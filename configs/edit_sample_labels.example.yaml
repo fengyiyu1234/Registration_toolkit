@@ -1,0 +1,31 @@
+# edit_sample_labels.py 的配置模板。复制成 configs/edit_sample_labels.yaml
+# （gitignored）再改成本机的真实路径：
+#
+#   cp configs/edit_sample_labels.example.yaml configs/edit_sample_labels.yaml
+#   conda activate antsreg
+#   python edit_sample_labels.py              # 弹出表单，字段用下面的值预填
+#   python edit_sample_labels.py --no-form    # 不弹表单，直接按这份配置打开 napari
+#
+# 这份配置是**可选**的：没有它时脚本仍然照旧弹表单（字段用 .dialog_state/ 里
+# 上次用过的值预填）。有它时，这里写了的字段优先于上次记录。
+
+# 样本图像，一般是 <name>_fine_25um.nii.gz。
+sample_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_fine_25um.nii.gz
+
+# 已经跑完配准得到的标签图 —— 这个工具是在它的基础上手工修正，
+# 而不是从零开始画（从零画用 annotate_gt_sam.py）。
+labels_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_labels_in_sample.nii.gz
+
+# 修正后的整份标签图输出路径。
+# 注意：单个脑区的 "Save This Region" 不走这里 —— 它固定写在 labels_path 旁边，
+# 命名成 <name>_<region_slug>_corrected_mask.nii.gz 加一个 .annotated_slices.json
+# sidecar，好让 registration_eval.py 的 dice_region_masks 直接引用。
+output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_labels_corrected.nii.gz
+
+# 脑区字典。二选一：
+#   use_brainglobe: false + ontology_json  —— 用本地的 CCF ontology JSON（推荐，
+#     和 pipeline、single_sample.py 用的是同一份，脑区 id 不会对不上）；
+#   use_brainglobe: true  + atlas_res_um   —— 让 BrainGlobe 现下载 Allen 图谱。
+use_brainglobe: false
+ontology_json: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
+atlas_res_um: 25.0              # 只在 use_brainglobe: true 时有意义

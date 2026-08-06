@@ -1,0 +1,33 @@
+# single_sample.py 的配置模板。复制成 configs/single_sample.yaml（gitignored）
+# 再改成本机的真实路径：
+#
+#   cp configs/single_sample.example.yaml configs/single_sample.yaml
+#   conda activate antsreg
+#   python single_sample.py
+#
+# 想同时留几个样本的配置，就各存一份、运行时显式指定，互不覆盖：
+#   python single_sample.py configs/single_sample.s12t.yaml
+#
+# 字符串里的 ~ 和 ${VAR} 会被展开，两台机器数据盘挂载点不同时可以写成
+# ${BRAIN_DATA}/TSC_ants/s12t/DevCCF，同一份文件两边都能用。
+
+# 1. 单个样本的工作目录（对应 pipeline 配置 s12t.yaml 里
+#    atlas_variants.<variant>.output_dir）。
+#    这个目录既支持 ANTs 产出（<name>_fine_*um.nii.gz + <name>_labels_in_sample.nii.gz），
+#    也支持 ClearMap 原生产出（resampled.tif + volume/result.mhd），
+#    由 DataLoader.resolve_native_paths 自动判断，不需要在这里声明是哪一种。
+sample_dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF
+
+# 2. 标准 Atlas 标签文件。必须是**已经按 pipeline 配置里的 orientation /
+#    slicing 转换过**、跟 labels_in_sample.nii.gz 处在同一空间的那一份，
+#    否则 "Atlas Space View" 里图谱和细胞点对不上。
+std_atlas_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um_1_-3_2__320-640_full_full.nii.gz
+
+# 3. JSON 格式脑区字典（需要包含 graph_order 和 id 两个字段，
+#    OntologyManager 两种编号都会建索引）。
+ontology_json_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
+
+# 4. 可选：视图旋转，只影响显示方向，不改动任何文件。
+#    0 = 不旋转，1 = 逆时针 90°，2 = 180°，3 = 顺时针 90°。
+#    细胞坐标会跟着一起旋转（DataLoader.rotate_pts），所以点和图不会错位。
+view_rotate_k: 0

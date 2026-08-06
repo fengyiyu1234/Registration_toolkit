@@ -1,0 +1,26 @@
+# paint_mask.py 的配置模板。复制成 configs/paint_mask.yaml（gitignored）
+# 再改成本机的真实路径：
+#
+#   cp configs/paint_mask.example.yaml configs/paint_mask.yaml
+#   conda activate antsreg
+#   python paint_mask.py                       # 无命令行参数
+#   python paint_mask.py configs/paint_mask.guide_s12t.yaml   # 或显式指定另一份
+#
+# 旧版本把这份配置放在仓库根目录的 paint_mask_local.yaml，那个位置仍然能读，
+# 但会打印一条迁移提示；直接 mv 到 configs/paint_mask.yaml 即可。
+
+kind: mask                      # "mask" | "guide"
+
+# mask: 要画 mask 的样本图像。
+# guide: role=sample 时是样本，role=atlas 时是图谱模板。
+image_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_fine_25um.nii.gz
+
+output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/modified_mask.nii.gz
+
+# 可选。
+# mask: 从已有 mask 开始修（例如自动生成的 <name>_brain_mask.nii.gz）。留空/删掉
+#       就是空白画布 —— 默认全部included，画 0 标出要排除的地方。
+# guide: 可选的预填（例如 scripts/project_outline.py 的猜测结果，只在 role=atlas 时用）。
+existing_mask_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_brain_mask.nii.gz
+
+role: sample                    # 只在 kind == "guide" 时有意义："sample" | "atlas"

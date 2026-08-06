@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+
+# Real configs (paths point at /data/...); only the *.example.yaml templates
+# are tracked.
+configs/*.yaml
+!configs/*.example.yaml
+
+# per-script local path configs (see paint_mask_local.example.yaml) -- real
+# paths live in *_local.yaml, gitignored so editing them isn't a git diff.
+*_local.yaml
+
+# _form_dialog.py's remembered last-used form values, per script
+.dialog_state/

@@ -1,0 +1,73 @@
+# registration_eval.py 的配置文件模板。复制这份改成自己的路径，存成
+# configs/eval_config.yaml（或任意文件名），然后从本仓库根目录运行：
+#   conda activate antsreg          # 需要 antspyx（点变换 + Jacobian）
+#   python registration_eval.py configs/eval_config.yaml
+#
+# 每个样本先在 ../Registration_ants 跑一遍配准 pipeline 得到
+# labels_in_sample.nii.gz，再用下面两条路子之一产出 ground truth：
+#   - edit_sample_labels.py：挑几个关心的脑区手工修正已有的配准标签、逐个
+#     "Save This Region" 单独导出成二值 mask；
+#   - annotate_gt_sam.py：在预先锁定的稀疏 z 层上用 micro_sam 点提示从头画。
+# 两者都会在 mask 旁边写 <...>.annotated_slices.json，下面的 use_annotation_hints
+# 会自动读取。不需要同时修完所有区域，某个样本某个区域还没标注就不写那个
+# key，跳过就行。
+#
+# 算指标之前先跑一遍 align_masks.py，确认每个 mask 跟源图像的 spacing/origin/
+# direction 完全一致——差一个体素的偏移在可视化里看不出来，但会系统性污染
+# HD95 这类表面距离指标。
+
+# 可选：复用 stats_config.yaml 里已经维护的 TSC/normal 分组，不写就都是 "unknown"。
+groups_manifest: /path/to/stats_config.yaml
+
+# 要在哪些脑区上算 Dice/HD95，按 CCF ontology 的精确名字（atlas_utils.region_mask_by_exact_name，
+# 不是子串模糊匹配，避免误伤名字里恰好包含这个片段的无关结构）。不写这一项就用下面这份默认值。
+dice_regions:
+  - Isocortex
+  - Caudoputamen
+  - Hippocampal formation
+  - Brain stem
+  - Cerebellum
+  - Cerebellar cortex
+
+# 一般不需要手动填这个：edit_sample_labels.py 的 "Save This Region" 会给每个
+# 区域的 mask 自动写一个 <...>_corrected_mask.annotated_slices.json，记录你实际手绘过
+# 哪几层（其余是插值猜的），下面 use_annotation_hints 默认就会按区域自动读取、只在那几层
+# 上算 Dice/HD95，不需要在这里重复填。只有你想让**所有区域**都强制用同一组 z 平面
+# （忽略每个区域自己的记录）时才需要手动写这个：
+# annotated_slices: [40, 60, 80]
+
+# 默认 true：自动读取每个区域 mask 旁边的 .annotated_slices.json，只在手绘过的那几层
+# 上算 Dice/HD95（没有 sidecar 文件的区域仍然按整个体积算，比如以前的数据或整层手工修正过的）。
+# 设成 false 就完全忽略这些记录，所有区域都按整个体积算（也可以用于验证插值质量本身）。
+# use_annotation_hints: true
+
+# 图谱：跟配准 pipeline 用的是同一份（custom 来源，见 config.example.yaml 的 atlas 块）。
+atlas:
+  template_path: /path/to/atlas_reference.tif
+  annotation_path: /path/to/atlas_annotation.tif
+  resolution_um: 25
+  ontology_path: /path/to/ontology.json   # 可选；不需要 M7 区域 Jacobian 统计时可以不写
+
+samples:
+  mouse01:
+    output_dir: /path/to/output/mouse01   # 跟 config.example.yaml 里这个样本的 output_dir 一致
+    name: mouse01                          # 跟 config.example.yaml 里 sample.name 一致
+    sample_resolution_um: 25               # 通常等于 registration.fine_target_um
+    atlas_resolution_um: 25
+
+    # M1 TRE：place_landmarks.py 分别在 sample/atlas 上放的匹配点对（可选）。
+    # sample_landmarks_csv: /path/to/mouse01_sample_landmarks.csv
+    # atlas_landmarks_csv: /path/to/atlas_landmarks.csv
+    # cortex_landmark_idx: [0, 1, 2]        # 可选：这几个点单独再报一次皮层子集的 TRE
+
+    # M2/M3 全脑轮廓：paint_mask.py（KIND="mask"）手工修正的全脑二值 mask（可选）。
+    # sample_brain_mask_corrected: /path/to/mouse01_brain_mask_corrected.nii.gz
+
+    # M2/M3 逐脑区 ground truth：edit_sample_labels.py 里每个区域单独
+    # "Save This Region" 导出的二值 mask，key 用跟 dice_regions 完全一样的名字。
+    # 只标注了一部分区域也没关系，其余的 key 不写就会被跳过（不报错）。
+    dice_region_masks:
+      Isocortex: /path/to/mouse01_isocortex_corrected_mask.nii.gz
+      Cerebellum: /path/to/mouse01_cerebellum_corrected_mask.nii.gz
+      # Caudoputamen / Hippocampal formation / Brain stem / Cerebellar cortex:
+      # 还没标注完，先不写这几个 key

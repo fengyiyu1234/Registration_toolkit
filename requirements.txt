@@ -1,0 +1,41 @@
+# Two environments, on purpose.
+#
+# ---------------------------------------------------------------------------
+# 1. `antsreg` -- everything except annotate_gt_sam.py
+# ---------------------------------------------------------------------------
+# Already exists (see ../Registration_ants/requirements.txt). These tools import
+# `registration_ants` through its editable install there, and
+# registration_eval.py needs antspyx for point transforms and Jacobians, so they
+# belong in that env rather than getting one of their own:
+#
+#   paint_mask.py  edit_sample_labels.py  place_landmarks.py
+#   single_sample.py  registration_eval.py  align_masks.py
+#
+# If antsreg ever has to be rebuilt, these are what they need on top of
+# ../Registration_ants/requirements.txt -- which is nothing, it already covers
+# all of them:
+napari[pyqt5]
+SimpleITK
+numpy
+scipy
+scikit-image
+pandas
+pyyaml
+tifffile
+
+# ---------------------------------------------------------------------------
+# 2. `gt_sam` -- annotate_gt_sam.py only
+# ---------------------------------------------------------------------------
+# micro_sam pulls in torch and its own pinned napari/numpy. Installing it into
+# antsreg would risk downgrading the numpy/napari/antspyx that the registration
+# pipeline runs on, so it gets a separate env:
+#
+#   conda create -y -n gt_sam -c conda-forge -c pytorch python=3.11 \
+#       micro_sam napari pyqt simpleitk pyyaml
+#
+# Verified working with micro_sam 1.8.8 / napari 0.8.0 / torch 2.10.0 /
+# SimpleITK 2.5.6 / python 3.11. align_masks.py runs in this env too (it
+# deliberately avoids importing anything that needs antspyx).
+#
+# SAM checkpoints (~410 MB for vit_b_lm + its decoder) download on first use
+# into ~/.cache/micro_sam.
