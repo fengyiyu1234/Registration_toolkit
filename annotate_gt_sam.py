@@ -1,3 +1,4 @@
+# ENV: gt_sam (NOT antsreg) -- `conda activate gt_sam` before running this file.
 """Semi-automatic ground-truth region masks on SPARSE z-slices, using napari +
 micro_sam point prompts.
 

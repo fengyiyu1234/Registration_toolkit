@@ -9,7 +9,7 @@
 每个工具都接受一个可选的位置参数指向别的 config，所以同一台机器上可以给不同
 样本各留一份，互相不覆盖：
 
-    python single_sample.py configs/single_sample.s12t.yaml
+    python single_sample.py configs/single_sample.local.yaml
 
 字符串值里的 `~` 和 `${VAR}` 会被展开，方便同一份 config 在数据盘挂载点不同的
 两台机器之间共用。未定义的 `${VAR}` 原样保留（不会静默变成空字符串），这样出错
@@ -107,7 +107,7 @@ def load_config(tool, cli_path=None, required=(), legacy_paths=(), optional=Fals
             return {}
         raise FileNotFoundError(_missing_message(tool, legacy_paths))
 
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if cfg is None:
         cfg = {}

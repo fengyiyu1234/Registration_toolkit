@@ -1,3 +1,4 @@
+# ENV: gt_sam (NOT antsreg) -- `conda activate gt_sam` before running this file.
 """End-to-end exercise of annotate_gt_sam.py's micro_sam integration, without a
 human: load a slice, fake a commit, save, load the NEXT slice through the
 state-reuse path, save, then reopen the first one with redo.
