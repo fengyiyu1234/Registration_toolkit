@@ -1,0 +1,53 @@
+# `antsreg` -- 除 annotate_gt_sam.py 以外所有工具的环境。
+#
+#     conda env create -f environment-antsreg.yml
+#     conda activate antsreg
+#     pip install -e ../Registration_ants        # 这一步 yml 里做不了，见下
+#
+# 最后那步是必须的：paint_mask.py / edit_sample_labels.py / registration_eval.py
+# 都 `from registration_ants import ...`。它的路径因机器而异（取决于你把
+# ANTs_Registration clone 到了哪儿），所以没写进 yml。
+#
+# 版本是从服务器上跑通的那套 antsreg 抄下来的（napari 0.8.0 / numpy 2.3.5 /
+# antspyx 0.6.3 / python 3.11）。pip 在别的平台上解不开某个 pin 的话，把那一行
+# 的 ==x.y.z 去掉再试 —— 代码没有依赖任何一个版本的特定行为。
+#
+# 三个平台都能建：antspyx 0.6.3 有 manylinux / macosx / win_amd64 wheel。
+# ANTs 的 C++ 命令行程序不需要单独装，全程走 antspyx 的 Python API。
+
+name: antsreg
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # Qt 绑定走 conda-forge 而不是 pip 的 `napari[pyqt5]` extra：pip 上的
+  # PyQt5-Qt5（真正的 Qt 运行时）只有 5.15.2 带 Windows wheel，更新的版本全是
+  # Linux-only，装出来的 Windows 环境会退回到一套 2020 年的 Qt。conda-forge 的
+  # pyqt 三个平台都是 5.15.11，跟 gt_sam 环境里那份一致。
+  - pyqt
+
+  - pip:
+      # GUI。不带 [pyqt5] extra —— 绑定已经由上面的 conda pyqt 提供。
+      - napari==0.8.0
+
+      # 图像 IO 与几何。SimpleITK 读写 nii.gz/mhd，tifffile 读 ClearMap 的
+      # resampled.tif。
+      - SimpleITK==2.5.5
+      - tifffile==2026.3.3
+
+      # registration_eval.py 的点变换和 Jacobian 走 antspyx；
+      # registration_ants/transforms.py 顶层就 import ants，所以它不是可选的。
+      - antspyx==0.6.3
+
+      - numpy==2.3.5
+      - scipy==1.15.3
+      - scikit-image==0.26.0
+      - pandas==3.0.3
+      - pyyaml==6.0.3
+
+      # tests/
+      - pytest

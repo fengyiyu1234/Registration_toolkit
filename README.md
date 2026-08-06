@@ -19,15 +19,23 @@ dependency only points one way.
 | `antsreg` | everything except `annotate_gt_sam.py` | already has napari + SimpleITK + antspyx + the editable `registration_ants` |
 | `gt_sam` | `annotate_gt_sam.py` | `micro_sam` pulls in torch and its own pinned napari/numpy; installing it into `antsreg` would risk downgrading what the registration pipeline runs on |
 
-Creating `gt_sam` (already done on this machine):
+Both are checked in as env files, so a new machine is three commands:
 
 ```bash
-conda create -y -n gt_sam -c conda-forge -c pytorch python=3.11 \
-    micro_sam napari pyqt simpleitk pyyaml
+conda env create -f environment-antsreg.yml
+conda activate antsreg
+pip install -e ../Registration_ants     # path-dependent, so not in the yml
+
+conda env create -f environment-gtsam.yml   # only if you need annotate_gt_sam.py
 ```
 
 `align_masks.py` deliberately depends on nothing beyond SimpleITK/numpy/scipy,
 so it runs in either env.
+
+Linux, macOS and Windows all work — `antspyx` ships `win_amd64` wheels, and
+nothing here shells out to the ANTs command-line binaries, so there is no
+native ANTs install to worry about. On Windows, run napari from a normal
+terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
 
 ---
 
