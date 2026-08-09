@@ -41,8 +41,12 @@ model_type: vit_b_lm
 # 不同脑区的层位置可以不同（本来就应该按各自最有代表性的位置挑）。
 # 每个脑区单独一个文件，值只有 0/1，脑区内部不再细分；相邻脑区
 # （cortex_surface vs cortex_wm）共享边界体素是允许的。
+#
+# 每个脑区可以写成 {start, end, step}（含 end），跳过 z 轴两端的空白 buffer
+# 区后按固定间隔取层，不用挨个想具体层号；也可以写成显式列表，比如 [95]——
+# 某层格外有代表性、想手动指定时用。两种写法可以按脑区混用。
 regions:
-  ventricle:      [50, 80, 110, 140, 170]
-  cortex_surface: [60, 90, 120, 150, 180]
-  cortex_wm:      [60, 90, 120, 150, 180]
-  hippocampus:    [70, 100, 130, 160, 190]
+  ventricle:      {start: 50, end: 170, step: 30}
+  cortex_surface: {start: 60, end: 180, step: 30}
+  cortex_wm:      {start: 60, end: 180, step: 30}
+  hippocampus:    {start: 70, end: 190, step: 30}

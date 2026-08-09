@@ -80,6 +80,9 @@ def test_config_validation(tmp):
         ({"ventricle": []}, "non-empty list"),
         ({"ventricle": [5, 5, 9]}, "duplicate"),
         ({"ventricle": [5, -1]}, "non-negative"),
+        ({"ventricle": {"start": 15, "end": 5, "step": 5}}, "must be <="),
+        ({"ventricle": {"start": 5, "end": 15, "step": 0}}, "positive int"),
+        ({"ventricle": {"start": 5, "end": 15}}, "needs step"),
     ]:
         raised = False
         try:
@@ -88,6 +91,15 @@ def test_config_validation(tmp):
             raised = True
             assert expect in str(exc), f"unexpected message for {regions}: {exc}"
         assert raised, f"load_config accepted {regions}"
+
+    print("   ok (rejections)")
+    print("1b. regions also accepts {start, end, step}, mixed with explicit lists per region")
+    range_cfg = gt.load_config(write_config(tmp, {
+        "ventricle": {"start": 5, "end": 15, "step": 5},
+        "cortex_surface": [6, 12],
+    }))
+    assert range_cfg["regions"]["ventricle"] == [5, 10, 15], range_cfg["regions"]["ventricle"]
+    assert range_cfg["regions"]["cortex_surface"] == [6, 12], range_cfg["regions"]["cortex_surface"]
 
     raised = False
     try:
@@ -124,6 +136,14 @@ def annotate(cfg, region, z_list):
     recorded = set(gt.manifest_slices(manifest, cfg["brain_id"], region)) | set(z_list)
     manifest[cfg["brain_id"]][region] = sorted(recorded)
     gt.save_manifest(cfg, manifest)
+
+
+def annotate_absent(cfg, region, z_list):
+    """Simulate 'Mark slice absent' clicks: no mask content written, just the
+    manifest's confirmed-absent bookkeeping."""
+    manifest = gt.load_manifest(cfg)
+    for z in z_list:
+        gt.record_region_slice(cfg, manifest, region, z, present=False)
 
 
 def test_export_geometry_and_manifest(tmp):
@@ -232,8 +252,40 @@ def test_verify_catches_manifest_mask_mismatch(tmp):
     print("   ok")
 
 
+def test_confirmed_absent(tmp):
+    print("5. confirmed-absent slices: recorded without mask content, verify passes, "
+          "sidecar carries both present and absent")
+    make_volume(tmp / "volume.nii.gz")
+    cfg = gt.load_config(write_config(tmp, {"hippocampus": [2, 4, 10, 14, 18]}))
+
+    annotate(cfg, "hippocampus", [10, 14, 18])          # drawn present (legacy flat-list write)
+    annotate_absent(cfg, "hippocampus", [2, 4])         # confirmed absent (structure not present yet)
+
+    assert gt.verify(cfg), "verify failed on a mix of present + confirmed-absent slices"
+
+    sidecar = json.loads(gt.sidecar_path_for(gt.mask_path_for(cfg, "hippocampus")).read_text())
+    assert sidecar["hand_drawn_slices"] == [2, 4, 10, 14, 18], sidecar
+    assert sidecar["confirmed_absent_slices"] == [2, 4], sidecar
+
+    manifest = gt.load_manifest(cfg)
+    assert gt.manifest_slices(manifest, "brain01", "hippocampus") == [2, 4, 10, 14, 18]
+    assert gt.manifest_absent_slices(manifest, "brain01", "hippocampus") == [2, 4]
+
+    # Contradiction: manifest says a plane is confirmed absent but the mask has
+    # content there -- verify() must catch it, not silently accept.
+    path = gt.mask_path_for(cfg, "hippocampus")
+    img = sitk.ReadImage(str(path))
+    arr = sitk.GetArrayFromImage(img)
+    arr[2] = blob_plane(2)
+    patched = sitk.GetImageFromArray(arr)
+    patched.CopyInformation(img)
+    sitk.WriteImage(patched, str(path))
+    assert not gt.verify(cfg), "verify passed despite a confirmed-absent plane having mask content"
+    print("   ok")
+
+
 def test_no_z_propagation_anywhere():
-    print("5. no z-propagation API is referenced anywhere in annotate_gt_sam.py")
+    print("6. no z-propagation API is referenced anywhere in annotate_gt_sam.py")
     source = (Path(__file__).resolve().parents[1] / "annotate_gt_sam.py").read_text()
     # Strip the docstrings/comments that explain WHY these are banned, so the
     # explanation itself doesn't trip the check.
@@ -258,7 +310,8 @@ def main():
     for fn in (test_config_validation,
                test_export_geometry_and_manifest,
                test_resume_does_not_lose_work,
-               test_verify_catches_manifest_mask_mismatch):
+               test_verify_catches_manifest_mask_mismatch,
+               test_confirmed_absent):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))
     test_no_z_propagation_anywhere()

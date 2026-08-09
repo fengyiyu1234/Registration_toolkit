@@ -68,6 +68,16 @@ as [done] and are skipped by "Next unfinished"; nothing already saved is
 overwritten unless you explicitly select that slice and use "Redo slice", which
 loads the existing mask back in for editing.
 
+Confirmed-absent slices: a region locked into a z-range in the config may
+genuinely not appear on some of those planes yet (e.g. hippocampus starting
+only partway through the volume). "Save slice" refuses an empty
+committed_objects layer -- an empty plane on disk would be indistinguishable
+from "never annotated" -- so use "Mark slice absent" instead to record that
+decision explicitly. registration_eval.py still restricts Dice/HD95 to exactly
+these planes; an all-empty ground-truth plane there scores as NaN (ignored) if
+the registered atlas is also empty, or Dice=0 if it wrongly predicts the
+region present -- real evaluation signal, not a no-op.
+
 A REALISTIC EXPECTATION
 -----------------------
 SAM point prompts work best on closed, intensity-homogeneous objects -- the
@@ -94,6 +104,24 @@ REQUIRED_CONFIG_KEYS = ("brain_id", "volume", "output_dir", "regions")
 # =====================================================================================
 # Config
 # =====================================================================================
+def _expand_region_range(path, region: str, spec: dict) -> list[int]:
+    """{start, end, step} -> explicit z list via range(start, end + 1, step)
+    (end inclusive). Lets a region be specified by scanning the volume once for
+    its valid z-range (skipping the empty buffer margins at the ends) instead of
+    hand-picking every individual slice index."""
+    missing = [k for k in ("start", "end", "step") if k not in spec]
+    if missing:
+        raise ValueError(f"{path}: regions.{region} range form needs {', '.join(missing)}")
+    start, end, step = spec["start"], spec["end"], spec["step"]
+    if not all(isinstance(v, int) for v in (start, end, step)):
+        raise ValueError(f"{path}: regions.{region} start/end/step must be ints")
+    if step <= 0:
+        raise ValueError(f"{path}: regions.{region} step must be a positive int, got {step}")
+    if start > end:
+        raise ValueError(f"{path}: regions.{region} start ({start}) must be <= end ({end})")
+    return list(range(start, end + 1, step))
+
+
 def load_config(path) -> dict:
     """Read + validate the annotation config. Fails on anything wrong here
     rather than after the SAM model has been downloaded and loaded."""
@@ -112,7 +140,20 @@ def load_config(path) -> dict:
     regions = cfg["regions"]
     if not isinstance(regions, dict) or not regions:
         raise ValueError(f"{path}: 'regions' must be a non-empty mapping of "
-                         f"region name -> list of z indices")
+                         f"region name -> list of z indices, or {{start, end, step}}")
+
+    normalized = {}
+    for region, spec in regions.items():
+        if isinstance(spec, dict):
+            normalized[region] = _expand_region_range(path, region, spec)
+        elif isinstance(spec, (list, tuple)):
+            normalized[region] = spec
+        else:
+            raise ValueError(
+                f"{path}: regions.{region} must be a list of z indices or a "
+                f"{{start, end, step}} mapping, got {type(spec).__name__}")
+    regions = normalized
+
     for region, slices in regions.items():
         if not isinstance(slices, (list, tuple)) or not slices:
             raise ValueError(f"{path}: regions.{region} must be a non-empty list of z indices")
@@ -153,7 +194,12 @@ def sidecar_path_for(mask_path: Path) -> Path:
 
 
 def load_manifest(cfg: dict) -> dict:
-    """{brain_id: {region: [z, ...]}}. Missing/empty file -> empty manifest."""
+    """{brain_id: {region: [z, ...] | {"present": [...], "absent": [...]}}}.
+    Missing/empty file -> empty manifest. A region's entry is either the
+    legacy flat-list shape (pre-dates confirmed-absent support, means "all
+    present") or the current {present, absent} shape -- see
+    _normalize_region_entry, which every reader goes through so both work
+    transparently."""
     manifest_path = cfg["manifest"]
     if not manifest_path.exists():
         return {}
@@ -163,6 +209,17 @@ def load_manifest(cfg: dict) -> dict:
     return json.loads(text)
 
 
+def _normalize_region_entry(entry) -> dict:
+    """Legacy flat list (all present) or {"present", "absent"} -> the latter,
+    always. Lets old manifests keep working without a migration step."""
+    if entry is None:
+        return {"present": [], "absent": []}
+    if isinstance(entry, list):
+        return {"present": sorted(int(z) for z in entry), "absent": []}
+    return {"present": sorted(int(z) for z in entry.get("present", [])),
+            "absent": sorted(int(z) for z in entry.get("absent", []))}
+
+
 def save_manifest(cfg: dict, manifest: dict) -> None:
     """Write the combined manifest plus, for each region, the per-mask sidecar
     derived from it. The combined manifest stays the single source of truth --
@@ -170,17 +227,48 @@ def save_manifest(cfg: dict, manifest: dict) -> None:
     cfg["manifest"].parent.mkdir(parents=True, exist_ok=True)
     cfg["manifest"].write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
-    for region, slices in manifest.get(cfg["brain_id"], {}).items():
+    for region, raw_entry in manifest.get(cfg["brain_id"], {}).items():
+        entry = _normalize_region_entry(raw_entry)
         sidecar = sidecar_path_for(mask_path_for(cfg, region))
         sidecar.write_text(json.dumps(
-            {"hand_drawn_slices": sorted(slices),
+            # hand_drawn_slices is what registration_eval.py's
+            # load_region_annotation_hint() reads -- "planes to restrict
+            # Dice/HD95 to." It doesn't care whether a plane is present or
+            # confirmed absent, only that it was decided, so it stays the
+            # union; confirmed_absent_slices is extra bookkeeping this tool
+            # uses for itself (verify()) and ignored by everything else.
+            {"hand_drawn_slices": sorted(set(entry["present"]) | set(entry["absent"])),
+             "confirmed_absent_slices": entry["absent"],
              "brain_id": cfg["brain_id"],
              "region": region,
              "source": "annotate_gt_sam.py"}, indent=2) + "\n")
 
 
 def manifest_slices(manifest: dict, brain_id: str, region: str) -> list[int]:
-    return sorted(manifest.get(brain_id, {}).get(region, []))
+    """All z's decided for this region so far -- drawn present or confirmed
+    absent. This is what "annotated" means for is_done()/the GUI's [done]
+    tag/next_unfinished()."""
+    entry = _normalize_region_entry(manifest.get(brain_id, {}).get(region))
+    return sorted(set(entry["present"]) | set(entry["absent"]))
+
+
+def manifest_absent_slices(manifest: dict, brain_id: str, region: str) -> list[int]:
+    return _normalize_region_entry(manifest.get(brain_id, {}).get(region))["absent"]
+
+
+def record_region_slice(cfg: dict, manifest: dict, region: str, z: int, present: bool) -> None:
+    """Move z into the "present" (drawn) or "absent" (confirmed empty) set for
+    region and out of the other one -- so redoing a slice the other way (e.g.
+    painting real content into a plane previously marked absent) can't leave
+    it recorded in both -- then persist manifest + derived sidecar."""
+    brain_id = cfg["brain_id"]
+    manifest.setdefault(brain_id, {})
+    entry = _normalize_region_entry(manifest[brain_id].get(region))
+    target, other = ("present", "absent") if present else ("absent", "present")
+    entry[target] = sorted(set(entry[target]) | {int(z)})
+    entry[other] = sorted(set(entry[other]) - {int(z)})
+    manifest[brain_id][region] = entry
+    save_manifest(cfg, manifest)
 
 
 # =====================================================================================
@@ -236,9 +324,11 @@ def verify(cfg: dict) -> bool:
 
       * grid identical to the volume (size/spacing/origin/direction)
       * dtype uint8, values a subset of {0, 1}
-      * the set of non-empty z-planes equals the manifest's list EXACTLY --
-        checked in both directions, so neither a plane the manifest forgot nor a
-        manifest entry whose plane came out empty can slip through
+      * every manifest-"present" plane has content, every manifest-"absent"
+        plane doesn't, and no plane has content the manifest doesn't know
+        about at all -- checked in all three directions, so a plane the
+        manifest forgot, a "present" entry that came out empty, and a
+        "absent" entry that actually has content can't slip through
     """
     reference = sitk.ReadImage(str(cfg["volume"]))
     manifest = load_manifest(cfg)
@@ -253,7 +343,9 @@ def verify(cfg: dict) -> bool:
     for region in sorted(set(cfg["regions"]) | recorded_regions):
         path = mask_path_for(cfg, region)
         planned = cfg["regions"].get(region, [])
-        recorded = manifest_slices(manifest, brain_id, region)
+        entry = _normalize_region_entry(manifest.get(brain_id, {}).get(region))
+        present, absent = set(entry["present"]), set(entry["absent"])
+        recorded = sorted(present | absent)
 
         if not path.exists():
             if recorded:
@@ -275,14 +367,19 @@ def verify(cfg: dict) -> bool:
         if stray.size:
             problems.append(f"values outside {{0, 1}}: {stray.tolist()[:10]}")
 
-        nonempty = sorted(int(z) for z in np.flatnonzero(arr.reshape(arr.shape[0], -1).any(axis=1)))
-        if nonempty != recorded:
-            missing = sorted(set(recorded) - set(nonempty))
-            extra = sorted(set(nonempty) - set(recorded))
-            if missing:
-                problems.append(f"manifest lists z={missing} but those planes are empty in the mask")
-            if extra:
-                problems.append(f"mask has content on z={extra}, absent from the manifest")
+        nonempty = set(int(z) for z in np.flatnonzero(arr.reshape(arr.shape[0], -1).any(axis=1)))
+
+        missing_present = sorted(present - nonempty)
+        if missing_present:
+            problems.append(f"manifest lists z={missing_present} as present but those planes are empty in the mask")
+
+        contradicted_absent = sorted(absent & nonempty)
+        if contradicted_absent:
+            problems.append(f"manifest lists z={contradicted_absent} as confirmed absent but the mask has content there")
+
+        extra = sorted(nonempty - present - absent)
+        if extra:
+            problems.append(f"mask has content on z={extra}, absent from the manifest")
 
         unplanned = sorted(set(recorded) - set(planned))
         if unplanned:
@@ -294,7 +391,8 @@ def verify(cfg: dict) -> bool:
             for p in problems:
                 print(f"        - {p}")
         else:
-            print(f"PASS  {region}: {len(recorded)}/{len(planned)} slices {recorded}")
+            note = f" ({len(absent)} confirmed absent)" if absent else ""
+            print(f"PASS  {region}: {len(recorded)}/{len(planned)} slices{note} {recorded}")
 
     print("=== all checks passed ===" if all_ok else "=== FAILURES above ===")
     return all_ok
@@ -336,6 +434,9 @@ class AnnotationSession:
     # ---- state -------------------------------------------------------------
     def is_done(self, region: str, z: int) -> bool:
         return z in manifest_slices(self.manifest, self.cfg["brain_id"], region)
+
+    def is_absent(self, region: str, z: int) -> bool:
+        return z in manifest_absent_slices(self.manifest, self.cfg["brain_id"], region)
 
     def _ensure_region_loaded(self, region: str) -> None:
         if self.current_region == region:
@@ -416,7 +517,8 @@ class AnnotationSession:
         return (f"Loaded {region} z={z}{note}.\n"
                 f"Place positive/negative points in 'point_prompts', press 's' to "
                 f"segment and 'c' to commit, hand-correct 'committed_objects' as "
-                f"needed, then click 'Save slice'.")
+                f"needed, then click 'Save slice'. If {region} genuinely doesn't "
+                f"appear on this plane, click 'Mark slice absent' instead.")
 
     def save_slice(self) -> str:
         """Binarize committed_objects into the region's 3D mask, write both the
@@ -435,20 +537,48 @@ class AnnotationSession:
             return (f"committed_objects is {plane_mask.shape}, expected "
                     f"{self.volume.shape[1:]} -- not saving.")
         if not plane_mask.any():
-            return (f"committed_objects is empty for {region} z={z}. Nothing saved "
-                    f"(an empty plane would be indistinguishable from 'not annotated').")
+            return (f"committed_objects is empty for {region} z={z}. If {region} "
+                    f"genuinely doesn't appear on this plane, click 'Mark slice "
+                    f"absent' instead -- an empty plane saved here would be "
+                    f"indistinguishable from 'not annotated'.")
 
         self._ensure_region_loaded(region)
         self.current_mask[z] = plane_mask
 
         path = save_region_mask(self.cfg, region, self.current_mask, self.reference)
-        recorded = set(manifest_slices(self.manifest, self.cfg["brain_id"], region))
-        recorded.add(int(z))
-        self.manifest[self.cfg["brain_id"]][region] = sorted(recorded)
-        save_manifest(self.cfg, self.manifest)
+        record_region_slice(self.cfg, self.manifest, region, z, present=True)
+        recorded = manifest_slices(self.manifest, self.cfg["brain_id"], region)
 
         return (f"Saved {region} z={z} ({int(plane_mask.sum())} voxels).\n"
                 f"{path.name}: {len(recorded)}/{len(self.cfg['regions'][region])} slices done.")
+
+    def save_slice_absent(self) -> str:
+        """Record that `region` genuinely does not appear on the currently
+        loaded plane -- the deliberate counterpart to save_slice()'s refusal
+        to save an empty committed_objects layer silently."""
+        if self.loaded_item is None:
+            return "Nothing loaded yet -- pick a slice and click 'Load slice' first."
+        region, z = self.loaded_item
+
+        layer = self.viewer.layers["committed_objects"].data
+        plane_mask = (np.asarray(layer) > 0).astype(np.uint8)
+        if plane_mask.shape != self.volume.shape[1:]:
+            return (f"committed_objects is {plane_mask.shape}, expected "
+                    f"{self.volume.shape[1:]} -- not saving.")
+        if plane_mask.any():
+            return (f"committed_objects has {int(plane_mask.sum())} painted voxels "
+                    f"for {region} z={z} -- that's not absent. Clear committed_objects "
+                    f"first, or click 'Save slice' if this is real content.")
+
+        self._ensure_region_loaded(region)
+        self.current_mask[z] = 0
+
+        path = save_region_mask(self.cfg, region, self.current_mask, self.reference)
+        record_region_slice(self.cfg, self.manifest, region, z, present=False)
+        recorded = manifest_slices(self.manifest, self.cfg["brain_id"], region)
+
+        return (f"Marked {region} z={z} as confirmed absent (no {region} on this plane).\n"
+                f"{path.name}: {len(recorded)}/{len(self.cfg['regions'][region])} slices decided.")
 
     def next_unfinished(self) -> tuple[str, int] | None:
         for region, z in self.queue:
@@ -472,7 +602,12 @@ def _build_dock(session: AnnotationSession):
         selected = listing.currentRow()
         listing.clear()
         for region, z in session.queue:
-            tag = "done" if session.is_done(region, z) else "todo"
+            if session.is_absent(region, z):
+                tag = "absent"
+            elif session.is_done(region, z):
+                tag = "done"
+            else:
+                tag = "todo"
             item = QListWidgetItem(f"[{tag}] {region}  z={z}")
             item.setData(0x0100, (region, z))  # Qt.UserRole
             listing.addItem(item)
@@ -504,6 +639,14 @@ def _build_dock(session: AnnotationSession):
             raise
         refresh_list()
 
+    def do_save_absent():
+        try:
+            status.setText(session.save_slice_absent())
+        except Exception as exc:
+            status.setText(f"ERROR marking absent: {type(exc).__name__}: {exc}")
+            raise
+        refresh_list()
+
     def do_next():
         target = session.next_unfinished()
         if target is None:
@@ -528,6 +671,8 @@ def _build_dock(session: AnnotationSession):
     redo_btn.clicked.connect(lambda: do_load(redo=True))
     save_btn = QPushButton("Save slice")
     save_btn.clicked.connect(do_save)
+    absent_btn = QPushButton("Mark slice absent (empty on purpose)")
+    absent_btn.clicked.connect(do_save_absent)
     next_btn = QPushButton("Next unfinished")
     next_btn.clicked.connect(do_next)
     verify_btn = QPushButton("Verify all output")
@@ -544,6 +689,7 @@ def _build_dock(session: AnnotationSession):
     row_layout.addWidget(redo_btn)
     layout.addWidget(row)
     layout.addWidget(save_btn)
+    layout.addWidget(absent_btn)
     layout.addWidget(next_btn)
     layout.addWidget(verify_btn)
     layout.addWidget(status)
