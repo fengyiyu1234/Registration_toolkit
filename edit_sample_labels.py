@@ -17,10 +17,14 @@ assignments in cell_registration.csv.
 Usage (needs a display; the antsreg env has napari+PyQt5+SimpleITK alongside
 antspyx -- one env for the whole pipeline):
     conda activate antsreg
-    python edit_sample_labels.py
-    # no CLI args -- a form window opens for the sample/labels/output paths
-    # and the ontology options, pre-filled with whatever you used last time
-    # (kept in .dialog_state/, gitignored).
+    python edit_sample_labels.py                 # form window, then napari
+    python edit_sample_labels.py --no-form       # straight to napari, from the config
+    python edit_sample_labels.py configs/edit_sample_labels.s12t.yaml
+
+    # A form window opens for the sample/labels/output paths and the ontology
+    # options, pre-filled from configs/edit_sample_labels.yaml if that exists
+    # and otherwise from whatever you used last time (kept in .dialog_state/,
+    # gitignored).
 
 Workflow:
     1. A napari window opens with the sample image and a Labels layer
@@ -94,6 +98,7 @@ from the full union of old + new hand-drawn planes against that baseline,
 overwriting the same file -- so interpolation error never compounds across
 sessions, and nothing you've already hand-verified gets silently lost.
 """
+import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,7 +118,7 @@ from PyQt5.QtWidgets import (
 # atlas_utils/mask_utils are pure json/numpy/scipy at this import level
 # (atlas_utils only imports ants lazily, inside get_allen_atlas).
 from registration_ants import atlas_utils, mask_utils
-from _form_dialog import run_form  # sibling module
+import _local_config  # sibling module
 
 
 _FORM_FIELDS = [
@@ -197,7 +202,13 @@ def _load_structures(args):
 
 
 def main():
-    form = run_form("edit_sample_labels", "Edit Sample Labels", _FORM_FIELDS)
+    parser = argparse.ArgumentParser(description="Hand-correct labels_in_sample.nii.gz")
+    _local_config.add_config_arg(parser, "edit_sample_labels")
+    _local_config.add_no_form_arg(parser)
+    cli = parser.parse_args()
+
+    form = _local_config.resolve_inputs(
+        "edit_sample_labels", "Edit Sample Labels", _FORM_FIELDS, cli.config, cli.no_form)
     args = SimpleNamespace(
         sample_path=form["sample_path"],
         labels_path=form["labels_path"],

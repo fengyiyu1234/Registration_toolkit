@@ -114,16 +114,17 @@ conda activate antsreg && python edit_sample_labels.py    # opens a path form
 
 - **`paint_mask.py`** — paint a binary inclusion/exclusion mask (`KIND="mask"`,
   e.g. excluding a tissue crack) or a paired guide outline (`KIND="guide"`, fed
-  to `ants.registration`'s `multivariate_extras`). Paths go in the gitignored
-  `paint_mask_local.yaml`; copy it from `paint_mask_local.example.yaml`, edit,
-  then `python paint_mask.py` with no arguments. Its guide outputs pair with
+  to `ants.registration`'s `multivariate_extras`). Its guide outputs pair with
   `../Registration_ants/scripts/project_outline.py`.
 - **`place_landmarks.py`** — click matching anatomical landmarks on the sample
-  and on the atlas, in the same order, for `registration_eval.py`'s landmark TRE.
-  A form window asks for role/paths, pre-filled from last time.
+  and on the atlas, in the same order, for `registration_eval.py`'s landmark TRE
+  and for `fit_initial_transform.py`.
+- **`fit_initial_transform.py`** — turn a pair of `place_landmarks.py` CSVs into
+  the two deformation fields `../Registration_ants` starts its registration
+  from, for the regions where intensity alone cannot establish correspondence.
+  See below.
 - **`single_sample.py`** — napari QC viewer for one registered sample: overlays
-  the warped atlas, the sample, and per-region labels. Paths are edited in the
-  `CONFIG` dict at the top.
+  the warped atlas, the sample, and per-region labels.
 - **`align_masks.py`** — see below.
 - **`registration_eval.py`** — Dice/HD95, landmark TRE, Jacobian and
   inverse-consistency metrics across samples and groups.
@@ -133,6 +134,93 @@ All the napari tools read images through SimpleITK, giving numpy order
 `(z, y, x)` with axis 0 = the real imaging planes — deliberately **not**
 `ants.image_read().numpy()`, whose axis order is reversed for the same file. Get
 that wrong and you annotate left-right cross-sections with nothing to warn you.
+
+### How every tool gets its paths
+
+One convention, no paths hardcoded in any script:
+
+```bash
+cp configs/<tool>.example.yaml configs/<tool>.yaml    # then edit the paths
+python <tool>.py                    # uses configs/<tool>.yaml
+python <tool>.py configs/other.yaml # or an explicit one, e.g. per sample
+```
+
+`configs/*.yaml` is gitignored and only the `*.example.yaml` templates are
+tracked, so changing samples never shows up as a git diff. `~` and `${VAR}` are
+expanded, so one config works across machines with different mount points.
+
+The tools that open a **form window** (`place_landmarks.py`,
+`edit_sample_labels.py`, `fit_initial_transform.py`) treat the config as
+optional: with one, its values pre-fill the form ahead of the last-used values
+remembered in `.dialog_state/`; without one, the form behaves as it always did.
+`--no-form` skips the window entirely and runs straight from the config.
+
+`fit_initial_transform.py` additionally accepts all its paths as CLI flags — but
+either give all of them or none, since half a command line makes "where does the
+rest come from" ambiguous.
+
+---
+
+## Landmark-driven initialisation: `fit_initial_transform.py`
+
+The P5 sample is flattened to 61% of the atlas's dorsoventral extent, and around
+the deep midline structures there is no intensity feature for the registration to
+lock onto. This script lets you state the correspondence by hand instead: place
+matching points with `place_landmarks.py`, fit a deformation field through them,
+and hand it to the pipeline as `registration.initial_transform`.
+
+```bash
+conda activate antsreg
+python fit_initial_transform.py --selftest        # synthetic phantom, ~6 s
+
+python fit_initial_transform.py \
+    --sample-landmarks landmarks_sample.csv --atlas-landmarks landmarks_atlas.csv \
+    --sample-image        registration.tif --sample-voxel-size 2.6 2.6 32.0 \
+    --sample-domain-image tsc12t_fine_20um.nii.gz \
+    --atlas-image  P04_LSFM_20um_1_-3_2__320-640_full_full.nii.gz \
+    --out-prefix   /path/to/s12t_ --fitting-levels 5
+
+python fit_initial_transform.py                   # no args -> the same form
+```
+
+Six things worth knowing before you use the output:
+
+- **The two sides may be at different resolutions, and normally are.** Place the
+  sample landmarks on the **raw acquisition TIFF** — the 20 µm resample drops xy
+  by 8× and the structures stop being identifiable — and the atlas landmarks on
+  the 20 µm atlas. The fit runs in physical coordinates, so each side only has to
+  know its own voxel size. Cropping is not a problem either: `crop_for_registration`
+  moves the origin, so physical space stays continuous.
+- **A TIFF forces `--sample-voxel-size`.** TIFF headers carry no spacing and
+  SimpleITK reports `(1.0, 1.0, 1.0)`, which would scale every physical coordinate
+  wrong by 2.6–32× silently, so its absence is a hard error. The three values are
+  **x y z** — the same order as `sample.voxel_size_um` in the pipeline config, and
+  the reverse of the CSV's `axis-0/1/2`.
+- **Two fields are written, not one.** ANTs cannot invert a deformation field it
+  did not produce, so `<prefix>init_fwd.nii.gz` (atlas grid) and
+  `<prefix>init_inv.nii.gz` (20 µm sample grid) are two independent fits of the same
+  landmark pairs with the roles swapped. Without the second one the reverse chain
+  (`labels_in_sample`, cell-to-region assignment) has a missing link.
+- **`--sample-domain-image` is the grid the inverse field lives on**, and it is
+  *not* the image the landmarks were placed on. Downstream that field warps atlas
+  labels into sample space against `{name}_fine_{N}um.nii.gz`, so pass that file.
+  Without it one is derived — from `--sample-image` if that is already a `.nii.gz`,
+  otherwise a synthetic `--target-um` (default 20) isotropic grid padded 10 %
+  beyond the acquisition extent.
+- **`--atlas-image` must be the pipeline's reoriented+cropped atlas cache**, not a
+  raw DevCCF release file — different axis order, different origin. Points that
+  land outside the image are a hard error, as is a non-identity direction matrix.
+- **Read the per-landmark residual table.** The two CSVs are paired by row order
+  only, so a pair naming two different anatomical locations does not fail — it
+  silently drags the field, and its residual is the only place it shows up.
+  Outliers are marked `<-- CHECK`. Two different causes, distinguished for you:
+  *uniformly* large residuals mean the B-spline lattice is too coarse (on the real
+  atlas `--fitting-levels 4` leaves ~100 µm, level 5 gives 0.9 µm), while a few
+  large ones among small ones mean a landmark ordering problem — unless the row
+  sits near the fitting domain's edge, where the lattice is unconstrained and more
+  levels will *not* help. The report says which case you are in.
+
+Budget ~8 minutes, ~15 GB of RAM and ~2 GB of disk for a real 20 µm run.
 
 ---
 
@@ -186,6 +274,7 @@ own `TransformIndexToPhysicalPoint`.
 ```bash
 conda activate antsreg
 python align_masks.py --selftest                        # also fine in gt_sam
+python fit_initial_transform.py --selftest
 python tests/test_registration_eval_smoke.py
 python tests/test_annotate_gt_sam_smoke.py              # also fine in gt_sam
 

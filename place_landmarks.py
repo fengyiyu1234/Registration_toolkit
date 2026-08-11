@@ -19,13 +19,16 @@ for a QC check on that).
 Usage (needs a display; the antsreg env has napari+PyQt5+SimpleITK alongside
 antspyx -- one env for the whole pipeline):
     conda activate antsreg
-    python place_landmarks.py
-    # no CLI args -- a form window opens for role/image/output-csv (and an
-    # optional points CSV to preload), pre-filled with whatever you used
-    # last time (kept in .dialog_state/, gitignored). Run it once
-    # for role=sample and once for role=atlas; since both roles share the
-    # same remembered image/output-csv fields, use Browse to point each
-    # run at its own file instead of accepting the pre-filled path as-is.
+    python place_landmarks.py                  # form window, then napari
+    python place_landmarks.py --no-form        # straight to napari, from the config
+    python place_landmarks.py configs/place_landmarks.s12t_atlas.yaml
+
+    A form window opens for role/image/output-csv (and an optional points CSV
+    to preload), pre-filled from configs/place_landmarks.yaml if that exists
+    and otherwise from whatever you used last time (kept in .dialog_state/,
+    gitignored). Run it once for role=sample and once for role=atlas -- since
+    both roles share the same remembered fields, either keep one config file
+    per role and pass it explicitly, or use Browse to repoint each run.
 
     Preload points from a previous export to resume/add to a session
     instead of starting from an empty Points layer.
@@ -44,19 +47,20 @@ Workflow:
     3. Click "Export Landmarks". Writes a CSV with columns
        index,axis-0,axis-1,axis-2 (voxel coordinates in this image's own
        (z,y,x) array order) -- the same column layout napari's own Points
-       CSV writer produces, and the format registration_eval.py's
-       load_points() parses.
+       CSV writer produces. Reading and writing that format lives in
+       _landmark_io, shared with registration_eval.py's load_points() and
+       fit_initial_transform.py.
 """
-import csv
+import argparse
 from types import SimpleNamespace
 
 import napari
 import numpy as np
-import pandas as pd
 import SimpleITK as sitk
 from PyQt5.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
-from _form_dialog import run_form  # sibling module
+import _landmark_io  # sibling module
+import _local_config  # sibling module
 
 
 _FORM_FIELDS = [
@@ -73,13 +77,14 @@ _FORM_FIELDS = [
 ]
 
 
-def _load_preloaded_points(points_csv):
-    df = pd.read_csv(points_csv)
-    return df[["axis-0", "axis-1", "axis-2"]].to_numpy(dtype=float)
-
-
 def main():
-    form = run_form("place_landmarks", "Place Landmarks", _FORM_FIELDS)
+    parser = argparse.ArgumentParser(description="Hand-place matching anatomical landmarks")
+    _local_config.add_config_arg(parser, "place_landmarks")
+    _local_config.add_no_form_arg(parser)
+    cli = parser.parse_args()
+
+    form = _local_config.resolve_inputs(
+        "place_landmarks", "Place Landmarks", _FORM_FIELDS, cli.config, cli.no_form)
     args = SimpleNamespace(
         role=form["role"],
         image_path=form["image_path"],
@@ -95,7 +100,11 @@ def main():
 
     initial_points = np.empty((0, 3), dtype=float)
     if args.points_csv:
-        initial_points = _load_preloaded_points(args.points_csv)
+        # Checked against this image's shape: preloading a CSV placed on a
+        # different image would otherwise silently seed the layer with points
+        # in the wrong place (or off-screen).
+        initial_points = _landmark_io.read_landmark_csv(
+            args.points_csv, shape_zyx=arr.shape, role="preloaded")
 
     viewer = napari.Viewer(title=f"Place landmarks ({args.role})")
     viewer.add_image(arr, name=args.role, colormap="gray")
@@ -122,14 +131,11 @@ def main():
             return
 
         # Same column layout napari_builtins' own Points CSV writer produces
-        # (index, axis-0, axis-1, axis-2), so registration_eval.py's
-        # load_points() (and napari's own CSV reader, if you want to reopen
-        # this file for editing) parse it the same way either tool wrote it.
-        with open(args.output_csv, mode="w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["index", "axis-0", "axis-1", "axis-2"])
-            for i, row in enumerate(data):
-                writer.writerow([i, *row])
+        # (index, axis-0, axis-1, axis-2), written through _landmark_io so the
+        # tools that read it back -- registration_eval.py's load_points(),
+        # fit_initial_transform.py, napari itself -- cannot disagree about the
+        # format with whatever wrote it.
+        _landmark_io.write_landmark_csv(args.output_csv, data)
 
         msg = f"Wrote {args.output_csv}\nLandmarks: {len(data)}"
         status_label.setText(msg)

@@ -1,0 +1,64 @@
+# fit_initial_transform.py 的配置模板。复制成 configs/fit_initial_transform.yaml
+# （gitignored）再改成本机的真实路径：
+#
+#   cp configs/fit_initial_transform.example.yaml configs/fit_initial_transform.yaml
+#   conda activate antsreg
+#   python fit_initial_transform.py              # 弹表单，字段用下面的值预填
+#   python fit_initial_transform.py --no-form    # 不弹表单，直接按这份配置跑
+#
+# 这份配置是**可选**的：没有它时脚本照旧弹表单（字段用 .dialog_state/ 里上次
+# 用过的值预填）。有它时，这里写了的字段优先于上次记录。
+#
+# 五个路径也可以全部走命令行 flag（见脚本 docstring 的 USAGE），但**不能只给一
+# 半**——给了一部分 flag 就必须给全，避免"剩下的从哪来"说不清。
+
+# 样本侧 landmark CSV（place_landmarks.py role=sample 导出）。
+sample_landmarks: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/landmarks_sample.csv
+
+# 图谱侧 landmark CSV（role=atlas 导出）。**必须和上面那份是同一批解剖位置、同
+# 一顺序**——CSV 里没有点名，只有行号；顺序错一行拟合就废，靠脚本打印的逐点残
+# 差表事后发现。
+atlas_landmarks: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/landmarks_atlas.csv
+
+# 标样本点时用的那张图（体素→物理坐标要用它的 spacing/origin）。
+# 推荐直接标在**原始 TIFF** 上：20µm 重采样后 xy 降了 8 倍，很多结构已经认不出来。
+# 两边分辨率不一样完全没关系——拟合用的是物理坐标，各自知道自己的体素尺寸就够了。
+sample_image: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/registration.tif
+
+# 样本体素尺寸，**x y z 顺序**（和 Registration_ants 配置里 sample.voxel_size_um
+# 一致，正好是 CSV 里 axis-0/1/2 也就是 z,y,x 的**反序**）。
+#
+# sample_image 是 .tif/.tiff 时**必填**：TIFF 头里没有体素尺寸，SimpleITK 读出来
+# 是 (1.0, 1.0, 1.0)，信了它每个物理坐标都会差 2.6~32 倍而且一路无人报错。所以
+# 缺这一项是直接报错退出，不是悄悄用默认值。
+#
+# sample_image 是 .nii.gz 时可以删掉这一项，用文件头里的 spacing/origin；写了就
+# 以这里为准，和文件头不一致时会打一条警告。
+sample_voxel_size: [2.6, 2.6, 32.0]
+
+# 反向形变场（init_inv）的定义网格。**不是**标点用的那张图：这个场下游是用来把
+# 图谱标签变形到样本空间的，而 pipeline 里那一步的参考网格是 fine 图，形变场长在
+# 原始采集网格上就对不上了。
+#
+# 填 pipeline 产出的 {name}_fine_{N}um.nii.gz。还没跑过 pipeline 就删掉这一项，
+# 脚本会按 target_um 自己合成一个空的各向同性网格（物理范围取 raw 的范围，再向外
+# 各留 10% 余量——贴边的点 B 样条约束不住，加 fitting_levels 也救不回来）。
+# 合成网格比真实 fine 网格大 1.7 倍（三个轴两侧都加），所以有 fine 图就填上。
+sample_domain_image: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/DevCCF_0810/tsc12t_fine_20um.nii.gz
+
+# 上面那项缺省时，合成网格的体素尺寸（µm）。跟 pipeline 的 fine 网格保持一致。
+target_um: 20.0
+
+# 标图谱点时用的那张图。**必须是 pipeline 真正配准用的那份转向+裁剪后的缓存图
+# 谱**，不能是原始 DevCCF 发布文件（轴序和 origin 都不一样，点会落到别处）。
+atlas_image: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_LSFM_20um_1_-3_2__320-640_full_full.nii.gz
+
+# 输出前缀，会写出 <prefix>init_fwd.nii.gz 和 <prefix>init_inv.nii.gz。
+# 真实 20µm 数据两个场加起来约 2 GB，别放在系统盘。
+out_prefix: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/landmark_init/s12t_
+
+# B 样条控制格的层数。控制格是铺满整个图像域的，所以合适的值取决于图像域的物理
+# 尺寸——真实图谱域上默认的 4 会留下约 100µm 的中位残差（等于场根本没穿过你标的
+# 点），5 就降到 0.9µm。**真实数据建议 5。**
+# 判据看脚本打印的残差表：整体都大 → 加层数；只有个别点大 → 是两份 CSV 顺序错。
+fitting_levels: 5

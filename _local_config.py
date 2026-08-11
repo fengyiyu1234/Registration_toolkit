@@ -15,8 +15,13 @@
 两台机器之间共用。未定义的 `${VAR}` 原样保留（不会静默变成空字符串），这样出错
 时报出来的是那个没展开的路径本身，一眼能看出是哪个变量没设。
 
+弹表单的交互式工具（place_landmarks.py / edit_sample_labels.py /
+fit_initial_transform.py）走 `resolve_inputs()`：配置是**可选**的，有就用来预填
+表单（优先于 .dialog_state/ 里上次用过的值），`--no-form` 则完全不弹窗、直接用
+配置。非交互工具（single_sample.py / paint_mask.py）直接用 `load_config()`。
+
 Not runnable on its own -- imported by single_sample.py, paint_mask.py,
-place_landmarks.py, edit_sample_labels.py.
+place_landmarks.py, edit_sample_labels.py, fit_initial_transform.py.
 """
 import os
 from pathlib import Path
@@ -39,6 +44,13 @@ def add_config_arg(parser, tool):
     parser.add_argument(
         "config", nargs="?", default=None,
         help=f"配置文件路径（默认 configs/{tool}.yaml，模板见 configs/{tool}.example.yaml）")
+
+
+def add_no_form_arg(parser):
+    """给弹表单的交互式工具加上 --no-form（直接按配置跑，不弹窗）。"""
+    parser.add_argument(
+        "--no-form", action="store_true",
+        help="不弹表单，直接用配置文件里的值（此时配置文件必须存在且填全）")
 
 
 def _expand(value):
@@ -123,3 +135,48 @@ def load_config(tool, cli_path=None, required=(), legacy_paths=(), optional=Fals
 
     print(f"[config] {path}")
     return cfg
+
+
+def _field_enabled(field, values):
+    """enabled_when=(other_key, expected) —— 另一个字段不等于 expected 时本字段
+    不生效（跟 _form_dialog.run_form 里灰掉输入框是同一套语义）。"""
+    cond = field.get("enabled_when")
+    return cond is None or values.get(cond[0]) == cond[1]
+
+
+def values_from_config(tool, fields, cfg):
+    """不弹表单时，直接把配置铺成 {key: value}，并做表单本来会做的必填校验。"""
+    if not cfg:
+        raise FileNotFoundError(
+            _missing_message(tool) + "\n\n（--no-form 跳过了表单，所以配置文件必须存在。）")
+
+    values = {f["key"]: cfg.get(f["key"], f.get("default")) for f in fields}
+    missing = []
+    for f in fields:
+        if not _field_enabled(f, values):
+            values[f["key"]] = None       # 跟表单里灰掉的字段一样解析成 None
+        elif not f.get("optional") and values[f["key"]] in (None, ""):
+            missing.append(f["key"])
+    if missing:
+        raise ValueError(
+            f"--no-form 需要配置里填全这些项: {', '.join(missing)}\n"
+            f"（每一项的含义见 {example_path(tool)}）")
+
+    unknown = set(cfg) - {f["key"] for f in fields}
+    if unknown:
+        print(f"[config] 忽略了 {tool} 用不到的字段: {', '.join(sorted(unknown))}")
+    return values
+
+
+def resolve_inputs(tool, title, fields, cli_path=None, no_form=False):
+    """所有交互式工具取参数的统一入口：配置文件（可选）→ 表单 → {key: value}。
+
+    有 configs/<tool>.yaml 时，里面写了的字段**优先于** .dialog_state/ 里上次
+    用过的值 —— 否则改了 config 却看不出效果。没有配置文件时行为跟以前完全一样
+    （空表单 + 上次的值）。--no-form 则完全不弹窗，直接用配置里的值。
+    """
+    cfg = load_config(tool, cli_path, optional=True)
+    if no_form:
+        return values_from_config(tool, fields, cfg)
+    from _form_dialog import run_form   # 惰性导入：--no-form 这条路不需要 PyQt5
+    return run_form(tool, title, fields, overrides=cfg)

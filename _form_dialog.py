@@ -5,8 +5,11 @@ ran, so re-running with the same paths is just "click OK" -- state is kept
 per-script in .dialog_state/<script_name>.json (gitignored, so it
 never shows up as a git diff).
 
-Not runnable on its own -- imported by edit_sample_labels.py and
-place_landmarks.py.
+Not runnable on its own, and normally not imported directly either: the
+interactive tools call _local_config.resolve_inputs(), which layers
+configs/<tool>.yaml on top of the remembered values and calls run_form() here
+(or skips it entirely for --no-form). Import this module directly only if a
+tool wants the form with no config layer at all.
 """
 import json
 from pathlib import Path
@@ -75,21 +78,31 @@ class _PathField(QWidget):
         return self.edit.text().strip()
 
 
-def run_form(script_name, title, fields):
+def run_form(script_name, title, fields, overrides=None):
     """Show one form window with all `fields` and return {key: value}.
 
     Each field dict has: key, label, type (one of "open_file", "save_file",
-    "directory", "choice", "int", "float", "checkbox"), plus type-specific
-    keys: filter (path types), options/default (choice), default/minimum/
-    maximum/decimals (int/float), default (checkbox), optional (skip the
-    required-value check), enabled_when=(other_key, expected_value) to
-    grey the field out unless another field currently equals expected_value.
+    "directory", "text", "choice", "int", "float", "checkbox"), plus
+    type-specific keys: filter (path types), placeholder (text),
+    options/default (choice), default/minimum/maximum/decimals (int/float),
+    default (checkbox), optional (skip the required-value check),
+    enabled_when=(other_key, expected_value) to grey the field out unless
+    another field currently equals expected_value.
+
+    `overrides` (normally configs/<script_name>.yaml, passed in by
+    _local_config.resolve_inputs) pre-fills fields ahead of the remembered
+    last-used values -- editing the config has to be visible in the form, or
+    there would be no point editing it. Fields absent from `overrides` still
+    fall back to .dialog_state/ and then to the field's own default.
 
     Disabled fields resolve to None in the result. Raises SystemExit if the
     user cancels the dialog.
     """
     global _app
     state = _load_state(script_name)
+    # `state` stays the thing that gets written back, so config values do not
+    # leak into .dialog_state/; `prefill` is only what the widgets start at.
+    prefill = {**state, **{k: v for k, v in (overrides or {}).items() if v is not None}}
     _app = QApplication.instance() or QApplication([])
 
     dialog = QDialog()
@@ -100,11 +113,18 @@ def run_form(script_name, title, fields):
     widgets = {}
     for f in fields:
         key = f["key"]
-        remembered = state.get(key, f.get("default"))
+        remembered = prefill.get(key, f.get("default"))
         ftype = f["type"]
         if ftype in ("open_file", "save_file", "directory"):
             mode = {"open_file": "open", "save_file": "save", "directory": "dir"}[ftype]
             w = _PathField(remembered or "", mode, f.get("filter", "All files (*)"))
+        elif ftype == "text":
+            # Free text, for the values that are neither a path nor a single
+            # number -- e.g. fit_initial_transform.py's "2.6 2.6 32.0" voxel
+            # size. Parsing is the caller's; this only collects the string.
+            w = QLineEdit("" if remembered is None else str(remembered))
+            if f.get("placeholder"):
+                w.setPlaceholderText(f["placeholder"])
         elif ftype == "choice":
             w = QComboBox()
             w.addItems(f["options"])
@@ -157,7 +177,9 @@ def run_form(script_name, title, fields):
             w = widgets[f["key"]]
             if f.get("optional") or not w.isEnabled():
                 continue
-            if isinstance(w, _PathField) and not w.value():
+            blank = ((isinstance(w, _PathField) and not w.value())
+                     or (isinstance(w, QLineEdit) and not w.text().strip()))
+            if blank:
                 QMessageBox.warning(dialog, "Missing value", f"'{f['label']}' is required.")
                 return
         dialog.accept()
@@ -177,6 +199,8 @@ def run_form(script_name, title, fields):
             continue
         if isinstance(w, _PathField):
             value = w.value() or None
+        elif isinstance(w, QLineEdit):
+            value = w.text().strip() or None
         elif isinstance(w, QComboBox):
             value = w.currentText()
         elif isinstance(w, (QSpinBox, QDoubleSpinBox)):

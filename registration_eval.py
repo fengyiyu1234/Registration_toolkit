@@ -78,6 +78,8 @@ from scipy.spatial import cKDTree
 
 from registration_ants import atlas_utils, transforms
 
+import _landmark_io  # sibling module
+
 
 # =====================================================================================
 # CONFIG
@@ -198,10 +200,11 @@ def load_points(csv_path):
     napari/SimpleITK's array order for these tools is (z,y,x) (axis-0 = the
     actual imaging/atlas planes) -- reversed here to (x,y,z) to match this
     codebase's established physical-space convention (see module docstring).
+    Parsing and validation live in _landmark_io so this tool,
+    fit_initial_transform.py and place_landmarks.py cannot drift apart on the
+    format.
     """
-    df = pd.read_csv(csv_path)
-    zyx = df[["axis-0", "axis-1", "axis-2"]].to_numpy(dtype=float)
-    return zyx[:, ::-1]
+    return _landmark_io.to_xyz(_landmark_io.read_landmark_csv(csv_path))
 
 
 def apply_transform_to_points(sample_pts_xyz_um, transforms_prefix):
