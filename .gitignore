@@ -14,3 +14,4 @@ configs/*.yaml
 
 # _form_dialog.py's remembered last-used form values, per script
 .dialog_state/
+local_config/
