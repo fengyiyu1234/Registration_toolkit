@@ -24,3 +24,29 @@ output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/modified_mask
 existing_mask_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_brain_mask.nii.gz
 
 role: sample                    # 只在 kind == "guide" 时有意义："sample" | "atlas"
+                                # 正常只画 sample：图谱侧由 Registration_ants 按下面的
+                                # 脑区名从 P04_DevCCF_Annotations_20um.nii.gz 自动取。
+                                # atlas 保留给需要手工修正图谱侧区域的情况。
+
+# 只在 kind == "guide" 时有意义。画笔 label 值 → 脑区名。
+# 一个脑区一个 label，在 napari 里切换画笔编号（左侧 label 输入框）来画不同脑区，
+# 导出成一份多 label 的体数据 + 一份 <output>.regions.json 记录这个映射。
+#
+# 名字必须能在图谱本体里匹配到（下游按名字去图谱标注文件取对应区域，子串匹配，
+# 匹配不到会静默失效，所以填之前先确认）。
+#
+# 不填 = 单区域的老用法：只用 label 1 画，导出结果和加多脑区支持之前逐位一致。
+# 填了的话，画布上出现没在这里登记的 label、或者这里登记了却没画的 label，
+# 导出时都会警告（只警告，文件照写 —— 分几次画是正常用法）。
+# 每个 label 至少要画 2 层，否则插值插不出体积，只会得到孤零零的一薄片。
+# region_labels:
+#   1: "cortex"
+#   2: "cerebellar hemisphere"
+#   3: "corpus callosum"
+
+# 可选，只影响 kind == "guide" 的显示，不影响导出的数值（导出的一直是体素索引）。
+# 注意是 (z, y, x) 顺序 —— 和 SimpleITK 读出来的数组轴序一致，跟流水线配置里
+# voxel_size_um 的 (x, y, z) 顺序正好相反。
+# 原始 registration.tif 是 2.6/2.6/32 µm，z 方向差 12 倍；不设的话 napari 按各向
+# 同性画，正交视图会被压扁 12 倍完全没法看。
+# display_scale_zyx: [32.0, 2.6, 2.6]

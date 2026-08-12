@@ -112,10 +112,15 @@ conda activate antsreg && python edit_sample_labels.py    # opens a path form
 
 ## The other tools
 
-- **`paint_mask.py`** — paint a binary inclusion/exclusion mask (`KIND="mask"`,
-  e.g. excluding a tissue crack) or a paired guide outline (`KIND="guide"`, fed
-  to `ants.registration`'s `multivariate_extras`). Its guide outputs pair with
-  `../Registration_ants/scripts/project_outline.py`.
+- **`paint_mask.py`** — paint a binary inclusion/exclusion mask (`kind: mask`,
+  e.g. excluding a tissue crack) or a guide outline (`kind: guide`, fed to
+  `ants.registration`'s `multivariate_extras`). A guide export can cover
+  several brain regions at once — one napari brush label per region, named in
+  the config's `region_labels`, each interpolated separately and exported as
+  one multi-label volume plus a `<output>.regions.json` sidecar recording which
+  label is which region. That mapping is what lets `../Registration_ants` build
+  the matching atlas-side outline automatically from the atlas annotation
+  volume, so normally only the sample side is painted here.
 - **`place_landmarks.py`** — click matching anatomical landmarks on the sample
   and on the atlas, in the same order, for `registration_eval.py`'s landmark TRE
   and for `fit_initial_transform.py`.
@@ -274,6 +279,7 @@ own `TransformIndexToPhysicalPoint`.
 ```bash
 conda activate antsreg
 python align_masks.py --selftest                        # also fine in gt_sam
+python paint_mask.py --selftest                         # also fine in gt_sam
 python fit_initial_transform.py --selftest
 python tests/test_registration_eval_smoke.py
 python tests/test_annotate_gt_sam_smoke.py              # also fine in gt_sam
