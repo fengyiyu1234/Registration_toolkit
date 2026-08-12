@@ -34,6 +34,9 @@ class OntologyManager:
     def __init__(self, json_path):
         self.id_to_name = {}
         self.name_to_id = {}
+        # region_id → [(name, acronym), ...]，从根节点到该脑区自身的完整层级链，
+        # 用来在 hover 时把"这是哪一级"说清楚。
+        self.id_to_path = {}
         self.parse_ontology(json_path)
 
     def parse_ontology(self, json_path):
@@ -45,28 +48,33 @@ class OntologyManager:
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        def extract_node(node):
+        def extract_node(node, ancestors=()):
             if isinstance(node, list):
-                for item in node: extract_node(item)
+                for item in node: extract_node(item, ancestors)
                 return
             if isinstance(node, dict):
                 node_id = node.get('id') or node.get('structure_id')
-                graph_order = node.get('graph_order') 
+                graph_order = node.get('graph_order')
                 node_name = node.get('name') or node.get('safe_name') or node.get('acronym')
-                
+
+                path = ancestors
                 if node_name is not None:
                     s_name = DataLoader.clean_part(node_name)
+                    s_acr = DataLoader.clean_part(node.get('acronym'))
+                    path = ancestors + ((s_name, s_acr),)
                     if graph_order is not None:
                         self.id_to_name[int(graph_order)] = s_name
                         self.name_to_id[s_name] = int(graph_order)
+                        self.id_to_path[int(graph_order)] = path
                     if node_id is not None:
                         self.id_to_name[int(node_id)] = s_name
+                        self.id_to_path[int(node_id)] = path
                         if s_name not in self.name_to_id:
                             self.name_to_id[s_name] = int(node_id)
-                
+
                 children = node.get('children') or node.get('msg')
-                if children: extract_node(children)
-        
+                if children: extract_node(children, path)
+
         if isinstance(data, dict):
             if 'msg' in data: extract_node(data['msg'])
             elif 'children' in data: extract_node(data['children'])
@@ -76,6 +84,25 @@ class OntologyManager:
 
     def get_name(self, region_id):
         return self.id_to_name.get(region_id, f"Region {region_id}")
+
+    def get_path(self, region_id):
+        """返回 [(name, acronym), ...]，从最顶层祖先到该脑区自身。找不到就返回空列表。"""
+        return list(self.id_to_path.get(int(region_id), ()))
+
+    @staticmethod
+    def _short(entry):
+        name, acr = entry
+        return acr or name
+
+    def get_lineage_str(self, region_id, sep=" › "):
+        """祖先链（不含自身）的紧凑字符串，优先用 acronym，方便塞进一行状态栏。"""
+        path = self.get_path(region_id)
+        return sep.join(self._short(e) for e in path[:-1])
+
+    def get_lineage_lines(self, region_id):
+        """逐级 'acronym — full name'，用于 tooltip 里看清每一级到底是什么。"""
+        return [f"{i}. {acr + ' — ' if acr else ''}{name}"
+                for i, (name, acr) in enumerate(self.get_path(region_id))]
 
 # ================= 📂 2. 数据加载与处理 =================
 
@@ -588,13 +615,21 @@ class MainController:
                         self.last_hover_val = val
                         if val > 0:
                             region_name = self.ontology.get_name(val)
-                            self.lbl_hover.setText(f"📍 Hover: {region_name} (ID: {val})")
-                            self.lbl_hover.setWordWrap(True)  
-                            self.lbl_hover.setFixedHeight(40) 
-                            self.lbl_hover.setAlignment(Qt.AlignTop | Qt.AlignLeft) 
-                            viewer.status = f"🧠 {region_name} (ID: {val})"
+                            path = self.ontology.get_path(val)
+                            acr = path[-1][1] if path else ""
+                            lineage = self.ontology.get_lineage_str(val)
+                            head = f"{region_name}" + (f" ({acr})" if acr else "")
+                            # 面板里：自身加粗一行 + 祖先链一行（acronym 紧凑，鼠标停在标签上
+                            # 看 tooltip 可以逐级展开成全名），这样一眼就知道当前是第几级。
+                            self.lbl_hover.setText(
+                                f"📍 Hover: <b>{head}</b> (ID: {val})"
+                                + (f"<br><span style='color:#666;'>{lineage}</span>" if lineage else "")
+                            )
+                            self.lbl_hover.setToolTip("\n".join(self.ontology.get_lineage_lines(val)))
+                            viewer.status = (f"🧠 {lineage} › " if lineage else "🧠 ") + f"{head} (ID: {val})"
                         else:
                             self.lbl_hover.setText("📍 Hover: Background")
+                            self.lbl_hover.setToolTip("")
                             viewer.status = ""
 
         @self.viewer.mouse_drag_callbacks.append
@@ -611,7 +646,9 @@ class MainController:
             if rid > 0: 
                 name = self.ontology.get_name(rid)
                 print(f"\n📍 Clicked Region: {name} (ID: {rid})")
-                
+                for line in self.ontology.get_lineage_lines(rid):
+                    print(f"   {line}")
+
                 if name and not name.startswith("Region"):
                     self.input_search.setText(name)
                     self.perform_search("Exact")
@@ -662,6 +699,10 @@ class MainController:
         self.lbl_hover = QLabel("📍 Hover: None")
         self.lbl_hover.setStyleSheet("color: #888; font-size: 11px;")
         self.lbl_hover.setWordWrap(True)
+        self.lbl_hover.setTextFormat(Qt.RichText)
+        self.lbl_hover.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # 层级链会换行，给它留几行高度，免得鼠标一动整个面板跟着抖
+        self.lbl_hover.setMinimumHeight(56)
         layout.addWidget(self.lbl_hover)
 
         layout.addSpacing(5); line_flag = QFrame(); line_flag.setFrameShape(QFrame.HLine); layout.addWidget(line_flag); layout.addSpacing(5)

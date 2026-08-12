@@ -35,22 +35,35 @@ kinds, one shared napari GUI, two different export semantics:
     no longer has to be drawn by hand: the atlas ships a complete
     annotation volume (P04_DevCCF_Annotations_20um.nii.gz) from which
     Registration_ants builds the matching atlas-side outline by looking the
-    region up *by name*. That is what makes the label->region-name mapping
-    below load-bearing rather than cosmetic -- it is the only thing tying
-    "the blob I painted" to "which atlas structure to pair it with".
+    region up. That is what makes the label->region mapping below
+    load-bearing rather than cosmetic -- it is the only thing tying "the blob
+    I painted" to "which atlas structure to pair it with".
     role="atlas" is still supported for the cases where the automatic
     atlas-side region needs to be hand-corrected (set
     EXISTING_MASK_PATH to ../Registration_ants/scripts/project_outline.py's
     output, or to the auto-generated region, as a starting guess instead of
     a blank canvas).
 
+    Picking the region: configure an atlas (`atlas_preset`, reusing
+    Registration_ants' own preset file) and the viewer grows an ontology
+    tree. Selecting any node highlights that structure AND all its
+    descendants in an atlas layer -- the only way a high-level node shows
+    anything, since the annotation's own labels sit at ontology depths 2-12
+    and a depth-3 node owns no voxels under its own id. Assign the selected
+    region to a brush label right there; the export records the ontology IDS
+    (see write_guide_sidecars for why ids rather than names). The atlas is a
+    reference only, never registered to the sample -- what is exported is
+    ids plus voxel indices on the sample's own grid, so nothing about how
+    the atlas is displayed, oriented, or downsampled can reach the output.
+
     Several regions at once: the paint layer is a napari Labels layer, so
     label 1/2/3/... are different brush values, one per brain region (see
-    `region_labels` in configs/paint_mask.example.yaml). They are exported
-    as ONE multi-label volume plus a `.regions.json` sidecar naming each
-    label, and each label is interpolated on its own -- see
-    interpolate_labels_separately for why they must not be interpolated
-    together.
+    `region_labels` in configs/paint_mask.example.yaml). One label can carry
+    SEVERAL atlas regions -- DevCCF has no single "cortex" structure, only 36
+    separate `layer N of <area>` ones. They are exported as ONE multi-label
+    volume plus a `.regions.json` sidecar naming each label, and each label
+    is interpolated on its own -- see interpolate_labels_separately for why
+    they must not be interpolated together.
 
 TWO FACTS THIS TOOL DELIBERATELY DOES NOT PAPER OVER
 
@@ -98,6 +111,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import SimpleITK as sitk
+import yaml
 
 import _local_config  # sibling module
 
@@ -107,6 +121,7 @@ import _local_config  # sibling module
 # ../Registration_ants editable install. Both are hard requirements for the
 # actual painting GUI, which only ever runs in antsreg.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
+QCheckBox = QHBoxLayout = QLineEdit = QSpinBox = QTreeWidget = QTreeWidgetItem = Qt = None
 
 
 def _import_gui():
@@ -114,11 +129,18 @@ def _import_gui():
     top of the GUI entry points; import errors surface there rather than at
     module import, which is what keeps --selftest env-independent."""
     global napari, QLabel, QPushButton, QVBoxLayout, QWidget
+    global QCheckBox, QHBoxLayout, QLineEdit, QSpinBox, QTreeWidget, QTreeWidgetItem, Qt
     import napari as _napari
-    from PyQt5.QtWidgets import (QLabel as _QLabel, QPushButton as _QPushButton,
+    from PyQt5.QtCore import Qt as _Qt
+    from PyQt5.QtWidgets import (QCheckBox as _QCheckBox, QHBoxLayout as _QHBoxLayout,
+                                 QLabel as _QLabel, QLineEdit as _QLineEdit,
+                                 QPushButton as _QPushButton, QSpinBox as _QSpinBox,
+                                 QTreeWidget as _QTreeWidget, QTreeWidgetItem as _QTreeWidgetItem,
                                  QVBoxLayout as _QVBoxLayout, QWidget as _QWidget)
     napari, QLabel, QPushButton = _napari, _QLabel, _QPushButton
     QVBoxLayout, QWidget = _QVBoxLayout, _QWidget
+    QCheckBox, QHBoxLayout, QLineEdit, QSpinBox = _QCheckBox, _QHBoxLayout, _QLineEdit, _QSpinBox
+    QTreeWidget, QTreeWidgetItem, Qt = _QTreeWidget, _QTreeWidgetItem, _Qt
 
 
 def _interpolate_sparse_mask():
@@ -149,42 +171,143 @@ def _load_local_config(cli_path=None):
         existing_mask_path=cfg.get("existing_mask_path") or None,
         role=cfg.get("role", "sample"),
         region_labels=_normalize_region_labels(cfg.get("region_labels") or {}),
+        region_ids=_normalize_region_ids(cfg.get("region_ids") or {}),
         display_scale_zyx=_normalize_display_scale(cfg.get("display_scale_zyx")),
+        atlas=_atlas_reference_config(cfg),
     )
 
 
-def _normalize_region_labels(raw):
-    """{brush label -> brain region name}, keys forced to int.
+# Path to Registration_ants' atlas preset file, so the atlas/ontology this
+# tool shows is literally the same one the pipeline registers against --
+# there is no second place to keep those four paths in sync.
+_DEFAULT_ATLAS_PRESETS = (
+    Path(__file__).resolve().parent.parent / "Registration_ants" / "configs" / "atlas_presets_local.yaml")
+
+_ATLAS_KEYS = ("template_path", "annotation_path", "ontology_path", "resolution_um", "orientation")
+
+
+def _atlas_reference_config(cfg):
+    """Resolve the optional atlas reference (guide mode only) -> SimpleNamespace
+    or None when no atlas is configured.
+
+    `atlas_preset` names an entry in Registration_ants' atlas_presets file
+    (devccf_p04 / demba_p5 / ...); any `atlas_*` key written directly in this
+    config overrides that entry's same-named field, so a one-off atlas needs
+    no preset at all. Only the annotation + ontology are strictly needed (they
+    are what the region picker resolves against); the template is just the
+    grayscale backdrop and may be omitted.
+    """
+    preset_name = cfg.get("atlas_preset")
+    overrides = {key: cfg.get(f"atlas_{key}") for key in _ATLAS_KEYS}
+    overrides["ontology_path"] = cfg.get("ontology_path", overrides["ontology_path"])
+    if not preset_name and not any(v for v in overrides.values()):
+        return None
+
+    resolved = {}
+    if preset_name:
+        presets_path = Path(cfg.get("atlas_presets_path") or _DEFAULT_ATLAS_PRESETS)
+        if not presets_path.exists():
+            raise FileNotFoundError(
+                f"atlas_preset: {preset_name} 需要预设文件 {presets_path}，但它不存在。\n"
+                f"要么改 atlas_presets_path 指向 Registration_ants/configs/atlas_presets_local.yaml，\n"
+                f"要么删掉 atlas_preset、直接在本配置里写 atlas_annotation_path / ontology_path。")
+        with open(presets_path, encoding="utf-8") as f:
+            presets = yaml.safe_load(f) or {}
+        if preset_name not in presets:
+            raise ValueError(
+                f"{presets_path} 里没有预设 {preset_name!r}；有的是: {sorted(presets)}")
+        resolved = {key: presets[preset_name].get(key) for key in _ATLAS_KEYS}
+
+    for key, value in overrides.items():
+        if value is not None:
+            resolved[key] = value
+
+    for required in ("annotation_path", "ontology_path"):
+        if not resolved.get(required):
+            raise ValueError(
+                f"图谱参考需要 {required}（preset {preset_name!r} 里没有，配置里也没写 atlas_{required}）")
+        if not Path(resolved[required]).exists():
+            raise FileNotFoundError(f"图谱 {required} 不存在: {resolved[required]}")
+    if resolved.get("template_path") and not Path(resolved["template_path"]).exists():
+        raise FileNotFoundError(f"图谱 template_path 不存在: {resolved['template_path']}")
+
+    downsample = int(cfg.get("atlas_downsample") or 1)
+    if downsample < 1:
+        raise ValueError(f"atlas_downsample 必须 >= 1，得到 {downsample}")
+
+    return SimpleNamespace(
+        preset=preset_name,
+        template_path=resolved.get("template_path") or None,
+        annotation_path=resolved["annotation_path"],
+        ontology_path=resolved["ontology_path"],
+        resolution_um=float(resolved.get("resolution_um") or 0) or None,
+        orientation=resolved.get("orientation") or None,
+        downsample=downsample,
+    )
+
+
+def _normalize_label_map(raw, key_name, coerce, describe):
+    """{brush label -> [entry, ...]}, label keys forced to int, values always
+    a list.
+
+    A label maps to a LIST, not a single entry, because one guide region
+    routinely needs several ontology entries: DevCCF has no single "cortex"
+    structure, only 36 separate `layer N of <area>` ones, and the pipeline's
+    mask.guide_regions.atlas_names/atlas_ids union a list per label for
+    exactly that reason. A bare scalar is accepted as a one-element list --
+    `1: cortex` is the obvious spelling and reads identically to `1: [cortex]`.
 
     YAML gives `1: cortex` as an int key but `"1": cortex` as a string one,
     and both spellings look identical in the file, so everything downstream
-    would silently miss half the mapping if this didn't normalize. Region
-    names are passed straight through: whether a name actually resolves in
-    the atlas ontology is checked on the Registration_ants side (substring
-    match), not here.
+    would silently miss half the mapping if this didn't normalize.
     """
     if not raw:
         return {}
     if not isinstance(raw, dict):
-        raise ValueError(
-            f"region_labels 应该是 {{label: 脑区名}} 映射，实际是 {type(raw).__name__}")
+        raise ValueError(f"{key_name} 应该是 {{label: {describe}}} 映射，实际是 {type(raw).__name__}")
 
     normalized = {}
-    for key, name in raw.items():
+    for key, entries in raw.items():
         try:
             label = int(key)
         except (TypeError, ValueError):
             raise ValueError(
-                f"region_labels 的 key 必须是画笔 label（整数），得到 {key!r}") from None
+                f"{key_name} 的 key 必须是画笔 label（整数），得到 {key!r}") from None
         if label < 1:
-            raise ValueError(f"region_labels 的 label 必须 >= 1（0 是背景/橡皮），得到 {label}")
+            raise ValueError(f"{key_name} 的 label 必须 >= 1（0 是背景/橡皮），得到 {label}")
         if label in normalized:
-            raise ValueError(f"region_labels 里 label {label} 出现了两次（int 和 str key 各一次？）")
-        name = str(name).strip()
-        if not name:
-            raise ValueError(f"region_labels 里 label {label} 的脑区名是空的")
-        normalized[label] = name
+            raise ValueError(f"{key_name} 里 label {label} 出现了两次（int 和 str key 各一次？）")
+        if isinstance(entries, (str, int)):
+            entries = [entries]
+        try:
+            entries = [coerce(e) for e in entries]
+        except (TypeError, ValueError):
+            raise ValueError(f"{key_name} 里 label {label} 的值应该是 {describe}，得到 {entries!r}") from None
+        if not entries:
+            raise ValueError(f"{key_name} 里 label {label} 的{describe}是空的")
+        normalized[label] = entries
     return normalized
+
+
+def _region_name(value):
+    name = str(value).strip()
+    if not name:
+        raise ValueError(value)
+    return name
+
+
+def _normalize_region_labels(raw):
+    """{brush label -> [brain region name, ...]}. Whether a name actually
+    resolves in the atlas ontology is checked by the ontology picker when an
+    atlas is configured, and on the Registration_ants side otherwise."""
+    return _normalize_label_map(raw, "region_labels", _region_name, "脑区名")
+
+
+def _normalize_region_ids(raw):
+    """{brush label -> [ontology structure id, ...]}. Normally written by the
+    GUI's ontology picker rather than by hand; ids beat names downstream
+    because they are matched exactly instead of as substrings."""
+    return _normalize_label_map(raw, "region_ids", int, "ontology structure id（整数）")
 
 
 def _normalize_display_scale(raw):
@@ -213,6 +336,189 @@ def _read_sitk_array(path):
     return image, sitk.GetArrayFromImage(image)
 
 
+def _read_array(path):
+    """Just the voxels, with the SimpleITK image dropped immediately.
+
+    GetArrayFromImage copies, so the ITK buffer and the numpy array are both
+    live until the image goes out of scope -- and binding it to a throwaway
+    `_` keeps it alive for the rest of the enclosing function. That is 1.1 GB
+    of nothing for the DevCCF annotation, doubling peak memory during the
+    atlas load for a handle the atlas path never uses (unlike the sample
+    path, which needs the image for CopyInformation on export).
+    """
+    return sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
+
+
+# =====================================================================================
+# atlas reference: a read-only backdrop + the ontology the region picker resolves against
+# =====================================================================================
+def _atlas_helpers():
+    """registration_ants.atlas_utils -- the ontology half of it is deliberately
+    free of the antspyx import (see that module's docstring), which is what
+    lets this display-only tool reuse it."""
+    from registration_ants import atlas_utils
+    return atlas_utils
+
+
+def _reorient_zyx(arr_zyx, orientation, atlas_utils):
+    """Apply a ClearMap-style orientation spec to a (z,y,x) array.
+
+    atlas_utils.reorient_volume operates on (x,y,z)-ordered arrays -- the
+    order ants.image_read().numpy() produces -- while everything in this file
+    is (z,y,x), the order sitk.GetArrayFromImage produces (see module
+    docstring fact 2). So the array is flipped into (x,y,z), reoriented, and
+    flipped back. Getting this wrong would silently show the atlas permuted
+    relative to the pipeline's view of it.
+
+    Purely cosmetic here: the picker exports ontology IDS, which say nothing
+    about voxel layout, so no orientation mistake in this display can reach
+    the exported file. It matters only so the reference LOOKS like the atlas
+    the pipeline uses.
+
+    Returns a VIEW, not a copy -- transposes and flips are both views, and the
+    caller downsamples before materializing anything. Copying here instead
+    would double peak memory on a volume that is 1.1 GB to begin with.
+    """
+    if not orientation:
+        return arr_zyx
+    arr_xyz = np.transpose(arr_zyx, (2, 1, 0))
+    arr_xyz = atlas_utils.reorient_volume(arr_xyz, orientation)
+    return np.transpose(arr_xyz, (2, 1, 0))
+
+
+def _compact_annotation(annotation_zyx, chunk=64):
+    """(compact, present_ids) -- annotation relabelled to small consecutive
+    indices into `present_ids`, so highlight lookups run on a uint8/uint16
+    array instead of the raw one.
+
+    The DevCCF P04 annotation reads back as float32 at 800x560x640: 1.1 GB
+    resident, on top of a sample volume that is already several GB. It only
+    carries 193 distinct labels, so an index array costs 287 MB (uint8) and
+    makes np.isin cheap besides.
+
+    Everything here runs a slab at a time, including the label scan, because
+    every obvious one-shot spelling materializes another array the size of
+    the input or worse: np.unique sorts a full flattened copy, and
+    np.unique(return_inverse=True) / np.searchsorted over the whole array both
+    return int64 -- 2.3 GB for this atlas, worse than the problem being
+    solved. `annotation_zyx` is also typically a non-contiguous reoriented
+    VIEW (see _reorient_zyx), so a whole-array operation would quietly
+    materialize that too.
+    """
+    present = set()
+    for z0 in range(0, annotation_zyx.shape[0], chunk):
+        present.update(np.unique(annotation_zyx[z0:z0 + chunk]).tolist())
+    present_ids = np.array(sorted(present))
+
+    dtype = np.uint8 if len(present_ids) <= np.iinfo(np.uint8).max + 1 else np.uint16
+    compact = np.empty(annotation_zyx.shape, dtype=dtype)
+    for z0 in range(0, annotation_zyx.shape[0], chunk):
+        sl = slice(z0, z0 + chunk)
+        compact[sl] = np.searchsorted(present_ids, annotation_zyx[sl]).astype(dtype)
+    return compact, present_ids.astype(np.int64)
+
+
+def voxels_per_ontology_node(structures, present_ids, counts):
+    """{structure id: voxel count including descendants} for EVERY ontology
+    node, from the per-label counts of the annotation.
+
+    Every voxel is credited to its own label and to each of that label's
+    ancestors (structure_id_path is the full root->node chain), so a node at
+    any depth reports the size of the whole subtree under it -- which is
+    exactly what the picker highlights when you click that node.
+
+    Nodes absent from the result have no voxels in this annotation at all.
+    That is the common case, not an edge case: the DevCCF P04 annotation
+    carries 193 of the ontology's 2552 structures. Assigning one of the empty
+    ones would make the pipeline refuse the whole run
+    (_build_guide_regions_from_labels raises when a region matches nothing),
+    so the picker greys them out instead of letting you pick them.
+    """
+    totals = {}
+    for label, count in zip(present_ids, counts):
+        info = structures.get(int(label))
+        if info is None:            # background (0), or a label this ontology doesn't describe
+            continue
+        for ancestor in info["structure_id_path"]:
+            totals[ancestor] = totals.get(ancestor, 0) + int(count)
+    return totals
+
+
+def _load_atlas_reference(atlas_cfg):
+    """Load the atlas backdrop + ontology for the region picker.
+
+    Returns SimpleNamespace(template, compact, present_ids, index_of_id,
+    structures, node_voxels, downsample) -- or raises with a message pointing
+    at the offending config key. `template` is None when no template_path is
+    configured; the picker works without it (highlighting only needs the
+    annotation), you just get no grayscale underneath.
+    """
+    atlas_utils = _atlas_helpers()
+    structures = atlas_utils.load_ccf_ontology_json(atlas_cfg.ontology_path)
+
+    step = atlas_cfg.downsample
+    sub = (slice(None, None, step),) * 3
+
+    print(f"[atlas] annotation: {atlas_cfg.annotation_path}")
+    annotation = _read_array(atlas_cfg.annotation_path)
+    # Reorient and downsample as views, so the only full-size array alive is
+    # the one SimpleITK just read; _compact_annotation reads through the view
+    # a slab at a time and the 1.1 GB original is dropped immediately after.
+    compact, present_ids = _compact_annotation(
+        _reorient_zyx(annotation, atlas_cfg.orientation, atlas_utils)[sub])
+    del annotation
+
+    counts = np.bincount(compact.ravel(), minlength=len(present_ids))
+    node_voxels = voxels_per_ontology_node(structures, present_ids, counts)
+
+    template = None
+    if atlas_cfg.template_path:
+        print(f"[atlas] template:   {atlas_cfg.template_path}")
+        raw_template = _read_array(atlas_cfg.template_path)
+        template = np.ascontiguousarray(
+            _reorient_zyx(raw_template, atlas_cfg.orientation, atlas_utils)[sub])
+        del raw_template
+        if template.shape != compact.shape:
+            print(f"WARNING: atlas template shape {template.shape} != annotation shape "
+                  f"{compact.shape}; showing the annotation only.")
+            template = None
+
+    known = sum(1 for sid in present_ids if int(sid) in structures)
+    print(f"[atlas] ontology: {len(structures)} structures, {len(present_ids)} labels in the "
+          f"annotation ({known} of them in the ontology), {len(node_voxels)} nodes non-empty; "
+          f"grid {compact.shape}" + (f", downsampled {step}x" if step > 1 else ""))
+
+    return SimpleNamespace(
+        template=template,
+        compact=compact,
+        present_ids=present_ids,
+        index_of_id={int(sid): i for i, sid in enumerate(present_ids)},
+        structures=structures,
+        node_voxels=node_voxels,
+        downsample=step,
+    )
+
+
+def highlight_mask(atlas, structure_id):
+    """Binary (z,y,x) mask of one ontology node INCLUDING all its descendants.
+
+    Descendants are resolved through structure_id_path, never by name, so
+    picking a node at any depth lights up the whole subtree -- which is the
+    only way a depth-3 node can highlight anything at all here, since the
+    DevCCF annotation's own labels sit at depths 2 through 12 and a parent
+    node usually owns no voxels under its own id.
+
+    Resolved through atlas_utils.descendant_ids_of, the same function the
+    pipeline's atlas_ids path uses, so what lights up here is exactly what
+    registration will pair against.
+    """
+    wanted = _atlas_helpers().descendant_ids_of(atlas.structures, [structure_id])
+    indices = [atlas.index_of_id[sid] for sid in wanted if sid in atlas.index_of_id]
+    if not indices:
+        return np.zeros(atlas.compact.shape, dtype=np.uint8)
+    return np.isin(atlas.compact, indices).astype(np.uint8)
+
+
 def _load_mask_array(path, expected_shape):
     """Read + binarize an existing mask/guess file. Returns None (with a
     warning) if its shape doesn't match -- caller decides the fallback."""
@@ -237,6 +543,98 @@ def _launch_viewer(arr, prefill, title, image_layer_name, mask_layer_name,
     paint_layer = viewer.add_labels(prefill.copy(), name=mask_layer_name,
                                     **labels_kwargs, **scale_kwargs)
     return viewer, paint_layer
+
+
+def _tree_label(sid, info, voxels):
+    acronym = info.get("acronym")
+    name = f"{info['name']} ({acronym})" if acronym else info["name"]
+    return [name, f"{voxels:,}" if voxels else "—", str(sid)]
+
+
+def populate_ontology_tree(tree, structures, node_voxels):
+    """Fill a QTreeWidget with the whole ontology; returns {sid: item}.
+
+    Built shallowest-first so every node's parent (structure_id_path[-2])
+    already exists when the node is added -- structure_id_path is the full
+    root->node chain, so the tree shape comes straight out of it with no
+    separate child lists to walk.
+
+    Nodes with no voxels in this annotation are marked disabled rather than
+    dropped: an empty node's whole subtree is necessarily empty too (a voxel
+    is credited to every ancestor of its label, so a non-empty child forces a
+    non-empty parent), which makes disabling safe -- it can never hide a
+    pickable descendant -- and keeps the real tree shape visible instead of
+    silently rewriting the ontology.
+    """
+    items = {}
+    for sid, info in sorted(structures.items(), key=lambda kv: len(kv[1]["structure_id_path"])):
+        path = info["structure_id_path"]
+        voxels = node_voxels.get(sid, 0)
+        item = QTreeWidgetItem(_tree_label(sid, info, voxels))
+        item.setData(0, Qt.UserRole, sid)
+        if not voxels:
+            item.setDisabled(True)
+        parent = items.get(path[-2]) if len(path) >= 2 else None
+        (parent or tree.invisibleRootItem()).addChild(item)
+        items[sid] = item
+    return items
+
+
+def visible_tree_ids(structures, node_voxels, text, hide_empty):
+    """Which ontology ids a search box showing `text` should leave visible.
+
+    Every ancestor of a match is included, otherwise a deep hit would be
+    unreachable -- the tree can only show a node if the whole chain down to
+    it is showing. Matching is on name and acronym, since the acronym
+    (DevCCF's "SPall", "THyA", ...) is often what you actually remember.
+    """
+    text = text.strip().lower()
+    visible = set()
+    for sid, info in structures.items():
+        if hide_empty and not node_voxels.get(sid):
+            continue
+        if text and text not in info["name"].lower() and text not in (info.get("acronym") or "").lower():
+            continue
+        visible.update(info["structure_id_path"])
+    return visible
+
+
+def format_assignment(assignment, structures):
+    """The label -> region panel text. Also the thing you check before
+    exporting, so it spells out ids as well as names."""
+    if not assignment:
+        return "还没有分配任何脑区。\n在上面的树里选一个脑区，设好 label 号，点“加到 label”。"
+    lines = []
+    for label in sorted(assignment):
+        entries = assignment[label]
+        names = ", ".join(f"{structures[sid]['name']} [{sid}]" for sid in entries)
+        lines.append(f"  label {label} = {names}")
+    return "brush label → 脑区：\n" + "\n".join(lines)
+
+
+def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size_um=None):
+    """A ready-to-paste mask.guide_regions block for the pipeline config.
+
+    Emitted on export because the ids are the whole point of picking regions
+    in the GUI and retyping them by hand from a JSON sidecar is exactly where
+    they would get corrupted. atlas_names is emitted alongside as a comment
+    only: two sources of truth that can disagree is precisely the failure
+    ids were chosen to remove, so the pipeline reads the ids and the names
+    stay human-facing.
+    """
+    voxel = list(voxel_size_um) if voxel_size_um else ["?", "?", "?"]
+    lines = [
+        "mask:",
+        "  guide_regions:",
+        f"    regions_mask: {output_path}",
+        f"    voxel_size_um: [{voxel[0]}, {voxel[1]}, {voxel[2]}]   # 原图 (x,y,z) µm -- tif header 里没有，必须手填",
+        "    atlas_ids:",
+    ]
+    for label in sorted(region_ids):
+        names = ", ".join(region_names.get(label, []))
+        lines.append(f"      {label}: {list(region_ids[label])}" + (f"   # {names}" if names else ""))
+    lines.append("    weight: 1.0")
+    return "\n".join(lines)
 
 
 def _make_export_dock(viewer, status_label, on_export, button_text, panel_name):
@@ -360,7 +758,10 @@ def interpolate_labels_separately(keyframes_by_label, full_shape, interpolate=No
 
 
 def _label_name(label, region_labels):
-    return region_labels.get(label, "unnamed")
+    """One label's region name(s) as display text -- a label can carry several
+    (see _normalize_label_map), so this joins rather than indexes."""
+    names = region_labels.get(label)
+    return ", ".join(names) if names else "unnamed"
 
 
 def guide_export_warnings(result, region_labels):
@@ -393,7 +794,7 @@ def guide_export_warnings(result, region_labels):
 
     for label in sorted(named - painted):
         warnings.append(
-            f"region_labels lists label {label} ({region_labels[label]}) but nothing was "
+            f"region_labels lists label {label} ({_label_name(label, region_labels)}) but nothing was "
             f"painted with it -- that region has no outline in this export.")
 
     # A single unnamed label with no region_labels at all is the original
@@ -420,13 +821,26 @@ def _output_stem(output_path):
 
 
 def write_guide_sidecars(output_path, image_path, result, region_labels, role, total_z,
-                         spacing_xyz=None):
+                         spacing_xyz=None, region_ids=None, atlas_info=None):
     """Write the two sidecars next to the exported outline, and return their paths.
 
     <stem>.regions.json is the one that matters for this tool: it is the
     only record of which brush label is which brain region, and
     Registration_ants needs exactly that to pull the matching region out of
-    the atlas annotation volume by name.
+    the atlas annotation volume.
+
+    It records both `region_ids` (ontology structure ids, when the region was
+    picked in the GUI's ontology tree) and `regions` (the names, always).
+    Feed the IDS to mask.guide_regions.atlas_ids: they are matched exactly,
+    descendants included, so the region registration pairs against is the one
+    that was highlighted while painting. The names are for reading -- as
+    mask.guide_regions.atlas_names they would be matched as case-insensitive
+    substrings, which can pull in unrelated structures ("Cerebellum" also
+    matches "cerebellum related fiber tracts").
+
+    Both are {label: LIST}, because one guide region often needs several
+    ontology entries -- DevCCF has no single "cortex", only 36 `layer N of
+    <area>` structures.
 
     <stem>.annotated_slices.json is the repo's pre-existing per-mask
     sidecar (written by edit_sample_labels.py and annotate_gt_sam.py, read
@@ -440,9 +854,12 @@ def write_guide_sidecars(output_path, image_path, result, region_labels, role, t
     regions_path = stem.with_name(stem.name + ".regions.json")
     slices_path = stem.with_name(stem.name + ".annotated_slices.json")
 
+    region_ids = region_ids or {}
     all_planes = sorted({z for planes in result.slices_by_label.values() for z in planes})
+    regions = {str(lab): list(region_labels[lab]) for lab in sorted(region_labels)}
     regions_path.write_text(json.dumps({
-        "regions": {str(lab): region_labels[lab] for lab in sorted(region_labels)},
+        "regions": regions,
+        "region_ids": {str(lab): list(region_ids[lab]) for lab in sorted(region_ids)},
         "annotated_slices": {str(lab): planes
                              for lab, planes in sorted(result.slices_by_label.items())},
         "image_path": str(image_path),
@@ -451,12 +868,13 @@ def write_guide_sidecars(output_path, image_path, result, region_labels, role, t
         "total_z": int(total_z),
         "header_spacing_xyz": list(spacing_xyz) if spacing_xyz is not None else None,
         "voxel_size_um_note": VOXEL_SIZE_UM_NOTE,
-    }, indent=2))
+        "atlas": atlas_info,
+    }, indent=2, ensure_ascii=False))
     slices_path.write_text(json.dumps({
         "hand_drawn_slices": all_planes,
         "total_z": int(total_z),
-        "regions": {str(lab): region_labels[lab] for lab in sorted(region_labels)},
-    }, indent=2))
+        "regions": regions,
+    }, indent=2, ensure_ascii=False))
     return regions_path, slices_path
 
 
@@ -496,14 +914,193 @@ def _run_mask(args):
 
 def _region_legend(region_labels):
     """The label -> region-name mapping, shown in the side panel so the
-    brush number you're about to paint with is never a guess."""
+    brush number you're about to paint with is never a guess. Only used when
+    there is no atlas configured -- with one, the assignment panel built by
+    _add_ontology_picker replaces this and is editable."""
     if not region_labels:
         return ("No region_labels in the config: paint one region with label 1.\n"
-                "For several regions, add region_labels to the config first --\n"
+                "For several regions, add region_labels to the config, or configure\n"
+                "an atlas (atlas_preset) to pick them from the ontology tree here --\n"
                 "an unnamed label cannot be paired with an atlas region.\n")
-    lines = "\n".join(f"  label {lab} = {region_labels[lab]}"
+    lines = "\n".join(f"  label {lab} = {_label_name(lab, region_labels)}"
                       for lab in sorted(region_labels))
     return f"Brush label -> brain region:\n{lines}\n"
+
+
+def _seed_assignment(region_labels, region_ids, structures):
+    """Pre-fill the GUI assignment from the config.
+
+    region_ids is taken as-is. Names from region_labels are resolved to ids
+    only on an exact, unique name match -- the substring matching the
+    pipeline does for names is precisely what ids are here to avoid, so
+    guessing on the operator's behalf would reintroduce it. A name that
+    doesn't resolve is reported, not silently dropped, and stays usable as a
+    name-only entry.
+    """
+    by_name = {}
+    for sid, info in structures.items():
+        by_name.setdefault(info["name"].strip().lower(), []).append(sid)
+
+    assignment, unresolved = {}, []
+    for label in sorted(set(region_labels) | set(region_ids)):
+        ids = list(region_ids.get(label, []))
+        for name in region_labels.get(label, []):
+            matches = by_name.get(name.strip().lower(), [])
+            if len(matches) == 1 and matches[0] not in ids:
+                ids.append(matches[0])
+            elif len(matches) != 1:
+                unresolved.append((label, name, len(matches)))
+        if ids:
+            assignment[label] = ids
+    return assignment, unresolved
+
+
+def _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=None):
+    """The ontology tree + label-assignment panel, as a dock on the right.
+
+    Selecting any node highlights that structure and everything under it in
+    a dedicated atlas layer (see highlight_mask), which is the only way to
+    see a high-level region at all: the annotation's own labels sit at
+    ontology depths 2-12, so a depth-3 node owns no voxels under its own id.
+
+    `assignment` ({label: [structure id]}) is mutated in place -- it is the
+    live state the export reads, so there is no separate "apply" step to
+    forget.
+    """
+    scale_kwargs = {"scale": atlas_scale} if atlas_scale is not None else {}
+    highlight = viewer.add_labels(
+        np.zeros(atlas.compact.shape, dtype=np.uint8), name="atlas region (highlight)",
+        opacity=0.55, **scale_kwargs)
+    highlight.editable = False                 # a reference layer; painting here would be meaningless
+
+    # objectNames so these are addressable from outside the closure -- napari
+    # contributes its own QSpinBox/QLineEdit widgets to the same window, so
+    # "the first spin box" is not this panel's brush-label box.
+    search = QLineEdit()
+    search.setObjectName("ontology_search")
+    search.setPlaceholderText("按名字/缩写过滤脑区...")
+    hide_empty = QCheckBox("只显示这份 annotation 里有体素的脑区")
+    hide_empty.setObjectName("ontology_hide_empty")
+    hide_empty.setChecked(True)
+
+    tree = QTreeWidget()
+    tree.setObjectName("ontology_tree")
+    tree.setHeaderLabels(["脑区", "体素", "id"])
+    tree.setColumnWidth(0, 260)
+    tree.setMinimumHeight(320)
+    items = populate_ontology_tree(tree, atlas.structures, atlas.node_voxels)
+
+    label_spin = QSpinBox()
+    label_spin.setObjectName("ontology_brush_label")
+    label_spin.setRange(1, MAX_LABEL)
+    add_btn = QPushButton("加到 label")
+    add_btn.setObjectName("ontology_assign")
+    remove_btn = QPushButton("从 label 移除")
+    remove_btn.setObjectName("ontology_unassign")
+    jump_btn = QPushButton("跳到该脑区中心层")
+    jump_btn.setObjectName("ontology_jump")
+    assign_label = QLabel()
+    picker_status = QLabel()
+    picker_status.setWordWrap(True)
+
+    def selected_id():
+        item = tree.currentItem()
+        return None if item is None else item.data(0, Qt.UserRole)
+
+    def refresh_filter():
+        visible = visible_tree_ids(atlas.structures, atlas.node_voxels,
+                                   search.text(), hide_empty.isChecked())
+        for sid, item in items.items():
+            item.setHidden(sid not in visible)
+        if search.text().strip():
+            tree.expandAll()
+
+    def on_select():
+        sid = selected_id()
+        if sid is None:
+            return
+        info = atlas.structures[sid]
+        voxels = atlas.node_voxels.get(sid, 0)
+        highlight.data = highlight_mask(atlas, sid)
+        highlight.name = f"atlas: {info['name']}"
+        if voxels:
+            picker_status.setText(f"{info['name']} [{sid}]，含后代 {voxels:,} 体素。")
+        else:
+            picker_status.setText(
+                f"{info['name']} [{sid}] 在这份 annotation 里没有任何体素，不能分配 —— "
+                f"流水线遇到匹配不到的区域会直接报错。")
+
+    def on_jump():
+        sid = selected_id()
+        if sid is None or not atlas.node_voxels.get(sid):
+            return
+        planes = np.flatnonzero(highlight.data.any(axis=(1, 2)))
+        if not planes.size:
+            return
+        # dims.set_point takes WORLD coordinates, so the plane index has to go
+        # through the layer's own scale -- the atlas and the sample sit on
+        # different grids sharing one slider, and skipping this would jump to
+        # the atlas's index interpreted as the sample's microns.
+        centre = int(planes[len(planes) // 2])
+        viewer.dims.set_point(0, centre * float(highlight.scale[0]))
+
+    def on_add():
+        sid = selected_id()
+        if sid is None:
+            picker_status.setText("先在树里选一个脑区。")
+            return
+        if not atlas.node_voxels.get(sid):
+            picker_status.setText(
+                f"{atlas.structures[sid]['name']} 在这份 annotation 里没有体素，拒绝分配。")
+            return
+        label = label_spin.value()
+        entries = assignment.setdefault(label, [])
+        if sid not in entries:
+            entries.append(sid)
+        paint_layer.selected_label = label     # so the brush is already right for painting
+        viewer.layers.selection = {paint_layer}
+        refresh_assignment()
+
+    def on_remove():
+        sid = selected_id()
+        label = label_spin.value()
+        if sid is not None and sid in assignment.get(label, []):
+            assignment[label].remove(sid)
+            if not assignment[label]:
+                del assignment[label]
+        refresh_assignment()
+
+    def refresh_assignment():
+        assign_label.setText(format_assignment(assignment, atlas.structures))
+
+    search.textChanged.connect(lambda _t: refresh_filter())
+    hide_empty.toggled.connect(lambda _c: refresh_filter())
+    tree.currentItemChanged.connect(lambda _cur, _prev: on_select())
+    jump_btn.clicked.connect(on_jump)
+    add_btn.clicked.connect(on_add)
+    remove_btn.clicked.connect(on_remove)
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(QLabel("图谱 ontology（选中即高亮，含全部后代）"))
+    layout.addWidget(search)
+    layout.addWidget(hide_empty)
+    layout.addWidget(tree)
+    layout.addWidget(picker_status)
+    layout.addWidget(jump_btn)
+    row = QWidget()
+    row_layout = QHBoxLayout(row)
+    row_layout.addWidget(QLabel("brush label"))
+    row_layout.addWidget(label_spin)
+    row_layout.addWidget(add_btn)
+    row_layout.addWidget(remove_btn)
+    layout.addWidget(row)
+    layout.addWidget(assign_label)
+    viewer.window.add_dock_widget(dock, area="right", name="Atlas / Ontology")
+
+    refresh_filter()
+    refresh_assignment()
+    return SimpleNamespace(highlight=highlight, refresh_assignment=refresh_assignment)
 
 
 def _run_guide(args):
@@ -520,9 +1117,35 @@ def _run_guide(args):
         arr, prefill, f"Paint guide outline ({args.role})", args.role,
         "guide outline (paint here)", scale=args.display_scale_zyx)
 
+    # The atlas is a read-only reference on its own grid, deliberately NOT
+    # registered to the sample -- the whole point of painting a guide is that
+    # the two don't line up yet. Both get an honest physical scale so each is
+    # drawn undistorted; they share one z slider, so scrolling to a highlighted
+    # atlas region also moves the sample view (use "跳到该脑区中心层" to get
+    # there, then scroll back). Nothing about this display reaches the export,
+    # which is ontology ids plus voxel indices on the sample's own grid.
+    atlas = assignment = None
+    if args.atlas:
+        atlas = _load_atlas_reference(args.atlas)
+        atlas_scale = ([args.atlas.resolution_um * atlas.downsample] * 3
+                       if args.atlas.resolution_um else None)
+        scale_kwargs = {"scale": atlas_scale} if atlas_scale is not None else {}
+        if atlas.template is not None:
+            viewer.add_image(atlas.template, name="atlas template", colormap="gray",
+                             visible=False, **scale_kwargs)
+        assignment, unresolved = _seed_assignment(args.region_labels, args.region_ids,
+                                                  atlas.structures)
+        for label, name, n in unresolved:
+            print(f"WARNING: region_labels label {label} 的 {name!r} 在 ontology 里"
+                  f"{'匹配到多个' if n else '匹配不到'}结构（{n} 个），没有转成 id；"
+                  f"请在树里重新选一次。")
+        _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=atlas_scale)
+
     guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask else ""
+    header = ("在右侧 ontology 树里选脑区 → 设 brush label → “加到 label”，然后就用那个\n"
+              "画笔号在样本上画。\n" if atlas else _region_legend(args.region_labels))
     status_label = QLabel(
-        _region_legend(args.region_labels) +
+        header +
         "Paint a rough outline on a few planes per region (start, end, and\n"
         "any plane where the shape changes a lot; at least 2 planes each),\n"
         "then click Export.\n" + guess_note)
@@ -538,20 +1161,41 @@ def _run_guide(args):
             f"Exporting... ({len(keyframes)} labels, {n_planes} painted planes)")
         result = interpolate_labels_separately(keyframes, arr.shape)
 
+        # The GUI assignment is authoritative when an atlas is loaded (it is
+        # what was actually looked at); the config's region_labels are the
+        # fallback for the no-atlas case.
+        if atlas is not None:
+            region_ids = {lab: list(ids) for lab, ids in assignment.items() if ids}
+            region_labels = {lab: [atlas.structures[sid]["name"] for sid in ids]
+                             for lab, ids in region_ids.items()}
+            atlas_info = {
+                "annotation_path": str(args.atlas.annotation_path),
+                "ontology_path": str(args.atlas.ontology_path),
+                "preset": args.atlas.preset,
+                "orientation": list(args.atlas.orientation) if args.atlas.orientation else None,
+                "resolution_um": args.atlas.resolution_um,
+            }
+        else:
+            region_ids, region_labels, atlas_info = dict(args.region_ids), args.region_labels, None
+
         out_sitk = sitk.GetImageFromArray(result.volume)
         out_sitk.CopyInformation(base_sitk)      # keeps the source's (1,1,1) -- see module docstring
         sitk.WriteImage(out_sitk, args.output_path)
         regions_path, slices_path = write_guide_sidecars(
-            args.output_path, args.image_path, result, args.region_labels, args.role,
-            arr.shape[0], spacing_xyz=base_sitk.GetSpacing())
+            args.output_path, args.image_path, result, region_labels, args.role,
+            arr.shape[0], spacing_xyz=base_sitk.GetSpacing(),
+            region_ids=region_ids, atlas_info=atlas_info)
 
         lines = [f"Wrote {args.output_path}", f"Wrote {regions_path}", f"Wrote {slices_path}"]
         for label in sorted(result.slices_by_label):
             lines.append(
-                f"  label {label} ({_label_name(label, args.region_labels)}): "
+                f"  label {label} ({_label_name(label, region_labels)}): "
                 f"{len(result.slices_by_label[label])} painted planes "
                 f"{result.slices_by_label[label]} -> {result.voxels_by_label[label]} voxels")
-        lines += [f"WARNING: {w}" for w in guide_export_warnings(result, args.region_labels)]
+        lines += [f"WARNING: {w}" for w in guide_export_warnings(result, region_labels)]
+        if region_ids:
+            lines += ["", "把下面这段粘进流水线 config：", "",
+                      guide_regions_yaml_snippet(region_ids, region_labels, args.output_path)]
 
         msg = "\n".join(lines)
         status_label.setText(msg)
@@ -658,7 +1302,7 @@ def selftest_three_labels_stay_separate(interp):
             f"label {label} extent {lo}..{hi} != {(zlo, ylo, xlo)}..{(zhi, yhi, xhi)}"
 
     assert result.n_contested == 0 and not result.overlap_pairs, result.overlap_pairs
-    assert guide_export_warnings(result, {1: "a", 2: "b", 3: "c"}) == []
+    assert guide_export_warnings(result, {1: ["a"], 2: ["b"], 3: ["c"]}) == []
     print("   ok")
 
 
@@ -720,7 +1364,7 @@ def selftest_single_plane_label_warns(interp):
     assert result.voxels_by_label[3] == 64, result.voxels_by_label
     assert result.voxels_by_label[1] == 64 * 7, result.voxels_by_label
 
-    warnings = guide_export_warnings(result, {1: "cortex", 3: "corpus callosum"})
+    warnings = guide_export_warnings(result, {1: ["cortex"], 3: ["corpus callosum"]})
     flat = [w for w in warnings if "label 3" in w and "1 plane" in w]
     assert flat, warnings
     assert "corpus callosum" in flat[0], flat[0]
@@ -751,7 +1395,7 @@ def selftest_overlap_is_counted_and_reported(interp):
     assert result.voxels_by_label[1] == 100 * 9 - expected, result.voxels_by_label
     assert result.voxels_by_label[2] == 100 * 5, result.voxels_by_label
 
-    warnings = guide_export_warnings(result, {1: "cortex", 2: "cerebellar hemisphere"})
+    warnings = guide_export_warnings(result, {1: ["cortex"], 2: ["cerebellar hemisphere"]})
     overlap = [w for w in warnings if "claimed by more than one label" in w]
     assert overlap, warnings
     assert str(expected) in overlap[0] and "cerebellar hemisphere" in overlap[0], overlap[0]
@@ -766,7 +1410,7 @@ def selftest_unnamed_and_unpainted_labels_warn(interp):
     result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
                                            interpolate=interp)
 
-    warnings = guide_export_warnings(result, {1: "cortex", 2: "cerebellar hemisphere"})
+    warnings = guide_export_warnings(result, {1: ["cortex"], 2: ["cerebellar hemisphere"]})
     assert any("label 2" in w and "nothing was" in w for w in warnings), warnings
     assert any("label 4" in w and "region_labels entry" in w for w in warnings), warnings
     print("   ok")
@@ -808,20 +1452,36 @@ def selftest_sidecars(interp, tmp_dir):
     result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
                                            interpolate=interp)
 
-    region_labels = {1: "cortex", 2: "cerebellar hemisphere"}
+    # label 1 carries TWO ontology entries, the case a single-name-per-label
+    # sidecar could not express (DevCCF has no single "cortex" structure).
+    region_labels = {1: ["layer 1 of A", "layer 2 of A"], 2: ["cerebellar hemisphere"]}
+    region_ids = {1: [15751, 15756], 2: [15623]}
     out_path = tmp_dir / "s12t_guide_sample.nii.gz"
     regions_path, slices_path = write_guide_sidecars(
         out_path, "/data/s12t/registration.tif", result, region_labels, "sample",
-        SHAPE[0], spacing_xyz=(1.0, 1.0, 1.0))
+        SHAPE[0], spacing_xyz=(1.0, 1.0, 1.0), region_ids=region_ids,
+        atlas_info={"preset": "devccf_p04", "ontology_path": "/atlas/DevCCFv1_ontology.json"})
 
     assert regions_path.name == "s12t_guide_sample.regions.json", regions_path
     assert slices_path.name == "s12t_guide_sample.annotated_slices.json", slices_path
 
     regions = json.loads(regions_path.read_text())
-    assert regions["regions"] == {"1": "cortex", "2": "cerebellar hemisphere"}, regions["regions"]
+    assert regions["regions"] == {"1": ["layer 1 of A", "layer 2 of A"],
+                                  "2": ["cerebellar hemisphere"]}, regions["regions"]
+    assert regions["region_ids"] == {"1": [15751, 15756], "2": [15623]}, regions["region_ids"]
     assert regions["annotated_slices"] == {"1": [0, 4, 8], "2": [2, 6]}, regions["annotated_slices"]
     assert regions["image_path"] == "/data/s12t/registration.tif"
+    assert regions["atlas"]["preset"] == "devccf_p04", regions["atlas"]
     assert "voxel size" in regions["voxel_size_um_note"].lower()
+
+    # The paste-ready pipeline snippet must carry the IDS (names are a comment
+    # only -- two authorities that can disagree is what ids exist to remove).
+    snippet = guide_regions_yaml_snippet(region_ids, region_labels, out_path,
+                                         voxel_size_um=[2.6, 2.6, 32.0])
+    parsed = yaml.safe_load(snippet)["mask"]["guide_regions"]
+    assert parsed["atlas_ids"] == {1: [15751, 15756], 2: [15623]}, parsed
+    assert parsed["voxel_size_um"] == [2.6, 2.6, 32.0], parsed
+    assert "atlas_names" not in parsed, parsed
 
     # Same key registration_eval.load_region_annotation_hint() reads. Asserted
     # by name rather than by importing it: registration_eval pulls in
@@ -836,11 +1496,20 @@ def selftest_sidecars(interp, tmp_dir):
 
 
 def selftest_config_normalizers():
-    print("8. config: region_labels int/str keys, display_scale_zyx validation")
+    print("8. config: region_labels int/str keys + multi-region values, display_scale_zyx")
+    # A bare string and a one-element list must normalize identically -- both
+    # spellings appear in real configs and reading them differently would be
+    # a silent half-mapping.
     assert _normalize_region_labels({1: "cortex", "2": "cerebellar hemisphere"}) == \
-        {1: "cortex", 2: "cerebellar hemisphere"}
+        {1: ["cortex"], 2: ["cerebellar hemisphere"]}
+    assert _normalize_region_labels({1: ["layer 1 of A", "layer 2 of A"]}) == \
+        {1: ["layer 1 of A", "layer 2 of A"]}
     assert _normalize_region_labels(None) == {}
     assert _normalize_region_labels({}) == {}
+
+    assert _normalize_region_ids({1: 15751, "2": [15623, 15666]}) == \
+        {1: [15751], 2: [15623, 15666]}
+    assert _normalize_region_ids(None) == {}
 
     def rejects(fn, value, needle):
         try:
@@ -872,6 +1541,82 @@ def selftest_config_normalizers():
     print("   ok")
 
 
+def _fake_ontology():
+    """A 6-node ontology shaped exactly like load_ccf_ontology_json's output.
+    Branch B is the "in the ontology but not in this annotation" case that
+    the real DevCCF pairing has 2359 of."""
+    return {
+        1:   {"id": 1,   "name": "root",     "acronym": "R",  "structure_id_path": [1]},
+        10:  {"id": 10,  "name": "branch A", "acronym": "BA", "structure_id_path": [1, 10]},
+        100: {"id": 100, "name": "leaf A1",  "acronym": "A1", "structure_id_path": [1, 10, 100]},
+        101: {"id": 101, "name": "leaf A2",  "acronym": "A2", "structure_id_path": [1, 10, 101]},
+        20:  {"id": 20,  "name": "branch B", "acronym": "BB", "structure_id_path": [1, 20]},
+        200: {"id": 200, "name": "leaf B1",  "acronym": "B1", "structure_id_path": [1, 20, 200]},
+    }
+
+
+def selftest_ontology_node_voxels():
+    print("10. ontology: voxels roll up to every ancestor; empty subtrees stay empty")
+    structures = _fake_ontology()
+    # Label 0 is background and has no ontology entry -- it must not crash and
+    # must not be credited to anything.
+    totals = voxels_per_ontology_node(structures, [0, 100, 101], [50, 3, 7])
+
+    assert totals == {1: 10, 10: 10, 100: 3, 101: 7}, totals
+    assert 20 not in totals and 200 not in totals, totals
+
+    # The invariant populate_ontology_tree relies on to disable empty nodes
+    # without ever hiding a pickable descendant: a node with no voxels can
+    # have no non-empty descendant, because every voxel is credited to the
+    # whole ancestor chain.
+    for sid, info in structures.items():
+        if not totals.get(sid):
+            descendants = [d for d, i in structures.items() if sid in i["structure_id_path"]]
+            assert not any(totals.get(d) for d in descendants), (sid, descendants)
+    print("   ok")
+
+
+def selftest_ontology_tree_filter():
+    print("11. ontology: search reveals ancestors, matches acronyms, respects hide-empty")
+    structures = _fake_ontology()
+    node_voxels = {1: 10, 10: 10, 100: 3, 101: 7}
+
+    assert visible_tree_ids(structures, node_voxels, "", True) == {1, 10, 100, 101}
+    assert visible_tree_ids(structures, node_voxels, "", False) == {1, 10, 100, 101, 20, 200}
+
+    # A deep hit is unreachable unless its whole ancestor chain shows too.
+    assert visible_tree_ids(structures, node_voxels, "leaf A2", True) == {1, 10, 101}
+    # Acronyms are searchable: "SPall"/"THyA" is often what you remember.
+    assert visible_tree_ids(structures, node_voxels, "a1", True) == {1, 10, 100}
+
+    # An empty region stays hidden while hide-empty is on, and is reachable
+    # (to look at, not to assign) once it's off.
+    assert visible_tree_ids(structures, node_voxels, "leaf B1", True) == set()
+    assert visible_tree_ids(structures, node_voxels, "leaf B1", False) == {1, 20, 200}
+    print("   ok")
+
+
+def selftest_seed_assignment():
+    print("12. config -> GUI assignment: ids kept, names resolved only when unambiguous")
+    structures = _fake_ontology()
+    structures[300] = {"id": 300, "name": "leaf A1",   # deliberate duplicate name
+                       "acronym": "DUP", "structure_id_path": [1, 20, 300]}
+
+    assignment, unresolved = _seed_assignment(
+        region_labels={1: ["branch A"], 2: ["nope"], 3: ["leaf A1"]},
+        region_ids={1: [101], 4: [200]},
+        structures=structures)
+
+    # Ids pass through; a unique name resolves and is appended alongside them.
+    assert assignment[1] == [101, 10], assignment
+    assert assignment[4] == [200], assignment
+    # A name matching nothing, and one matching two structures, both refuse to
+    # guess -- substring/ambiguous matching is exactly what ids exist to avoid.
+    assert 2 not in assignment and 3 not in assignment, assignment
+    assert sorted((lab, n) for lab, _name, n in unresolved) == [(2, 0), (3, 2)], unresolved
+    print("   ok")
+
+
 def selftest_interpolator_matches_registration_ants():
     print("9. local reference interpolator == registration_ants.mask_utils (when available)")
     try:
@@ -884,6 +1629,34 @@ def selftest_interpolator_matches_registration_ants():
     a = real(keyframes, (12, 20, 20))
     b = _reference_interpolate_sparse_mask(keyframes, (12, 20, 20))
     assert np.array_equal(a, b), f"{int(np.sum(a != b))} voxels differ -- the copy has drifted"
+    print("   ok")
+
+
+def selftest_compact_annotation():
+    print("13. atlas: chunked relabelling is exact, and small enough to be worth it")
+    rng = np.random.default_rng(3)
+    ids = np.array([0, 7, 15564, 21558], dtype=np.float32)   # real DevCCF-scale ids
+    annotation = ids[rng.integers(0, len(ids), size=(70, 12, 9))].astype(np.float32)
+
+    compact, present_ids = _compact_annotation(annotation, chunk=16)   # chunk < z, so it wraps
+
+    assert np.array_equal(present_ids, ids.astype(np.int64)), present_ids
+    assert compact.dtype == np.uint8, compact.dtype
+    # Round-tripping through the index must reproduce the annotation exactly:
+    # a chunk-boundary bug would corrupt only some planes, which is precisely
+    # the kind of thing that would go unnoticed in the GUI.
+    assert np.array_equal(present_ids[compact], annotation.astype(np.int64))
+
+    counts = np.bincount(compact.ravel(), minlength=len(present_ids))
+    assert counts.sum() == annotation.size
+    for i, sid in enumerate(present_ids):
+        assert counts[i] == int((annotation == sid).sum()), (sid, counts[i])
+
+    # >255 distinct labels has to widen, or ids would silently collide.
+    many = np.arange(300, dtype=np.float32).reshape(300, 1, 1) * np.ones((300, 2, 2), np.float32)
+    wide, wide_ids = _compact_annotation(many, chunk=32)
+    assert wide.dtype == np.uint16, wide.dtype
+    assert np.array_equal(wide_ids[wide], many.astype(np.int64))
     print("   ok")
 
 
@@ -902,6 +1675,10 @@ def run_selftests():
         selftest_sidecars(interp, Path(tmp))
     selftest_config_normalizers()
     selftest_interpolator_matches_registration_ants()
+    selftest_ontology_node_voxels()
+    selftest_ontology_tree_filter()
+    selftest_seed_assignment()
+    selftest_compact_annotation()
     print("=== all selftests passed ===")
     return 0
 
@@ -924,8 +1701,8 @@ def main():
     elif cfg.kind == "guide":
         args = SimpleNamespace(image_path=cfg.image_path, output_path=cfg.output_path,
                                 existing_mask=cfg.existing_mask_path, role=cfg.role,
-                                region_labels=cfg.region_labels,
-                                display_scale_zyx=cfg.display_scale_zyx)
+                                region_labels=cfg.region_labels, region_ids=cfg.region_ids,
+                                display_scale_zyx=cfg.display_scale_zyx, atlas=cfg.atlas)
         _run_guide(args)
     else:
         raise ValueError(f"Unknown kind: {cfg.kind!r} (expected 'mask' or 'guide')")

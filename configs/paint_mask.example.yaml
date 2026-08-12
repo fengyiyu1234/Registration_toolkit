@@ -28,21 +28,53 @@ role: sample                    # 只在 kind == "guide" 时有意义："sample"
                                 # 脑区名从 P04_DevCCF_Annotations_20um.nii.gz 自动取。
                                 # atlas 保留给需要手工修正图谱侧区域的情况。
 
-# 只在 kind == "guide" 时有意义。画笔 label 值 → 脑区名。
-# 一个脑区一个 label，在 napari 里切换画笔编号（左侧 label 输入框）来画不同脑区，
-# 导出成一份多 label 的体数据 + 一份 <output>.regions.json 记录这个映射。
+# ===== 图谱参考 + ontology 选区（只在 kind == "guide" 时有意义，可选） =====
+# 配了就会在 napari 右侧多出一个面板：可折叠的 ontology 树 + 搜索框。选中任意
+# 层级的节点，图谱侧就高亮该节点【及其全部后代】（annotation 自己的 label 分布在
+# 第 2~12 层，所以高层节点必须靠后代求并集才看得见东西）。选好脑区 → 设 brush
+# label → 点“加到 label”，画笔会自动切过去，直接开画。
 #
-# 名字必须能在图谱本体里匹配到（下游按名字去图谱标注文件取对应区域，子串匹配，
-# 匹配不到会静默失效，所以填之前先确认）。
+# 图谱只是【参考】，不需要和你的样本对齐 —— 导出的是 ontology structure id，
+# 跟图谱怎么显示、什么朝向、降采样几倍都无关。两者共用一个 z 滑块，滚到图谱某个
+# 脑区时样本的当前层也会跟着动，用面板上的“跳到该脑区中心层”按钮定位。
+#
+# 路径直接复用 Registration_ants 的图谱预设，不用在两个地方各维护一份。
+# atlas_preset: devccf_p04            # 预设名，见 Registration_ants/configs/atlas_presets_local.yaml
+# atlas_presets_path: /home/fyu7/My_project/Registration_ants/configs/atlas_presets_local.yaml
+#                                     # 默认就是 ../Registration_ants/configs/atlas_presets_local.yaml
+#
+# 也可以不用预设，直接写路径（写了就覆盖预设里的同名项）：
+# atlas_annotation_path: /path/to/P04_DevCCF_Annotations_20um.nii.gz   # 必需
+# ontology_path:         /path/to/DevCCFv1_ontology.json               # 必需
+# atlas_template_path:   /path/to/P04_LSFM_20um.nii.gz                 # 可选，只是灰度背景
+# atlas_resolution_um:   20
+# atlas_orientation:     [1, -3, 2]   # 和流水线一致，纯显示用
+#
+# 图谱内存：DevCCF P04 解压后 annotation 1.1 GB、template 573 MB。加载峰值约
+# 2.7 GB，之后常驻会压到 860 MB（annotation 只有 193 个 label，压成 uint8 索引）。
+# 设成 2 则常驻降到 108 MB、峰值 2.4 GB，对正确性完全无害（导出的是 id）。
+# atlas_downsample: 1
+
+# 只在 kind == "guide" 时有意义。画笔 label 值 → 脑区名。
+# 配了图谱的话这里可以不填 —— 在 GUI 的 ontology 树里选就行，导出时以 GUI 里的
+# 分配为准；这里填了的会作为初始值预填进面板（名字只有在 ontology 里能【唯一精确】
+# 匹配到一个结构时才会转成 id，匹配不到或匹配到多个都会提示你去树里重选）。
+#
+# 一个 label 可以对应【多个】脑区（值写成列表）：DevCCF 里没有单个 "cortex"，
+# 只有 36 个 "layer N of <area>"，所以单个名字经常不够用。
 #
 # 不填 = 单区域的老用法：只用 label 1 画，导出结果和加多脑区支持之前逐位一致。
-# 填了的话，画布上出现没在这里登记的 label、或者这里登记了却没画的 label，
-# 导出时都会警告（只警告，文件照写 —— 分几次画是正常用法）。
+# 画布上出现没登记的 label、或登记了却没画的 label，导出时都会警告（只警告，
+# 文件照写 —— 分几次画是正常用法）。
 # 每个 label 至少要画 2 层，否则插值插不出体积，只会得到孤零零的一薄片。
 # region_labels:
-#   1: "cortex"
-#   2: "cerebellar hemisphere"
-#   3: "corpus callosum"
+#   1: ["layer 1 of Isocortex", "layer 2 of Isocortex"]
+#   2: "cerebellar hemisphere"        # 单个的话写成字符串也行
+#
+# 画笔 label → ontology structure id。正常由 GUI 写进 <output>.regions.json，
+# 一般不用手写；写了的话原样带过去（id 是精确匹配，比名字的子串匹配可靠）。
+# region_ids:
+#   1: [15751, 15756]
 
 # 可选，只影响 kind == "guide" 的显示，不影响导出的数值（导出的一直是体素索引）。
 # 注意是 (z, y, x) 顺序 —— 和 SimpleITK 读出来的数组轴序一致，跟流水线配置里
