@@ -1133,6 +1133,18 @@ def _run_guide(args):
         if atlas.template is not None:
             viewer.add_image(atlas.template, name="atlas template", colormap="gray",
                              visible=False, **scale_kwargs)
+        if atlas_scale is not None and args.display_scale_zyx is None:
+            # Both sets of layers share one z slider, positioned in world
+            # coordinates. With the atlas in microns and the sample left at
+            # scale 1 (voxel indices), the sample collapses into the first
+            # few percent of the slider's range and "jump to region" lands
+            # nowhere near it -- so this is worth saying out loud rather than
+            # leaving as a puzzling viewer.
+            print(f"WARNING: 配了图谱但没设 display_scale_zyx。图谱按 {atlas_scale[0]:g} µm 定位，"
+                  f"样本却按体素索引(1,1,1)，两者共用的 z 滑块会对不上，样本会被挤在滑块最前面一小段。"
+                  f"\n         在配置里加上 display_scale_zyx: [z, y, x]（原图微米数，例如 "
+                  f"[32.0, 2.6, 2.6]）。只影响显示，不影响导出。")
+
         assignment, unresolved = _seed_assignment(args.region_labels, args.region_ids,
                                                   atlas.structures)
         for label, name, n in unresolved:
