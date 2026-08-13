@@ -47,11 +47,14 @@ kinds, one shared napari GUI, two different export semantics:
     Picking the region: configure an atlas (`atlas_preset`, reusing
     Registration_ants' own preset file) and the viewer grows an ontology
     tree. Selecting any node highlights that structure AND all its
-    descendants in an atlas layer -- the only way a high-level node shows
-    anything, since the annotation's own labels sit at ontology depths 2-12
-    and a depth-3 node owns no voxels under its own id. Assign the selected
-    region to a brush label right there; the export records the ontology IDS
-    (see write_guide_sidecars for why ids rather than names). The atlas is a
+    descendants -- the only way a high-level node shows anything, since the
+    annotation's own labels sit at ontology depths 2-12 and a depth-3 node
+    owns no voxels under its own id. Assign the selected region to a brush
+    label right there; the export records the ontology IDS (see
+    write_guide_sidecars for why ids rather than names).
+
+    The atlas is drawn in a SECOND, closable window (see _open_atlas_window
+    for the measured reason it must not share the sample's), and is a
     reference only, never registered to the sample -- what is exported is
     ids plus voxel indices on the sample's own grid, so nothing about how
     the atlas is displayed, oriented, or downsampled can reach the output.
@@ -499,27 +502,6 @@ def _load_atlas_reference(atlas_cfg):
     )
 
 
-def atlas_display_step(display_scale_zyx):
-    """The per-voxel display size to draw the atlas at: the SAMPLE's z step,
-    isotropically, never the atlas's own micron size.
-
-    napari steps the shared z slider by the smallest scale across all layers.
-    Give the atlas its true 20 um next to a sample at 32 um and the slider
-    steps by 20, so slider positions land on FRACTIONAL sample planes (0.62,
-    1.25, 1.88, 2.50, ...) -- and there the renderer and the polygon/paint
-    tool round differently, so the stroke lands one plane before the plane on
-    screen. Measured on napari 0.8.0: 5 of every 12 slider positions paint the
-    wrong plane, silently.
-
-    Matching the sample's z step makes every slider position an exact integer
-    sample plane. Applying it to all three axes keeps the atlas isotropic, so
-    it is only drawn larger or smaller, never distorted -- and since the atlas
-    here is a reference with no required spatial correspondence to the sample
-    (its ids are what gets exported, not its geometry), that is free.
-    """
-    return float(display_scale_zyx[0]) if display_scale_zyx else 1.0
-
-
 def highlight_mask(atlas, structure_id):
     """Binary (z,y,x) mask of one ontology node INCLUDING all its descendants.
 
@@ -564,6 +546,35 @@ def _launch_viewer(arr, prefill, title, image_layer_name, mask_layer_name,
     paint_layer = viewer.add_labels(prefill.copy(), name=mask_layer_name,
                                     **labels_kwargs, **scale_kwargs)
     return viewer, paint_layer
+
+
+def _open_atlas_window(atlas, resolution_um):
+    """A SECOND napari window holding the atlas alone: the grayscale template
+    plus the highlight layer the ontology tree drives.
+
+    Kept out of the sample's window on purpose. Sharing one viewer means
+    sharing one z slider, whose step is the smallest scale across all layers
+    -- so an atlas at 20um beside a sample at 32um put slider positions on
+    fractional sample planes (0.62, 1.25, 1.88, ...), where napari 0.8.0's
+    renderer and its paint tool round differently: measured, 5 of every 12
+    slider positions painted one plane BEFORE the plane on screen, silently.
+    Separate windows remove the shared slider, and with it that whole class of
+    bug -- the sample's slider is driven by the sample alone again. It also
+    means the atlas keeps its own true voxel size here instead of being
+    rescaled to stay commensurate with the sample's.
+
+    The window is disposable: nothing here is needed to paint or export (the
+    ontology tree and the label assignment live in the sample's window), so
+    closing it loses no state, and reopening rebuilds it from `atlas`.
+    """
+    scale_kwargs = {"scale": [float(resolution_um) * atlas.downsample] * 3} if resolution_um else {}
+    viewer = napari.Viewer(title="Atlas reference (read-only)")
+    if atlas.template is not None:
+        viewer.add_image(atlas.template, name="atlas template", colormap="gray", **scale_kwargs)
+    highlight = viewer.add_labels(np.zeros(atlas.compact.shape, dtype=np.uint8),
+                                  name="atlas region", opacity=0.55, **scale_kwargs)
+    highlight.editable = False              # a reference; painting here would mean nothing
+    return SimpleNamespace(viewer=viewer, highlight=highlight)
 
 
 def _tree_label(sid, info, voxels):
@@ -916,6 +927,69 @@ def write_guide_sidecars(output_path, image_path, result, region_labels, role, t
     return regions_path, slices_path
 
 
+def load_guide_resume(existing_path, expected_shape):
+    """Restore a previous guide export as EDITABLE keyframes, or None if it
+    can't be resumed that way.
+
+    Reloading the exported volume directly is wrong twice over, which is why
+    this exists rather than reusing _load_mask_array:
+
+      1. That function binarizes (`> 0`), collapsing a multi-label outline
+         into a single label -- every region you separated would merge.
+      2. The exported volume is DENSE: interpolation already filled every
+         plane between the first and last keyframe. Re-reading it makes all
+         of those look hand-drawn, so the next export interpolates on top of
+         the previous export's own guess instead of on your real keyframes.
+         A 5-plane job comes back as 11 planes and drifts further every round.
+
+    So only the planes the `.regions.json` sidecar recorded as hand-drawn are
+    restored, at their original label values -- the same "overlay only the
+    real keyframes onto a fresh baseline" rule edit_sample_labels.py's
+    _load_prior_hand_drawn follows, for the same reason.
+
+    Note the restored plane holds what SURVIVED export: where two labels'
+    interpolations collided, the higher label id won (see
+    interpolate_labels_separately), so a keyframe overlapped by a
+    higher-numbered region comes back missing those voxels. The export
+    warning about contested voxels is what flags that at the time.
+
+    Returns SimpleNamespace(prefill, region_ids, region_labels,
+    slices_by_label) -- region_* being what the sidecar recorded, ready to
+    re-seed the assignment panel so the label numbers keep their meaning.
+    """
+    sidecar = _output_stem(existing_path)
+    sidecar = sidecar.with_name(sidecar.name + ".regions.json")
+    if not sidecar.exists():
+        return None
+
+    meta = json.loads(sidecar.read_text())
+    annotated = meta.get("annotated_slices") or {}
+    if not annotated:
+        return None
+
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(existing_path)))
+    if arr.shape != expected_shape:
+        print(f"WARNING: 续画文件 shape {arr.shape} != 图像 shape {expected_shape}，不预填。")
+        return None
+
+    prefill = np.zeros(expected_shape, dtype=np.uint8)
+    slices_by_label = {}
+    for raw_label, planes in annotated.items():
+        label = int(raw_label)
+        planes = [z for z in planes if 0 <= z < expected_shape[0]]
+        for z in planes:
+            prefill[z][arr[z] == label] = label
+        slices_by_label[label] = sorted(planes)
+
+    return SimpleNamespace(
+        prefill=prefill,
+        slices_by_label=slices_by_label,
+        region_ids=_normalize_region_ids(meta.get("region_ids") or {}),
+        region_labels=_normalize_region_labels(meta.get("regions") or {}),
+        sidecar=sidecar,
+    )
+
+
 def _run_mask(args):
     _import_gui()
     sample_sitk, arr = _read_sitk_array(args.sample_path)
@@ -993,23 +1067,27 @@ def _seed_assignment(region_labels, region_ids, structures):
     return assignment, unresolved
 
 
-def _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=None):
-    """The ontology tree + label-assignment panel, as a dock on the right.
+def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=None):
+    """The ontology tree + label-assignment panel, as a dock on the SAMPLE
+    viewer's right side.
 
-    Selecting any node highlights that structure and everything under it in
-    a dedicated atlas layer (see highlight_mask), which is the only way to
-    see a high-level region at all: the annotation's own labels sit at
-    ontology depths 2-12, so a depth-3 node owns no voxels under its own id.
+    Selecting any node highlights that structure and everything under it (see
+    highlight_mask) in the separate atlas window -- the only way to see a
+    high-level region at all, since the annotation's own labels sit at
+    ontology depths 2-12 and a depth-3 node owns no voxels under its own id.
+
+    Everything needed to paint and export lives HERE, in the sample's window:
+    the atlas window is a disposable viewer that can be closed and reopened at
+    will (see _open_atlas_window) without touching the assignment.
 
     `assignment` ({label: [structure id]}) is mutated in place -- it is the
     live state the export reads, so there is no separate "apply" step to
     forget.
     """
-    scale_kwargs = {"scale": atlas_scale} if atlas_scale is not None else {}
-    highlight = viewer.add_labels(
-        np.zeros(atlas.compact.shape, dtype=np.uint8), name="atlas region (highlight)",
-        opacity=0.55, **scale_kwargs)
-    highlight.editable = False                 # a reference layer; painting here would be meaningless
+    # {"w": SimpleNamespace | None}. napari clears a closed viewer's layers
+    # but leaves the Python object alive, so the Qt window's own destroyed
+    # signal is what actually tells us the user shut it.
+    atlas_window = {"w": None}
 
     # objectNames so these are addressable from outside the closure -- napari
     # contributes its own QSpinBox/QLineEdit widgets to the same window, so
@@ -1037,6 +1115,8 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=Non
     remove_btn.setObjectName("ontology_unassign")
     jump_btn = QPushButton("跳到该脑区中心层")
     jump_btn.setObjectName("ontology_jump")
+    window_btn = QPushButton("打开图谱窗口")
+    window_btn.setObjectName("ontology_window")
     assign_label = QLabel()
     picker_status = QLabel()
     picker_status.setWordWrap(True)
@@ -1044,6 +1124,30 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=Non
     def selected_id():
         item = tree.currentItem()
         return None if item is None else item.data(0, Qt.UserRole)
+
+    def window_open():
+        return atlas_window["w"] is not None
+
+    def ensure_window():
+        """The atlas window, opening one if it isn't up."""
+        if not window_open():
+            win = _open_atlas_window(atlas, resolution_um)
+            win.viewer.window._qt_window.destroyed.connect(_on_window_closed)
+            atlas_window["w"] = win
+            window_btn.setText("关闭图谱窗口")
+        return atlas_window["w"]
+
+    def _on_window_closed(*_args):
+        atlas_window["w"] = None
+        window_btn.setText("打开图谱窗口")
+
+    def on_toggle_window():
+        if window_open():
+            atlas_window["w"].viewer.close()   # destroyed signal resets the state
+            _on_window_closed()
+        else:
+            ensure_window()
+            on_select()                        # show whatever is selected right now
 
     def refresh_filter():
         visible = visible_tree_ids(atlas.structures, atlas.node_voxels,
@@ -1059,28 +1163,35 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=Non
             return
         info = atlas.structures[sid]
         voxels = atlas.node_voxels.get(sid, 0)
-        highlight.data = highlight_mask(atlas, sid)
-        highlight.name = f"atlas: {info['name']}"
         if voxels:
-            picker_status.setText(f"{info['name']} [{sid}]，含后代 {voxels:,} 体素。")
+            picker_status.setText(f"{info['name']} [{sid}]，含后代 {voxels:,} 体素。"
+                                  + ("" if window_open() else " 打开图谱窗口可以看到它。"))
         else:
             picker_status.setText(
                 f"{info['name']} [{sid}] 在这份 annotation 里没有任何体素，不能分配 —— "
                 f"流水线遇到匹配不到的区域会直接报错。")
+        # Only compute the mask when there is somewhere to show it: it is a
+        # full-volume np.isin over the annotation, too expensive to run on
+        # every arrow-key move through the tree with no window open.
+        if window_open():
+            win = atlas_window["w"]
+            win.highlight.data = highlight_mask(atlas, sid)
+            win.highlight.name = f"atlas: {info['name']}"
 
     def on_jump():
         sid = selected_id()
         if sid is None or not atlas.node_voxels.get(sid):
             return
-        planes = np.flatnonzero(highlight.data.any(axis=(1, 2)))
+        win = ensure_window()
+        if win.highlight.data.max() == 0:
+            on_select()
+        planes = np.flatnonzero(win.highlight.data.any(axis=(1, 2)))
         if not planes.size:
             return
         # dims.set_point takes WORLD coordinates, so the plane index has to go
-        # through the layer's own scale -- the atlas and the sample sit on
-        # different grids sharing one slider, and skipping this would jump to
-        # the atlas's index interpreted as the sample's microns.
+        # through the layer's own scale.
         centre = int(planes[len(planes) // 2])
-        viewer.dims.set_point(0, centre * float(highlight.scale[0]))
+        win.viewer.dims.set_point(0, centre * float(win.highlight.scale[0]))
 
     def on_add():
         sid = selected_id()
@@ -1117,14 +1228,16 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=Non
     jump_btn.clicked.connect(on_jump)
     add_btn.clicked.connect(on_add)
     remove_btn.clicked.connect(on_remove)
+    window_btn.clicked.connect(on_toggle_window)
 
     dock = QWidget()
     layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("图谱 ontology（选中即高亮，含全部后代）"))
+    layout.addWidget(QLabel("图谱 ontology（选中即在图谱窗口高亮，含全部后代）"))
     layout.addWidget(search)
     layout.addWidget(hide_empty)
     layout.addWidget(tree)
     layout.addWidget(picker_status)
+    layout.addWidget(window_btn)
     layout.addWidget(jump_btn)
     row = QWidget()
     row_layout = QHBoxLayout(row)
@@ -1138,7 +1251,9 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=Non
 
     refresh_filter()
     refresh_assignment()
-    return SimpleNamespace(highlight=highlight, refresh_assignment=refresh_assignment)
+    ensure_window()          # open it once at startup; closing it is then up to you
+    return SimpleNamespace(refresh_assignment=refresh_assignment,
+                           atlas_window=atlas_window, ensure_window=ensure_window)
 
 
 def _run_guide(args):
@@ -1146,10 +1261,23 @@ def _run_guide(args):
     base_sitk, arr = _read_sitk_array(args.image_path)
 
     prefill = np.zeros(arr.shape, dtype=np.uint8)
-    if args.existing_mask:
+    resume = load_guide_resume(args.existing_mask, arr.shape) if args.existing_mask else None
+    if resume is not None:
+        prefill = resume.prefill
+        planes = sum(len(p) for p in resume.slices_by_label.values())
+        print(f"[resume] 从 {resume.sidecar.name} 恢复了 {planes} 个手画层"
+              f"（{ {lab: p for lab, p in sorted(resume.slices_by_label.items())} }），"
+              f"插值出来的层已丢弃，继续画即可。")
+    elif args.existing_mask:
+        # No sidecar: all this can do is binarize, which merges every region
+        # into label 1 and treats interpolated planes as hand-drawn. Usable as
+        # a rough tracing backdrop, not as a resume.
         loaded = _load_mask_array(args.existing_mask, arr.shape)
         if loaded is not None:
             prefill = loaded
+            print(f"WARNING: {args.existing_mask} 旁边没有 .regions.json，无法按关键帧续画。"
+                  f"\n         已按二值预填：所有脑区被合并成 label 1，且插值出来的层会被当成"
+                  f"手画层。\n         只适合当描图底稿；要真正续画，请用带 sidecar 的导出结果。")
 
     viewer, paint_layer = _launch_viewer(
         arr, prefill, f"Paint guide outline ({args.role})", args.role,
@@ -1157,31 +1285,32 @@ def _run_guide(args):
 
     # The atlas is a read-only reference on its own grid, deliberately NOT
     # registered to the sample -- the whole point of painting a guide is that
-    # the two don't line up yet. Both get an honest physical scale so each is
-    # drawn undistorted; they share one z slider, so scrolling to a highlighted
-    # atlas region also moves the sample view (use "跳到该脑区中心层" to get
-    # there, then scroll back). Nothing about this display reaches the export,
-    # which is ontology ids plus voxel indices on the sample's own grid.
+    # the two don't line up yet. It lives in its OWN window (see
+    # _open_atlas_window for why sharing one was actively harmful), so this
+    # viewer's z slider is driven by the sample alone. Nothing about the atlas
+    # display reaches the export, which is ontology ids plus voxel indices on
+    # the sample's own grid.
     atlas = assignment = None
     if args.atlas:
         atlas = _load_atlas_reference(args.atlas)
-        atlas_scale = [atlas_display_step(args.display_scale_zyx)] * 3
-        scale_kwargs = {"scale": atlas_scale}
-        if atlas.template is not None:
-            viewer.add_image(atlas.template, name="atlas template", colormap="gray",
-                             visible=False, **scale_kwargs)
         if args.display_scale_zyx is None:
             print("WARNING: 没设 display_scale_zyx，样本按各向同性绘制。原图 z 间距通常是面内的 "
                   "10 倍以上，正交视图会被压扁到没法用。\n         建议加上 display_scale_zyx: "
                   "[z, y, x]（原图微米数，例如 [32.0, 2.6, 2.6]）。只影响显示，不影响导出。")
 
-        assignment, unresolved = _seed_assignment(args.region_labels, args.region_ids,
-                                                  atlas.structures)
+        # A resumed file's own sidecar wins over the config: it records what
+        # those label numbers actually meant last session, and painting more
+        # planes under a label that silently changed region would be worse
+        # than any config convenience.
+        seed_labels = resume.region_labels if resume is not None else args.region_labels
+        seed_ids = resume.region_ids if resume is not None else args.region_ids
+        assignment, unresolved = _seed_assignment(seed_labels, seed_ids, atlas.structures)
         for label, name, n in unresolved:
             print(f"WARNING: region_labels label {label} 的 {name!r} 在 ontology 里"
                   f"{'匹配到多个' if n else '匹配不到'}结构（{n} 个），没有转成 id；"
                   f"请在树里重新选一次。")
-        _add_ontology_picker(viewer, atlas, paint_layer, assignment, atlas_scale=atlas_scale)
+        _add_ontology_picker(viewer, atlas, paint_layer, assignment,
+                             resolution_um=args.atlas.resolution_um)
 
     guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask else ""
     header = ("在右侧 ontology 树里选脑区 → 设 brush label → “加到 label”，然后就用那个\n"
@@ -1539,6 +1668,60 @@ def selftest_sidecars(interp, tmp_dir):
     print("   ok")
 
 
+def selftest_resume_restores_only_hand_drawn_planes(interp, tmp_dir):
+    print("15. resume: export -> reload -> add planes, without inheriting the interpolation")
+    canvas = _canvas()
+    _box(canvas, [0, 4, 8], 1, 2, 10, 2, 10)        # label 1: 3 real keyframes
+    _box(canvas, [2, 6], 2, 20, 30, 4, 12)          # label 2: 2 real keyframes
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+
+    out_path = tmp_dir / "resume_guide.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(result.volume), str(out_path))
+    write_guide_sidecars(out_path, "/data/registration.tif", result,
+                         {1: ["cortex"], 2: ["cerebellar hemisphere"]}, "sample", SHAPE[0],
+                         region_ids={1: [15751], 2: [15623]})
+
+    resumed = load_guide_resume(out_path, SHAPE)
+    assert resumed is not None
+
+    # The whole point: exactly the planes that were hand-drawn come back, NOT
+    # the dense interpolation between them. Reloading the volume directly
+    # would give label 1 planes 0..8 and label 2 planes 2..6.
+    assert resumed.slices_by_label == {1: [0, 4, 8], 2: [2, 6]}, resumed.slices_by_label
+    assert sparse_keyframes_by_label(resumed.prefill).keys() == {1, 2}
+    assert {lab: sorted(planes) for lab, planes in
+            sparse_keyframes_by_label(resumed.prefill).items()} == {1: [0, 4, 8], 2: [2, 6]}
+
+    # Labels stay distinct (the old `> 0` path merged them into one).
+    assert set(np.unique(resumed.prefill).tolist()) == {0, 1, 2}, np.unique(resumed.prefill)
+    # And the label -> region mapping survives, so label numbers keep meaning.
+    assert resumed.region_ids == {1: [15751], 2: [15623]}, resumed.region_ids
+    assert resumed.region_labels == {1: ["cortex"], 2: ["cerebellar hemisphere"]}
+
+    # Re-exporting the untouched resume must reproduce the original file
+    # byte-for-byte -- otherwise every save/reload cycle would drift.
+    again = interpolate_labels_separately(sparse_keyframes_by_label(resumed.prefill), SHAPE,
+                                          interpolate=interp)
+    assert np.array_equal(again.volume, result.volume), \
+        f"{int(np.sum(again.volume != result.volume))} voxels drifted across a resume cycle"
+
+    # Adding a keyframe extends that label's span and leaves the other alone.
+    grown = resumed.prefill.copy()
+    _box(grown, [12], 1, 2, 10, 2, 10)
+    third = interpolate_labels_separately(sparse_keyframes_by_label(grown), SHAPE,
+                                          interpolate=interp)
+    assert third.slices_by_label == {1: [0, 4, 8, 12], 2: [2, 6]}, third.slices_by_label
+    assert third.voxels_by_label[1] == 64 * 13, third.voxels_by_label
+    assert third.voxels_by_label[2] == result.voxels_by_label[2], third.voxels_by_label
+
+    # No sidecar next to the file -> refuse to pretend it's resumable.
+    plain = tmp_dir / "no_sidecar.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(result.volume), str(plain))
+    assert load_guide_resume(plain, SHAPE) is None
+    print("   ok")
+
+
 def selftest_config_normalizers():
     print("8. config: region_labels int/str keys + multi-region values, display_scale_zyx")
     # A bare string and a one-element list must normalize identically -- both
@@ -1681,32 +1864,6 @@ def selftest_interpolator_matches_registration_ants():
     print("   ok")
 
 
-def selftest_atlas_scale_keeps_slider_on_sample_planes():
-    print("14. atlas display scale: every z slider step must be an exact sample plane")
-    # napari's shared z slider steps by the SMALLEST scale across layers, so
-    # this reproduces the rule without needing a viewer. The regression being
-    # guarded: an atlas drawn at its own micron size (20) next to a 32um
-    # sample put the slider on fractional sample planes, where napari's
-    # renderer and its paint tool round differently -- strokes landed one
-    # plane before the plane on screen, on 5 of every 12 positions.
-    for sample_scale in ([32.0, 2.6, 2.6], [50.0, 1.0, 1.0], [1.0, 1.0, 1.0]):
-        atlas_step = atlas_display_step(sample_scale)
-        slider_step = min(sample_scale[0], atlas_step)
-        planes = [k * slider_step / sample_scale[0] for k in range(20)]
-        assert all(abs(p - round(p)) < 1e-9 for p in planes), (sample_scale, planes[:5])
-        assert atlas_step == sample_scale[0], (sample_scale, atlas_step)
-
-    # No display scale at all: both sides sit on the voxel-index grid, which
-    # is commensurate too (step 1 = one sample plane).
-    assert atlas_display_step(None) == 1.0
-
-    # The atlas must stay isotropic -- it may be drawn bigger or smaller, but
-    # never squashed along one axis, or the reference stops looking like a brain.
-    scale = [atlas_display_step([32.0, 2.6, 2.6])] * 3
-    assert len(set(scale)) == 1, scale
-    print("   ok")
-
-
 def selftest_compact_annotation():
     print("13. atlas: chunked relabelling is exact, and small enough to be worth it")
     rng = np.random.default_rng(3)
@@ -1748,13 +1905,13 @@ def run_selftests():
     selftest_single_label_matches_old_behaviour(interp)
     with tempfile.TemporaryDirectory() as tmp:
         selftest_sidecars(interp, Path(tmp))
+        selftest_resume_restores_only_hand_drawn_planes(interp, Path(tmp))
     selftest_config_normalizers()
     selftest_interpolator_matches_registration_ants()
     selftest_ontology_node_voxels()
     selftest_ontology_tree_filter()
     selftest_seed_assignment()
     selftest_compact_annotation()
-    selftest_atlas_scale_keeps_slider_on_sample_planes()
     print("=== all selftests passed ===")
     return 0
 
