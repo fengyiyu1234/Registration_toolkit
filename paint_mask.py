@@ -499,6 +499,27 @@ def _load_atlas_reference(atlas_cfg):
     )
 
 
+def atlas_display_step(display_scale_zyx):
+    """The per-voxel display size to draw the atlas at: the SAMPLE's z step,
+    isotropically, never the atlas's own micron size.
+
+    napari steps the shared z slider by the smallest scale across all layers.
+    Give the atlas its true 20 um next to a sample at 32 um and the slider
+    steps by 20, so slider positions land on FRACTIONAL sample planes (0.62,
+    1.25, 1.88, 2.50, ...) -- and there the renderer and the polygon/paint
+    tool round differently, so the stroke lands one plane before the plane on
+    screen. Measured on napari 0.8.0: 5 of every 12 slider positions paint the
+    wrong plane, silently.
+
+    Matching the sample's z step makes every slider position an exact integer
+    sample plane. Applying it to all three axes keeps the atlas isotropic, so
+    it is only drawn larger or smaller, never distorted -- and since the atlas
+    here is a reference with no required spatial correspondence to the sample
+    (its ids are what gets exported, not its geometry), that is free.
+    """
+    return float(display_scale_zyx[0]) if display_scale_zyx else 1.0
+
+
 def highlight_mask(atlas, structure_id):
     """Binary (z,y,x) mask of one ontology node INCLUDING all its descendants.
 
@@ -612,6 +633,20 @@ def format_assignment(assignment, structures):
     return "brush label → 脑区：\n" + "\n".join(lines)
 
 
+def voxel_size_um_from_display_scale(display_scale_zyx):
+    """display_scale_zyx (z,y,x) -> the pipeline's voxel_size_um (x,y,z), or
+    None when no display scale was configured.
+
+    The two configs describe the same physical voxel in OPPOSITE axis orders
+    -- display_scale_zyx matches sitk.GetArrayFromImage's (z,y,x), while
+    mask.guide_regions.voxel_size_um is (x,y,z) like every other micron
+    triple in the pipeline. Reversing it by hand is exactly the kind of step
+    that gets silently miscopied, and a reversed voxel_size_um does not
+    error: it just resamples the outline against the wrong physical size.
+    """
+    return list(reversed(display_scale_zyx)) if display_scale_zyx else None
+
+
 def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size_um=None):
     """A ready-to-paste mask.guide_regions block for the pipeline config.
 
@@ -623,11 +658,14 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
     stay human-facing.
     """
     voxel = list(voxel_size_um) if voxel_size_um else ["?", "?", "?"]
+    note = ("# 原图 (x,y,z) µm，由 display_scale_zyx 反序得到 -- 核对一下"
+            if voxel_size_um else
+            "# 原图 (x,y,z) µm -- tif header 里没有，必须手填")
     lines = [
         "mask:",
         "  guide_regions:",
         f"    regions_mask: {output_path}",
-        f"    voxel_size_um: [{voxel[0]}, {voxel[1]}, {voxel[2]}]   # 原图 (x,y,z) µm -- tif header 里没有，必须手填",
+        f"    voxel_size_um: [{voxel[0]}, {voxel[1]}, {voxel[2]}]   {note}",
         "    atlas_ids:",
     ]
     for label in sorted(region_ids):
@@ -1127,23 +1165,15 @@ def _run_guide(args):
     atlas = assignment = None
     if args.atlas:
         atlas = _load_atlas_reference(args.atlas)
-        atlas_scale = ([args.atlas.resolution_um * atlas.downsample] * 3
-                       if args.atlas.resolution_um else None)
-        scale_kwargs = {"scale": atlas_scale} if atlas_scale is not None else {}
+        atlas_scale = [atlas_display_step(args.display_scale_zyx)] * 3
+        scale_kwargs = {"scale": atlas_scale}
         if atlas.template is not None:
             viewer.add_image(atlas.template, name="atlas template", colormap="gray",
                              visible=False, **scale_kwargs)
-        if atlas_scale is not None and args.display_scale_zyx is None:
-            # Both sets of layers share one z slider, positioned in world
-            # coordinates. With the atlas in microns and the sample left at
-            # scale 1 (voxel indices), the sample collapses into the first
-            # few percent of the slider's range and "jump to region" lands
-            # nowhere near it -- so this is worth saying out loud rather than
-            # leaving as a puzzling viewer.
-            print(f"WARNING: 配了图谱但没设 display_scale_zyx。图谱按 {atlas_scale[0]:g} µm 定位，"
-                  f"样本却按体素索引(1,1,1)，两者共用的 z 滑块会对不上，样本会被挤在滑块最前面一小段。"
-                  f"\n         在配置里加上 display_scale_zyx: [z, y, x]（原图微米数，例如 "
-                  f"[32.0, 2.6, 2.6]）。只影响显示，不影响导出。")
+        if args.display_scale_zyx is None:
+            print("WARNING: 没设 display_scale_zyx，样本按各向同性绘制。原图 z 间距通常是面内的 "
+                  "10 倍以上，正交视图会被压扁到没法用。\n         建议加上 display_scale_zyx: "
+                  "[z, y, x]（原图微米数，例如 [32.0, 2.6, 2.6]）。只影响显示，不影响导出。")
 
         assignment, unresolved = _seed_assignment(args.region_labels, args.region_ids,
                                                   atlas.structures)
@@ -1207,7 +1237,9 @@ def _run_guide(args):
         lines += [f"WARNING: {w}" for w in guide_export_warnings(result, region_labels)]
         if region_ids:
             lines += ["", "把下面这段粘进流水线 config：", "",
-                      guide_regions_yaml_snippet(region_ids, region_labels, args.output_path)]
+                      guide_regions_yaml_snippet(
+                          region_ids, region_labels, args.output_path,
+                          voxel_size_um=voxel_size_um_from_display_scale(args.display_scale_zyx))]
 
         msg = "\n".join(lines)
         status_label.setText(msg)
@@ -1523,6 +1555,11 @@ def selftest_config_normalizers():
         {1: [15751], 2: [15623, 15666]}
     assert _normalize_region_ids(None) == {}
 
+    # (z,y,x) display scale -> (x,y,z) pipeline voxel size. Reversed, not
+    # copied: the two configs use opposite axis orders for the same voxel.
+    assert voxel_size_um_from_display_scale([32.0, 2.6, 2.6]) == [2.6, 2.6, 32.0]
+    assert voxel_size_um_from_display_scale(None) is None
+
     def rejects(fn, value, needle):
         try:
             fn(value)
@@ -1644,6 +1681,32 @@ def selftest_interpolator_matches_registration_ants():
     print("   ok")
 
 
+def selftest_atlas_scale_keeps_slider_on_sample_planes():
+    print("14. atlas display scale: every z slider step must be an exact sample plane")
+    # napari's shared z slider steps by the SMALLEST scale across layers, so
+    # this reproduces the rule without needing a viewer. The regression being
+    # guarded: an atlas drawn at its own micron size (20) next to a 32um
+    # sample put the slider on fractional sample planes, where napari's
+    # renderer and its paint tool round differently -- strokes landed one
+    # plane before the plane on screen, on 5 of every 12 positions.
+    for sample_scale in ([32.0, 2.6, 2.6], [50.0, 1.0, 1.0], [1.0, 1.0, 1.0]):
+        atlas_step = atlas_display_step(sample_scale)
+        slider_step = min(sample_scale[0], atlas_step)
+        planes = [k * slider_step / sample_scale[0] for k in range(20)]
+        assert all(abs(p - round(p)) < 1e-9 for p in planes), (sample_scale, planes[:5])
+        assert atlas_step == sample_scale[0], (sample_scale, atlas_step)
+
+    # No display scale at all: both sides sit on the voxel-index grid, which
+    # is commensurate too (step 1 = one sample plane).
+    assert atlas_display_step(None) == 1.0
+
+    # The atlas must stay isotropic -- it may be drawn bigger or smaller, but
+    # never squashed along one axis, or the reference stops looking like a brain.
+    scale = [atlas_display_step([32.0, 2.6, 2.6])] * 3
+    assert len(set(scale)) == 1, scale
+    print("   ok")
+
+
 def selftest_compact_annotation():
     print("13. atlas: chunked relabelling is exact, and small enough to be worth it")
     rng = np.random.default_rng(3)
@@ -1691,6 +1754,7 @@ def run_selftests():
     selftest_ontology_tree_filter()
     selftest_seed_assignment()
     selftest_compact_annotation()
+    selftest_atlas_scale_keeps_slider_on_sample_planes()
     print("=== all selftests passed ===")
     return 0
 
