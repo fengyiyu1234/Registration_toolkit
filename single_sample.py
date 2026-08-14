@@ -9,6 +9,7 @@ import os
 import glob
 import json
 import re
+import html
 
 
 from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame,
@@ -89,20 +90,27 @@ class OntologyManager:
         """返回 [(name, acronym), ...]，从最顶层祖先到该脑区自身。找不到就返回空列表。"""
         return list(self.id_to_path.get(int(region_id), ()))
 
-    @staticmethod
-    def _short(entry):
-        name, acr = entry
-        return acr or name
-
-    def get_lineage_str(self, region_id, sep=" › "):
-        """祖先链（不含自身）的紧凑字符串，优先用 acronym，方便塞进一行状态栏。"""
-        path = self.get_path(region_id)
-        return sep.join(self._short(e) for e in path[:-1])
-
     def get_lineage_lines(self, region_id):
-        """逐级 'acronym — full name'，用于 tooltip 里看清每一级到底是什么。"""
+        """逐级 'acronym — full name'，用于终端打印时看清每一级到底是什么。"""
         return [f"{i}. {acr + ' — ' if acr else ''}{name}"
                 for i, (name, acr) in enumerate(self.get_path(region_id))]
+
+    def get_lineage_html(self, region_id):
+        """面板里用的层级块：从最顶层祖先一路列到该脑区自身，自身加粗。
+
+        napari 0.8 的状态栏由后台 StatusChecker 线程按图层信息重算，手写 viewer.status
+        会被立刻冲掉，所以脑区名和上级链只在这个面板里显示。
+        """
+        path = self.get_path(region_id)
+        if not path:
+            return "<i style='color:#a66;'>该 ID 不在 ontology 中</i>"
+        lines = []
+        for i, (name, acr) in enumerate(path):
+            text = html.escape(f"{acr} — {name}" if acr else name)
+            if i == len(path) - 1:
+                text = f"<b>{text}</b>"
+            lines.append(f"<span style='color:#666;'>{i:>2}</span>&nbsp;{text}")
+        return "<br>".join(lines)
 
 # ================= 📂 2. 数据加载与处理 =================
 
@@ -614,23 +622,20 @@ class MainController:
                     if val != self.last_hover_val:
                         self.last_hover_val = val
                         if val > 0:
-                            region_name = self.ontology.get_name(val)
                             path = self.ontology.get_path(val)
-                            acr = path[-1][1] if path else ""
-                            lineage = self.ontology.get_lineage_str(val)
-                            head = f"{region_name}" + (f" ({acr})" if acr else "")
-                            # 面板里：自身加粗一行 + 祖先链一行（acronym 紧凑，鼠标停在标签上
-                            # 看 tooltip 可以逐级展开成全名），这样一眼就知道当前是第几级。
+                            if path:
+                                name, acr = path[-1]
+                                head = html.escape(f"{name} ({acr})" if acr else name)
+                            else:
+                                head = f"Region {val}"
+                            # 面板里把整条链从根列到自身（自身加粗），不用鼠标旁边的浮窗，
+                            # 免得挡住画面。
                             self.lbl_hover.setText(
-                                f"📍 Hover: <b>{head}</b> (ID: {val})"
-                                + (f"<br><span style='color:#666;'>{lineage}</span>" if lineage else "")
+                                f"📍 <b>{head}</b> · ID {val}<br>"
+                                + self.ontology.get_lineage_html(val)
                             )
-                            self.lbl_hover.setToolTip("\n".join(self.ontology.get_lineage_lines(val)))
-                            viewer.status = (f"🧠 {lineage} › " if lineage else "🧠 ") + f"{head} (ID: {val})"
                         else:
                             self.lbl_hover.setText("📍 Hover: Background")
-                            self.lbl_hover.setToolTip("")
-                            viewer.status = ""
 
         @self.viewer.mouse_drag_callbacks.append
         def on_click(viewer, event):
@@ -697,13 +702,19 @@ class MainController:
         layout.addWidget(btn_export_highlight)
 
         self.lbl_hover = QLabel("📍 Hover: None")
-        self.lbl_hover.setStyleSheet("color: #888; font-size: 11px;")
+        self.lbl_hover.setStyleSheet("color: #999; font-size: 11px;")
         self.lbl_hover.setWordWrap(True)
         self.lbl_hover.setTextFormat(Qt.RichText)
         self.lbl_hover.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        # 层级链会换行，给它留几行高度，免得鼠标一动整个面板跟着抖
-        self.lbl_hover.setMinimumHeight(56)
-        layout.addWidget(self.lbl_hover)
+        self.lbl_hover.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # DevCCF 最深有十几级，全列出来会很高：固定高度 + 滚动，
+        # 这样鼠标一动整个面板不会跟着抖。
+        hover_scroll = QScrollArea()
+        hover_scroll.setWidgetResizable(True)
+        hover_scroll.setFrameShape(QFrame.NoFrame)
+        hover_scroll.setFixedHeight(180)
+        hover_scroll.setWidget(self.lbl_hover)
+        layout.addWidget(hover_scroll)
 
         layout.addSpacing(5); line_flag = QFrame(); line_flag.setFrameShape(QFrame.HLine); layout.addWidget(line_flag); layout.addSpacing(5)
 
