@@ -27,7 +27,23 @@ std_atlas_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_
 #    OntologyManager 两种编号都会建索引）。
 ontology_json_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
 
-# 4. 可选：视图旋转，只影响显示方向，不改动任何文件。
+# 4. 可选：Native 视图显示哪张样本图。
+#    默认用 sample_dir 里自动找到的降采样图（resampled.tif / *_fine_*um.nii.gz），
+#    看细节会糊；填上原始配准 tiff（pipeline 配置里的 sample.raw_tiff）就改用它，
+#    几 GB~几十 GB 也没关系 —— tiff 走 memmap / zarr 懒加载，napari 只读当前那一层。
+#    标签图和细胞点仍在降采样网格上，这张图靠 scale 自动对齐（= 降采样图形状 /
+#    原图形状，各轴独立算，z 和 xy 倍数不同也没问题），启动时会打印算出来的 scale。
+#    填了这个之后 Grid 默认关掉，变成"图谱轮廓叠在高分原图上"，面板上可以随时切回并排。
+# native_image_path: /data/.../raw_data/s12t/registration.tif
+#
+#    自动比例是形状之比，最多差半个降采样体素（2273→296 那种量级误差 0.2%，够用）。
+#    想精确、或者原图裁过边/加过 padding 导致视野不同时，在这里手动写死。
+#    顺序是 [z, y, x]（注意和 pipeline 配置里 voxel_size_um 的 [x,y,z] 相反），
+#    值 = 原始体素尺寸 ÷ fine_target_um，含义是"一个原始体素 = 几个降采样体素"。
+#    例：raw voxel [2.6, 2.6, 32] µm、fine_target_um: 20 → [32/20, 2.6/20, 2.6/20]
+# native_image_scale: [1.6, 0.13, 0.13]
+
+# 5. 可选：视图旋转，只影响显示方向，不改动任何文件。
 #    0 = 不旋转，1 = 逆时针 90°，2 = 180°，3 = 顺时针 90°。
 #    细胞坐标会跟着一起旋转（DataLoader.rotate_pts），所以点和图不会错位。
 view_rotate_k: 0

@@ -124,7 +124,8 @@ import _local_config  # sibling module
 # ../Registration_ants editable install. Both are hard requirements for the
 # actual painting GUI, which only ever runs in antsreg.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
-QCheckBox = QHBoxLayout = QLineEdit = QSpinBox = QTreeWidget = QTreeWidgetItem = Qt = None
+QCheckBox = QHBoxLayout = QLineEdit = QScrollArea = QSpinBox = None
+QTreeWidget = QTreeWidgetItem = Qt = None
 
 
 def _import_gui():
@@ -132,17 +133,20 @@ def _import_gui():
     top of the GUI entry points; import errors surface there rather than at
     module import, which is what keeps --selftest env-independent."""
     global napari, QLabel, QPushButton, QVBoxLayout, QWidget
-    global QCheckBox, QHBoxLayout, QLineEdit, QSpinBox, QTreeWidget, QTreeWidgetItem, Qt
+    global QCheckBox, QHBoxLayout, QLineEdit, QScrollArea, QSpinBox
+    global QTreeWidget, QTreeWidgetItem, Qt
     import napari as _napari
     from PyQt5.QtCore import Qt as _Qt
     from PyQt5.QtWidgets import (QCheckBox as _QCheckBox, QHBoxLayout as _QHBoxLayout,
                                  QLabel as _QLabel, QLineEdit as _QLineEdit,
-                                 QPushButton as _QPushButton, QSpinBox as _QSpinBox,
+                                 QPushButton as _QPushButton, QScrollArea as _QScrollArea,
+                                 QSpinBox as _QSpinBox,
                                  QTreeWidget as _QTreeWidget, QTreeWidgetItem as _QTreeWidgetItem,
                                  QVBoxLayout as _QVBoxLayout, QWidget as _QWidget)
     napari, QLabel, QPushButton = _napari, _QLabel, _QPushButton
     QVBoxLayout, QWidget = _QVBoxLayout, _QWidget
     QCheckBox, QHBoxLayout, QLineEdit, QSpinBox = _QCheckBox, _QHBoxLayout, _QLineEdit, _QSpinBox
+    QScrollArea = _QScrollArea
     QTreeWidget, QTreeWidgetItem, Qt = _QTreeWidget, _QTreeWidgetItem, _Qt
 
 
@@ -686,14 +690,50 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
     return "\n".join(lines)
 
 
+def _scrollable(label, min_height):
+    """A growing text label wrapped in a scroll area, so its content length
+    stops driving the whole window's minimum size.
+
+    Load-bearing, not cosmetic. A word-wrapped QLabel reports its ENTIRE
+    laid-out text as its minimumSizeHint, and Qt propagates that up the chain
+    dock content -> QDockWidget -> napari's QMainWindow. Measured on this
+    panel layout: filling the export label with a normal 4-label report took
+    the main window's minimum height from 854 px to 1238 px, i.e. past the
+    work area of a 1080p screen. Qt then resizes the window to satisfy the
+    new minimum, and resizing a maximized/fullscreen window drops it back to
+    normal -- that is the "clicking Export exits fullscreen" bug -- after
+    which the window can never be made shorter again, so the z slider at the
+    bottom sits under the taskbar for good.
+
+    Widening/narrowing is no escape either, it is the wrong way round: a
+    word-wrapped label has heightForWidth, so a NARROWER dock needs MORE
+    height (measured on the same report: 648 px at 600 px wide, 1201 px at
+    260 px wide). The one dimension still free makes it worse.
+
+    A QScrollArea's own minimum is a small fixed size, so the report scrolls
+    inside the panel instead of pushing the window around.
+    """
+    label.setWordWrap(True)
+    label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+    scroll = QScrollArea()
+    scroll.setWidget(label)
+    scroll.setWidgetResizable(True)
+    scroll.setMinimumHeight(min_height)
+    return scroll
+
+
 def _make_export_dock(viewer, status_label, on_export, button_text, panel_name):
-    status_label.setWordWrap(True)
+    # Selectable because the guide export prints a ready-to-paste
+    # guide_regions block into this label (guide_regions_yaml_snippet) --
+    # retyping it out of the terminal is exactly the corruption those ids
+    # exist to prevent.
+    status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     export_btn = QPushButton(button_text)
     export_btn.clicked.connect(on_export)
 
     dock = QWidget()
     layout = QVBoxLayout(dock)
-    layout.addWidget(status_label)
+    layout.addWidget(_scrollable(status_label, 120))
     layout.addWidget(export_btn)
     viewer.window.add_dock_widget(dock, area="right", name=panel_name)
 
@@ -1103,7 +1143,12 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
     tree.setObjectName("ontology_tree")
     tree.setHeaderLabels(["脑区", "体素", "id"])
     tree.setColumnWidth(0, 260)
-    tree.setMinimumHeight(320)
+    # A floor, not a target: the tree is what absorbs spare vertical space, so
+    # it fills the dock on a tall window regardless. Keep the floor low enough
+    # that the two right-hand docks' minimum heights, which napari stacks and
+    # therefore ADDS, still leave the window shorter than the screen -- see
+    # _scrollable for what happens when they don't.
+    tree.setMinimumHeight(160)
     items = populate_ontology_tree(tree, atlas.structures, atlas.node_voxels)
 
     label_spin = QSpinBox()
@@ -1117,9 +1162,11 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
     jump_btn.setObjectName("ontology_jump")
     window_btn = QPushButton("打开图谱窗口")
     window_btn.setObjectName("ontology_window")
+    # Both grow with use -- picker_status with the selected region's blurb,
+    # assign_label with one line per assigned brush label -- so both go in
+    # scroll areas for the reason _scrollable spells out.
     assign_label = QLabel()
     picker_status = QLabel()
-    picker_status.setWordWrap(True)
 
     def selected_id():
         item = tree.currentItem()
@@ -1236,7 +1283,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
     layout.addWidget(search)
     layout.addWidget(hide_empty)
     layout.addWidget(tree)
-    layout.addWidget(picker_status)
+    layout.addWidget(_scrollable(picker_status, 56))
     layout.addWidget(window_btn)
     layout.addWidget(jump_btn)
     row = QWidget()
@@ -1246,7 +1293,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
     row_layout.addWidget(add_btn)
     row_layout.addWidget(remove_btn)
     layout.addWidget(row)
-    layout.addWidget(assign_label)
+    layout.addWidget(_scrollable(assign_label, 80))
     viewer.window.add_dock_widget(dock, area="right", name="Atlas / Ontology")
 
     refresh_filter()

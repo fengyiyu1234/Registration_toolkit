@@ -159,6 +159,77 @@ class DataLoader:
         return arr.astype(dtype) if dtype is not None else arr
 
     @staticmethod
+    def open_volume_lazy(path):
+        """打开体积图像但尽量不整卷读进内存。
+
+        原始配准 tiff 动辄几 GB~几十 GB，整卷 imread 会直接吃光内存；napari 每次
+        只显示一层，所以给它一个能按需切片的对象就够了。优先级：
+          memmap（未压缩 tiff，零拷贝，最快）→ zarr/dask（压缩 tiff，按 chunk 解码）
+          → 整卷读入（前两者都不行时的兜底）
+        非 tiff（nii/mhd）没有懒加载路径，只能整卷读 —— 它们本来就是降采样过的小文件。
+        """
+        if not path or not os.path.exists(path): return None
+        if not path.lower().endswith(('.tif', '.tiff')):
+            return sitk.GetArrayFromImage(sitk.ReadImage(path))
+
+        size_gb = os.path.getsize(path) / 2**30
+        try:
+            arr = tifffile.memmap(path, mode='r')
+            print(f"   ↳ memmap 打开 ({size_gb:.1f} GB, shape={arr.shape})，按需读取")
+            return arr
+        except Exception:
+            pass  # 压缩或分块不连续的 tiff memmap 不了，走 zarr
+        try:
+            import dask.array as da
+            store = tifffile.imread(path, aszarr=True)
+            arr = da.from_zarr(store)
+            print(f"   ↳ zarr/dask 打开 ({size_gb:.1f} GB, shape={arr.shape})，按需解码")
+            return arr
+        except Exception as e:
+            print(f"   ↳ 懒加载不可用 ({type(e).__name__}: {e})，整卷读入内存 ({size_gb:.1f} GB)")
+            return tifffile.imread(path)
+
+    @staticmethod
+    def volume_shape(path):
+        """只读 header 拿到 (z, y, x) 形状，不解码任何像素。
+
+        算高分辨率原图的 scale 只需要降采样网格的形状，没必要把降采样图整卷读进来
+        （nii.gz 尤其慢）。ITK 的 GetSize() 是 (x,y,z)，反过来才是 numpy 轴序。
+        """
+        if not path or not os.path.exists(path): return None
+        try:
+            if path.lower().endswith(('.tif', '.tiff')):
+                with tifffile.TiffFile(path) as tf:
+                    return tuple(tf.series[0].shape)
+            reader = sitk.ImageFileReader()
+            reader.SetFileName(path)
+            reader.ReadImageInformation()
+            return tuple(reversed(reader.GetSize()))
+        except Exception as e:
+            print(f"⚠️ 读取形状失败 ({type(e).__name__}: {e}): {path}")
+            return None
+
+    @staticmethod
+    def estimate_contrast(arr, percentiles=(0.5, 95.5), max_planes=64, max_pixels=4_000_000):
+        """抽样估计显示用的对比度，返回 (contrast_limits, 采样到的 (min, max))。
+
+        normalize_image_8bit 那套要把整卷读进来算百分位，对懒加载的大图等于白懒加载。
+        这里先按形状把三个轴的步长都算好、一次切片取样，读进内存的量和图像大小无关
+        —— 写成 arr[::z_step] 再降采样的话，dask 分支会先把几十个整层解码出来
+        （2.8 GB 的原图 ≈ 18 MB/层 × 79 层 = 1.4 GB），等于没懒加载。
+
+        第二个返回值给 contrast_limits_range 用：napari 收到显式 contrast_limits
+        时会把滑条范围也锁成同一对值，不放开的话亮度就提不过 95.5 分位。
+        """
+        z_step = max(1, arr.shape[0] // max_planes)
+        n_planes = -(-arr.shape[0] // z_step)
+        yx_step = max(1, int(np.sqrt(n_planes * arr.shape[1] * arr.shape[2] / max_pixels)))
+        sub = np.asarray(arr[::z_step, ::yx_step, ::yx_step])
+        low, high = np.percentile(sub, list(percentiles))
+        high = max(float(high), float(low) + 1)
+        return (float(low), high), (float(sub.min()), max(float(sub.max()), high))
+
+    @staticmethod
     def resolve_native_paths(target_dir):
         """Find the raw sample image + atlas-labels-warped-to-sample-space
         file, whichever pipeline produced them:
@@ -410,6 +481,53 @@ class MainController:
 
     # --- 视图加载 ---
 
+    def _resolve_native_image_path(self, resampled_path):
+        """Native 视图显示哪张图：配置里指定了原始配准图就用它，否则用降采样图。"""
+        hires = CONFIG.get('native_image_path')
+        if not hires:
+            return resampled_path
+        if not os.path.exists(hires):
+            print(f"⚠️ native_image_path 不存在，退回降采样图: {hires}")
+            return resampled_path
+        print(f"🔍 使用原始分辨率图像: {hires}")
+        return hires
+
+    def _native_image_placement(self, img_shape, ref_shape):
+        """把原始分辨率图像摆到降采样网格（= 世界坐标系）上，返回 (ok, scale)。
+
+        细胞点用的是 cell_registration.csv 里的 resample 空间坐标，标签图也在同一
+        网格上，所以世界坐标保持 = 降采样网格，只给这张高分辨率图加 scale，其余图层
+        和 hover 取值（直接拿 viewer.cursor.position 去索引标签数组）的逻辑都不用动。
+        scale=None 表示两者本来就同一网格，不用缩放；ok=False 表示对不齐、不该显示
+        —— 高分图按 1:1 摆进去会和细胞点差好几倍，还不如不画。
+
+        没有 translate：Registration_ants 用 ants.resample_image 生成降采样图，ITK
+        重采样保留 origin，原图体素 0 的中心就是降采样体素 0 的中心（实测 raw idx i
+        → fine idx i × spacing 比，精确成立），而 napari 把体素 i 画在世界坐标
+        i*scale 处，正好对上。只有 cv2.resize/scipy.zoom 那种"外框对齐"的重采样才需
+        要 (scale-1)/2 的半格补偿 —— 加错方向会整体偏半个降采样体素。
+
+        scale 默认取两者形状之比。ants.resample_image 的输出尺寸是
+        round(size*spacing/target)，所以这个比值最多差半个降采样体素（本样本
+        2273→296，误差 0.2%，边缘累计约 0.5 个 20 µm 体素）；要精确就在 config 里
+        写 native_image_scale = 原始体素尺寸 ÷ fine_target_um，按 (z,y,x) 序。
+        """
+        override = CONFIG.get('native_image_scale')
+        if override:
+            scale = tuple(float(s) for s in override)
+        elif ref_shape is None:
+            print("⚠️ 找不到降采样网格 (resampled.tif / *_fine_*um.nii.gz / 标签图)，"
+                  "无法把原始分辨率图对齐到细胞坐标系。\n"
+                  "   请改用降采样图，或在 config 里显式写 native_image_scale。")
+            return False, None
+        elif tuple(img_shape) == tuple(ref_shape):
+            return True, None
+        else:
+            scale = tuple(r / i for r, i in zip(ref_shape, img_shape))
+        print(f"   ↳ 对齐到降采样网格 {tuple(ref_shape) if ref_shape else '(scale 来自 config)'}: "
+              f"scale={tuple(round(s, 4) for s in scale)}")
+        return True, scale
+
     def load_sample_native_view(self):
         self.viewer.layers.clear()
         self.current_cells_df = pd.DataFrame()
@@ -418,30 +536,67 @@ class MainController:
         resampled_path, mhd_path = DataLoader.resolve_native_paths(self.target_dir)
         cell_reg_dir = os.path.join(self.target_dir, 'cell_registration')
 
-        img_norm, shape = DataLoader.normalize_image_8bit(resampled_path)
+        img_path = self._resolve_native_image_path(resampled_path)
+        img = DataLoader.open_volume_lazy(img_path)
+        if img is not None:
+            if img.ndim > 3:
+                img = np.squeeze(img)  # ImageJ 超栈常带 (Z,1,Y,X) 这种单元素轴
+            if img.ndim != 3:
+                print(f"⚠️ 图像不是 3D (shape={img.shape})，跳过：{img_path}")
+                img = None
         mhd = DataLoader.load_volume(mhd_path, dtype=np.uint32)
         # 使用 cell_registration.csv 中已经算好的 resample 空间坐标 (第4-6列, 0-indexed 3:6)
         df_cells = DataLoader.load_cells_from_registration(cell_reg_dir, self.ontology, coord_start=3)
 
+        # 参考网格取降采样图本身：cell_registration.csv 的 "resample space" 列就是按
+        # 它算的 (registration_ants/cell_points.py 拿 sample_fine 做 physical→index)，
+        # 标签图只是恰好被 warp 到同一个网格上，缺标签图时不至于静默错位。
+        # 放在旋转之前算 —— 这时两个 shape 都还是文件里的原始轴序。
+        scale = None
+        if img is not None:
+            ref_shape = DataLoader.volume_shape(resampled_path)
+            if ref_shape is None and mhd is not None:
+                ref_shape = mhd.shape
+            ok, scale = self._native_image_placement(img.shape, ref_shape)
+            if not ok:
+                img = None
+
         k = CONFIG.get('view_rotate_k', 0)
         if k:
-            if img_norm is not None:
-                img_norm = DataLoader.rotate_vol(img_norm, k)
+            if img is not None:
+                img = DataLoader.rotate_vol(img, k)
+                if scale and k % 2:  # rot90 把 y/x 两轴换了位置，scale 也得跟着换
+                    scale = (scale[0], scale[2], scale[1])
             if mhd is not None:
                 orig_shape = mhd.shape
                 mhd = DataLoader.rotate_vol(mhd, k)
                 if not df_cells.empty:
                     df_cells[['z', 'y', 'x']] = DataLoader.rotate_pts(df_cells[['z', 'y', 'x']].values, k, orig_shape)
 
-        if img_norm is not None:
-            self.viewer.add_image(img_norm, name="Raw Image", colormap="gray", blending='additive')
+        if img is not None:
+            limits, full_range = DataLoader.estimate_contrast(img)
+            img_layer = self.viewer.add_image(img, name="Raw Image", colormap="gray",
+                                              blending='additive', scale=scale,
+                                              contrast_limits=limits)
+            # 显式传 contrast_limits 时 napari 会把 contrast_limits_range 锁成同一对
+            # 值，滑条就提不过 95.5 分位了；QC 时经常要拉亮看暗处，所以放开范围。
+            img_layer.contrast_limits_range = full_range
+            if scale is not None:
+                print("   ↳ 高分辨率图只适合 2D 逐层看；别切 3D 渲染 (ndisplay=3)，"
+                      "napari 会把整卷塞进显存。")
+        elif img_path:
+            print(f"⚠️ 未显示样本图像：{img_path}")
         else:
             print(f"⚠️ 找不到样本图像 (resampled.tif 或 *_fine_*um.nii.gz)，目录: {self.target_dir}")
 
         labels_layer = None
         if mhd is not None:
             self.current_atlas_labels = mhd
-            labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.05, visible=False)
+            # 默认可见 + 轮廓模式：判断配准好坏看的就是脑区边界和解剖结构对不对得上，
+            # 轮廓压在高分辨率原图上能直接看出偏多少，填充模式反而把细节盖住了。
+            # （napari 0.8 的 Labels.__init__ 不收 contour，只能建完再设。）
+            labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.7)
+            labels_layer.contour = 1
             self.setup_highlight_layers(mhd.shape)
         else:
             print(f"⚠️ 找不到样本空间标签图 (volume/result.mhd 或 *_labels_in_sample.nii.gz)，无法为细胞赋予准确的脑区颜色和筛选。")
@@ -493,11 +648,12 @@ class MainController:
         self.setup_flag_layer()
 
     def _apply_grid_layout(self, atlas_layer_name):
+        # 图谱图层移到最顶层：叠加模式下轮廓要压在原图上面才看得见。
         if atlas_layer_name in self.viewer.layers:
             idx = self.viewer.layers.index(atlas_layer_name)
             self.viewer.layers.move(idx, -1)
-        self.viewer.grid.enabled = True
         self.viewer.grid.shape = (-1, 3)
+        self.viewer.grid.enabled = self.cb_grid.isChecked()
 
     def on_cell_layer_click(self, event):
         layer = event.source
@@ -670,6 +826,14 @@ class MainController:
         self.combo_sample.addItem(f"📍 [Atlas ] {self.sample_name}")
         self.combo_sample.currentTextChanged.connect(self.on_mode_change)
         layout.addWidget(self.combo_sample)
+
+        # 叠加 = 图谱轮廓压在（高分辨率的）原图上，一眼看出边界偏没偏；
+        # 并排 = 每个图层各占一格、相机联动，适合对着看整体形状。
+        self.cb_grid = QCheckBox("Grid 并排 (取消勾选 = 叠加对比)")
+        self.cb_grid.setChecked(not CONFIG.get('native_image_path'))
+        self.cb_grid.stateChanged.connect(
+            lambda state: setattr(self.viewer.grid, 'enabled', state == Qt.Checked))
+        layout.addWidget(self.cb_grid)
 
         h_size = QHBoxLayout()
         h_size.addWidget(QLabel("<b>Cell Size:</b>"))
