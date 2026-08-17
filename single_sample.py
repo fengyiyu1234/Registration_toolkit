@@ -739,7 +739,8 @@ class MainController:
 
         for cls_name in unique_classes:
             cb = QCheckBox(cls_name)
-            cb.setChecked(True)
+            # 默认全部不勾选：细胞点铺满整卷会盖住图谱轮廓，先看配准、再按需打开类别。
+            cb.setChecked(False)
             cb.stateChanged.connect(lambda state, n=cls_name: self.on_cell_check_toggle(n, state))
             self.layout_classes.addWidget(cb)
             self.cell_checkboxes[cls_name] = cb
@@ -919,7 +920,7 @@ class MainController:
             # 默认可见 + 轮廓模式：判断配准好坏看的就是脑区边界和解剖结构对不对得上，
             # 轮廓压在高分辨率原图上能直接看出偏多少，填充模式反而把细节盖住了。
             # （napari 0.8 的 Labels.__init__ 不收 contour，只能建完再设。）
-            labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.7)
+            labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.5)
             labels_layer.contour = 1
             self.setup_highlight_layers(mhd.shape)
         else:
@@ -972,7 +973,7 @@ class MainController:
                 if not df_cells.empty:
                     df_cells[['z', 'y', 'x']] = DataLoader.rotate_pts(df_cells[['z', 'y', 'x']].values, k, orig_shape)
             self.current_atlas_labels = data
-            atlas_layer = self.viewer.add_labels(self.current_atlas_labels, name="Atlas Anatomy", opacity=0.3)
+            atlas_layer = self.viewer.add_labels(self.current_atlas_labels, name="Atlas Anatomy", opacity=0.5)
             self.setup_highlight_layers(self.current_atlas_labels.shape)
         else:
             # 图谱标签图缺失也要能看细胞（细胞的 atlas 空间坐标和脑区名都在 csv 里）。

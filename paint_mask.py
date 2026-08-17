@@ -91,10 +91,13 @@ kinds, one shared napari GUI, two different export semantics:
     write_guide_sidecars for why ids rather than names).
 
     The atlas is drawn in a SECOND, closable window (see _open_atlas_window
-    for the measured reason it must not share the sample's), and is a
-    reference only, never registered to the sample -- what is exported is
-    ids plus voxel indices on the sample's own grid, so nothing about how
-    the atlas is displayed, oriented, or downsampled can reach the output.
+    for the measured reason it must not share the sample's) as three stacked
+    layers -- the grayscale template, the complete annotation in colour, and
+    the region currently selected in the tree -- each toggleable from napari's
+    own layer list. It is a reference only, never registered to the sample --
+    what is exported is ids plus voxel indices on the sample's own grid, so
+    nothing about how the atlas is displayed, oriented, or downsampled can
+    reach the output.
 
     Several regions at once: the paint layer is a napari Labels layer, so
     label 1/2/3/... are different brush values, one per brain region (see
@@ -590,9 +593,42 @@ def _launch_viewer(arr, prefill, title, image_layer_name, mask_layer_name,
     return viewer, paint_layer
 
 
+def annotation_features(atlas):
+    """Hover text for the full-annotation layer, one row per compact label.
+
+    That layer holds COMPACT indices (see _compact_annotation), which mean
+    nothing on their own -- index 37 is not structure 37. napari's Labels
+    layer appends a features row to the status bar next to the value under
+    the cursor, matched through the 'index' column, so mapping compact index
+    -> the real structure's name and id here is what makes the layer readable
+    without hunting for the label in the tree.
+    """
+    names, ids = [], []
+    for sid in atlas.present_ids:
+        sid = int(sid)
+        info = atlas.structures.get(sid)
+        if sid == 0:
+            names.append("背景")
+        elif info is None:
+            names.append(f"ontology 里没有 id {sid}")
+        else:
+            acronym = info.get("acronym")
+            names.append(f"{info['name']} ({acronym})" if acronym else info["name"])
+        ids.append(sid)
+    return {"index": np.arange(len(atlas.present_ids)), "脑区": names, "id": ids}
+
+
 def _open_atlas_window(atlas, resolution_um):
-    """A SECOND napari window holding the atlas alone: the grayscale template
-    plus the highlight layer the ontology tree drives.
+    """A SECOND napari window holding the atlas alone, as three stacked layers:
+    the grayscale template underneath, the COMPLETE annotation in colour over
+    it, and on top the highlight layer the ontology tree drives.
+
+    All three are independent napari layers, so the layer list's own
+    checkboxes and opacity slider are the controls: annotation off to read the
+    plain template, annotation on to see where the selected region sits among
+    its neighbours. The annotation starts semi-transparent and the highlight is
+    forced to solid red rather than taking a colormap colour, so it stays
+    distinguishable on top of 190-odd annotation colours.
 
     Kept out of the sample's window on purpose. Sharing one viewer means
     sharing one z slider, whose step is the smallest scale across all layers
@@ -612,11 +648,21 @@ def _open_atlas_window(atlas, resolution_um):
     scale_kwargs = {"scale": [float(resolution_um) * atlas.downsample] * 3} if resolution_um else {}
     viewer = napari.Viewer(title="Atlas reference (read-only)")
     if atlas.template is not None:
-        viewer.add_image(atlas.template, name="atlas template", colormap="gray", **scale_kwargs)
+        viewer.add_image(atlas.template, name="reference（模板灰度）",
+                         colormap="gray", **scale_kwargs)
+    # atlas.compact itself, not a copy: 190-odd labels over an 800^3 grid is
+    # the biggest array in the process, and the layer is read-only anyway.
+    annotation = viewer.add_labels(atlas.compact, name="annotation（全部脑区）",
+                                   opacity=0.45, features=annotation_features(atlas),
+                                   **scale_kwargs)
+    annotation.editable = False
     highlight = viewer.add_labels(np.zeros(atlas.compact.shape, dtype=np.uint8),
-                                  name="atlas region", opacity=0.55, **scale_kwargs)
+                                  name="selection（选中的脑区）", opacity=0.85,
+                                  colormap=napari.utils.DirectLabelColormap(
+                                      color_dict={None: "transparent", 1: "red"}),
+                                  **scale_kwargs)
     highlight.editable = False              # a reference; painting here would mean nothing
-    return SimpleNamespace(viewer=viewer, highlight=highlight)
+    return SimpleNamespace(viewer=viewer, highlight=highlight, annotation=annotation)
 
 
 def _tree_label(sid, info, voxels):
@@ -1659,7 +1705,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
         if window_open():
             win = atlas_window["w"]
             win.highlight.data = highlight_mask(atlas, sid)
-            win.highlight.name = f"atlas: {info['name']}"
+            win.highlight.name = f"selection: {info['name']}"
 
     def on_jump():
         sid = selected_id()
