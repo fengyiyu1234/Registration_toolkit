@@ -55,6 +55,14 @@ class OntologyManager:
         self.go_to_path = {}
         self.go_to_id = {}
         self.has_graph_order = False
+        # float32 别名。ClearMap 的图谱标注是 float32 存的
+        # (DeMBA_P5_annotation_trimmed*.tif)，而 CCF v3 里有 124 个 id 超过 float32
+        # 的 24 位有效精度，写进文件时就被舍入成了另一个数（526157192 → 526157184），
+        # 拿文件里的值去 ontology 查必然查不到 —— 本机图谱里这类体素占 1.0%，
+        # hover 显示成 "Region 526157184"、按名字搜也搜不出来。
+        # 两张表分别给"读文件的值→真实 id"和"真实 id→文件里的值"兜一次。
+        self.f32_to_ids = {}
+        self.id_to_f32 = {}
         self.parse_ontology(json_path)
 
     def parse_ontology(self, json_path):
@@ -92,6 +100,10 @@ class OntologyManager:
                         # 同名脑区（不同半球等）保留先遇到的那个 id，和以前一致
                         if s_name not in self.name_to_id:
                             self.name_to_id[s_name] = int(node_id)
+                        alias = int(np.float32(int(node_id)))
+                        if alias != int(node_id):
+                            self.id_to_f32[int(node_id)] = alias
+                            self.f32_to_ids.setdefault(alias, []).append(int(node_id))
 
                 children = node.get('children') or node.get('msg')
                 if children: extract_node(children, path)
@@ -103,20 +115,49 @@ class OntologyManager:
         elif isinstance(data, list):
             extract_node(data)
 
-    def get_name(self, region_id, key='id'):
-        table = self.go_to_name if key == 'graph_order' else self.id_to_name
+    def resolve_label_value(self, value):
+        """把标签体积里读到的数值换成 ontology 里真实存在的 id。
+
+        返回 (id, ambiguous)。ambiguous=True 表示这个被 float32 舍入过的值对应
+        多个真实 id（如 526157192 和 526157196 都存成 526157184，通常是同一脑区的
+        相邻亚层），只能取第一个 —— 调用方该把结果标成"近似"，不要说得太确定。
+        """
         try:
-            return table.get(int(region_id), f"Region {region_id}")
+            v = int(value)
         except (TypeError, ValueError):
+            return None, False
+        if v in self.id_to_name:
+            return v, False
+        cands = self.f32_to_ids.get(v)
+        if cands:
+            return cands[0], len(cands) > 1
+        return v, False
+
+    def label_value_variants(self, region_id):
+        """一个真实 id 在标签体积里可能以哪些数值出现（自己 + float32 别名）。"""
+        alias = self.id_to_f32.get(int(region_id))
+        return (int(region_id), alias) if alias is not None else (int(region_id),)
+
+    def get_name(self, region_id, key='id'):
+        if key == 'graph_order':
+            try:
+                return self.go_to_name.get(int(region_id), f"Region {region_id}")
+            except (TypeError, ValueError):
+                return f"Region {region_id}"
+        rid, _ = self.resolve_label_value(region_id)
+        if rid is None:
             return f"Region {region_id}"
+        return self.id_to_name.get(rid, f"Region {region_id}")
 
     def get_path(self, region_id, key='id'):
         """返回 [(name, acronym), ...]，从最顶层祖先到该脑区自身。找不到就返回空列表。"""
-        table = self.go_to_path if key == 'graph_order' else self.id_to_path
-        try:
-            return list(table.get(int(region_id), ()))
-        except (TypeError, ValueError):
-            return []
+        if key == 'graph_order':
+            try:
+                return list(self.go_to_path.get(int(region_id), ()))
+            except (TypeError, ValueError):
+                return []
+        rid, _ = self.resolve_label_value(region_id)
+        return list(self.id_to_path.get(rid, ())) if rid is not None else []
 
     def to_label_id(self, value, key='id'):
         """把细胞表里的编号换算成标签体积用的 atlas id。
@@ -319,27 +360,25 @@ class DataLoader:
                     列 "resample 空间" 坐标所在的网格，两条流程都是**未裁剪**的
                     那一份：ClearMap 的 resampled.tif（cellMap.py 里
                     sink_shape 固定用全图）/ ANTs 的 <name>_fine_*um.nii.gz）
-          labels    图谱标签图 warp 回样本空间的结果
-          ref_gray  图谱参考灰度图 warp 回样本空间的结果（只有 ClearMap 有：它是
-                    把 reference 当 moving 配到样本上的，elastix 的 result.1 就是
-                    这张图）。标签图缺失时用它替代，好歹还能肉眼核对配准。
-          cropped   labels/ref_gray 是否处在"裁剪后"的网格上（见下）
+          labels    图谱标签图 warp 回样本空间的结果 —— 两条流程的 Native 视图都靠
+                    它画脑区轮廓、hover 查脑区（ClearMap 的 volume/result.mhd 由
+                    cellMap.py 的 transform_annotation_volume() 生成，ANTs 的是
+                    <name>_labels_in_sample.nii.gz）
+          cropped   labels 是否处在"裁剪后"的网格上（见下）
 
         ClearMap 的 registration.crop_for_registration 会先把 resampled.tif 裁一
-        块出来当 elastix 的 fixed image，于是 volume/result.mhd 和 elastix 的
-        result.*.mhd 都在裁剪后的小网格上，而细胞坐标在全图网格上 —— 两者要对齐得
-        先按裁剪偏移补回去（clearmap_crop_info + pad_to_grid 负责）。ANTs 那边 labels_in_sample
+        块出来当 elastix 的 fixed image，于是 volume/result.mhd 也在裁剪后的小网格
+        上，而细胞坐标在全图网格上 —— 两者要对齐得先按裁剪偏移补回去
+        （clearmap_crop_info + pad_to_grid 负责）。ANTs 那边 labels_in_sample
         是写回未裁剪 fine 网格的（实测 251×517×295，和 fine_20um 同形状），不需要。
         """
         cm_img = os.path.join(target_dir, 'resampled.tif')
         cm_labels = os.path.join(target_dir, 'volume', 'result.mhd')
-        cm_ref = os.path.join(target_dir, 'elastix_auto_to_reference', 'result.1.mhd')
         if os.path.exists(cm_img) or os.path.exists(cm_labels):
             return {
                 'pipeline': 'clearmap',
                 'img': cm_img if os.path.exists(cm_img) else None,
                 'labels': cm_labels if os.path.exists(cm_labels) else None,
-                'ref_gray': cm_ref if os.path.exists(cm_ref) else None,
                 'cropped': True,
             }
 
@@ -349,7 +388,6 @@ class DataLoader:
             'pipeline': 'ants' if (fine_matches or labels_matches) else None,
             'img': fine_matches[0] if fine_matches else None,
             'labels': labels_matches[0] if labels_matches else None,
-            'ref_gray': None,
             'cropped': False,
         }
 
@@ -650,6 +688,10 @@ class MainController:
         else:
             for name, region_id in self.ontology.name_to_id.items():
                 if keyword.lower() in name.lower(): matched_ids.append(region_id)
+        # float32 存的图谱里大 id 会被舍入（见 OntologyManager 的 f32 别名），
+        # 只按真实 id 找会漏掉整块脑区。
+        matched_ids = [v for rid in matched_ids
+                       for v in self.ontology.label_value_variants(rid)]
 
         if self.highlight_atlas is not None and self.current_atlas_labels is not None:
             if matched_ids:
@@ -830,18 +872,6 @@ class MainController:
             mhd = (DataLoader.pad_to_grid(mhd, offset, grid_shape, "样本空间标签图")
                    if offset is not None else None)
 
-        # 标签图缺失时退而用"图谱参考灰度图 warp 回样本空间"的结果（ClearMap 的
-        # elastix_auto_to_reference/result.1.mhd —— 它把 reference 当 moving 配到样本
-        # 上，所以 result 就在样本空间）。它不是标签图、不能用来查脑区，但叠在样本图
-        # 上仍然能直接看出配准偏没偏，否则 Native 视图就只剩一张原图什么都对不了。
-        ref_gray = None
-        if mhd is None and paths['ref_gray'] and grid_shape is not None:
-            ref_gray = DataLoader.load_volume(paths['ref_gray'])
-            if ref_gray is not None:
-                offset = self._native_grid_offset(ref_gray.shape, grid_shape, "图谱参考灰度图")
-                ref_gray = (DataLoader.pad_to_grid(ref_gray, offset, grid_shape, "图谱参考灰度图")
-                            if offset is not None else None)
-
         scale = None
         if img is not None:
             ok, scale = self._native_image_placement(img.shape, grid_shape)
@@ -856,8 +886,6 @@ class MainController:
                     scale = (scale[0], scale[2], scale[1])
             if mhd is not None:
                 mhd = DataLoader.rotate_vol(mhd, k)
-            if ref_gray is not None:
-                ref_gray = DataLoader.rotate_vol(ref_gray, k)
             # 细胞点跟着世界坐标网格转，而不是跟着标签图转 —— 以前用的是标签图形状，
             # 标签图缺失时整段跳过，图转了点没转，无声错位。
             if not df_cells.empty and grid_shape is not None:
@@ -899,15 +927,9 @@ class MainController:
                   "(ClearMap: volume/result.mhd / ANTs: *_labels_in_sample.nii.gz)：\n"
                   "   hover 查脑区和图谱轮廓这两项不可用。细胞的脑区归属写在 "
                   "cell_registration.csv 里，\n   不依赖标签图，所以细胞点、脑区搜索、"
-                  "按脑区筛选仍然照常可用。")
-            if ref_gray is not None:
-                limits, full_range = DataLoader.estimate_contrast(ref_gray)
-                ref_layer = self.viewer.add_image(ref_gray, name="Reference in Sample",
-                                                  colormap="magenta", blending='additive',
-                                                  opacity=0.6, contrast_limits=limits)
-                ref_layer.contrast_limits_range = full_range
-                print("   ↳ 改用图谱参考灰度图 (elastix_auto_to_reference/result.1.mhd) "
-                      "叠在样本图上做目视核对。")
+                  "按脑区筛选仍然照常可用。\n"
+                  "   ClearMap 的这个文件由 cellMap.py 的 transform_annotation_volume() 生成，"
+                  "缺了就重跑它补上。")
             self.setup_highlight_layers(None)
 
         self.current_cells_df = df_cells
@@ -1100,10 +1122,16 @@ class MainController:
                                 head = html.escape(f"{name} ({acr})" if acr else name)
                             else:
                                 head = f"Region {val}"
+                            # 文件里的值被 float32 舍入过时把真实 id 一并写出来，
+                            # 别让人以为 ontology 里真有这么个 id；多解时标明是近似。
+                            rid, ambiguous = self.ontology.resolve_label_value(val)
+                            id_txt = f"ID {val}"
+                            if rid is not None and rid != int(val):
+                                id_txt += f" → {rid}{' (多解，取首个)' if ambiguous else ''}"
                             # 面板里把整条链从根列到自身（自身加粗），不用鼠标旁边的浮窗，
                             # 免得挡住画面。
                             self.lbl_hover.setText(
-                                f"📍 <b>{head}</b> · ID {val}<br>"
+                                f"📍 <b>{head}</b> · {id_txt}<br>"
                                 + self.ontology.get_lineage_html(val)
                             )
                         else:

@@ -19,9 +19,8 @@
 #    两种产出缺件时的降级行为：
 #      - 缺样本空间标签图（ClearMap 的 volume/result.mhd 没跑成功是常见情况）：
 #        细胞点、脑区搜索、按脑区筛选照常（这些只依赖 cell_registration.csv），
-#        只是没有图谱轮廓、hover 查不了脑区；ClearMap 目录会自动改用
-#        elastix_auto_to_reference/result.1.mhd（图谱参考灰度图 warp 回样本空间）
-#        叠在样本图上，仍然能目视判断配准好坏。
+#        只是没有图谱轮廓、hover 查不了脑区。这个文件由 cellMap.py 的
+#        transform_annotation_volume() 生成，要这两项功能就重跑它补上。
 #      - ClearMap 开了 registration.crop_for_registration：标签图和 elastix 结果
 #        都在裁剪后的小网格上，而细胞坐标在未裁剪网格上，脚本按 log.txt 里记的
 #        偏移自动补齐（见下面第 6 条）。

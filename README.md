@@ -139,11 +139,9 @@ conda activate antsreg && python edit_sample_labels.py    # opens a path form
   `cell_registration.csv` stores `graph_order` rather than raw atlas ids, which
   collide numerically with ids for most regions (the id space is decided per
   file from the region-name column). Missing pieces degrade instead of
-  disabling the view: with no sample-space label volume you still get the cell
-  points, the region search and the per-region filter (all of which come from
-  the CSV), plus ClearMap's `elastix_auto_to_reference/result.1.mhd` — the
-  atlas reference warped onto the sample — as the overlay to eyeball the
-  registration against.
+  disabling the view: with no sample-space label volume there is no region
+  outline and no hover lookup, but the cell points, the region search and the
+  per-region filter all still work, since those come from the CSV.
 - **`align_masks.py`** — see below.
 - **`registration_eval.py`** — Dice/HD95, landmark TRE, Jacobian and
   inverse-consistency metrics across samples and groups.
