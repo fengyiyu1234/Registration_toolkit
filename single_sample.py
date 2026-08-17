@@ -32,23 +32,40 @@ _REQUIRED_KEYS = ("sample_dir", "std_atlas_path", "ontology_json_path")
 # ================= 🧠 1. JSON 脑区层级管理器 =================
 
 class OntologyManager:
+    """脑区字典，两套编号各建一套索引。
+
+    标签体积（标准图谱标签图、warp 回样本空间的标签图）里存的一律是 atlas 原始
+    id；细胞表 cell_registration.csv 第 9 列存的却分两种情况 ——
+      ClearMap  : graph_order（cellMap.py 里 convert_label(..., value='graph_order')）
+      ANTs      : atlas 原始 id（registration_ants/cell_points.py 的列说明）
+    两套编号的数值大面积重合（本机 CCF v3 的 1327 个脑区里有 1126 个数值既是某个
+    id 又是某个 graph_order），所以不能像以前那样塞进同一张表按数值查名字 —— 那
+    等于让 ClearMap 的细胞去认 id 空间的名字，张冠李戴且完全静默。查询接口统一带
+    一个 key 参数说明数值属于哪套编号，默认 'id'（= 标签体积的编号空间）。
+    """
     def __init__(self, json_path):
+        # id 空间：atlas 标注文件里的原始 id
         self.id_to_name = {}
         self.name_to_id = {}
         # region_id → [(name, acronym), ...]，从根节点到该脑区自身的完整层级链，
         # 用来在 hover 时把"这是哪一级"说清楚。
         self.id_to_path = {}
+        # graph_order 空间（ClearMap 细胞表用的编号）
+        self.go_to_name = {}
+        self.go_to_path = {}
+        self.go_to_id = {}
+        self.has_graph_order = False
         self.parse_ontology(json_path)
 
     def parse_ontology(self, json_path):
-        if not os.path.exists(json_path): 
+        if not os.path.exists(json_path):
             print(f"❌ JSON not found: {json_path}")
             return
-        
+
         print(f"📖 Parsing JSON Ontology...")
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
         def extract_node(node, ancestors=()):
             if isinstance(node, list):
                 for item in node: extract_node(item, ancestors)
@@ -64,12 +81,15 @@ class OntologyManager:
                     s_acr = DataLoader.clean_part(node.get('acronym'))
                     path = ancestors + ((s_name, s_acr),)
                     if graph_order is not None:
-                        self.id_to_name[int(graph_order)] = s_name
-                        self.name_to_id[s_name] = int(graph_order)
-                        self.id_to_path[int(graph_order)] = path
+                        self.has_graph_order = True
+                        self.go_to_name[int(graph_order)] = s_name
+                        self.go_to_path[int(graph_order)] = path
+                        if node_id is not None:
+                            self.go_to_id[int(graph_order)] = int(node_id)
                     if node_id is not None:
                         self.id_to_name[int(node_id)] = s_name
                         self.id_to_path[int(node_id)] = path
+                        # 同名脑区（不同半球等）保留先遇到的那个 id，和以前一致
                         if s_name not in self.name_to_id:
                             self.name_to_id[s_name] = int(node_id)
 
@@ -83,25 +103,72 @@ class OntologyManager:
         elif isinstance(data, list):
             extract_node(data)
 
-    def get_name(self, region_id):
-        return self.id_to_name.get(region_id, f"Region {region_id}")
+    def get_name(self, region_id, key='id'):
+        table = self.go_to_name if key == 'graph_order' else self.id_to_name
+        try:
+            return table.get(int(region_id), f"Region {region_id}")
+        except (TypeError, ValueError):
+            return f"Region {region_id}"
 
-    def get_path(self, region_id):
+    def get_path(self, region_id, key='id'):
         """返回 [(name, acronym), ...]，从最顶层祖先到该脑区自身。找不到就返回空列表。"""
-        return list(self.id_to_path.get(int(region_id), ()))
+        table = self.go_to_path if key == 'graph_order' else self.id_to_path
+        try:
+            return list(table.get(int(region_id), ()))
+        except (TypeError, ValueError):
+            return []
 
-    def get_lineage_lines(self, region_id):
+    def to_label_id(self, value, key='id'):
+        """把细胞表里的编号换算成标签体积用的 atlas id。
+
+        细胞点的颜色是拿这个 id 去问标签图层要的（get_color），不换算的话
+        ClearMap 的 graph_order 会取到另一个脑区的颜色。查不到就退回 0。
+        """
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return 0
+        # 细胞表里 0 = background、-1 = no label（cellMap.py 的 raw_ids 约定），
+        # 不是编号；graph_order 0 恰好是 root，不排掉的话所有背景细胞都会被涂成 root 色。
+        if value <= 0:
+            return 0
+        if key == 'graph_order':
+            return self.go_to_id.get(value, 0)
+        return value
+
+    def detect_cell_value_key(self, values, names):
+        """判断细胞表第 9 列是 id 还是 graph_order：拿第 10 列的脑区名当答案对一遍。
+
+        两条流程都会把脑区名一起写进 csv（ClearMap 第 10 列 name / ANTs 同一位置），
+        所以哪套编号能对上更多行，第 9 列就是哪套编号 —— 比按数值范围猜可靠（数值
+        大面积重合），也不依赖"哪个 pipeline 产的"这种外部信息。
+        """
+        if not self.has_graph_order:
+            return 'id'  # 字典里根本没有 graph_order（如 DevCCF），只可能是 id
+        score = {'id': 0, 'graph_order': 0}
+        for v, n in zip(values, names):
+            n = DataLoader.clean_part(n).lower()
+            if not n or n in ('background', 'no label'):
+                continue
+            for key in score:
+                if self.get_name(v, key=key).lower() == n:
+                    score[key] += 1
+        if score['graph_order'] == score['id'] == 0:
+            return 'id'
+        return 'graph_order' if score['graph_order'] > score['id'] else 'id'
+
+    def get_lineage_lines(self, region_id, key='id'):
         """逐级 'acronym — full name'，用于终端打印时看清每一级到底是什么。"""
         return [f"{i}. {acr + ' — ' if acr else ''}{name}"
-                for i, (name, acr) in enumerate(self.get_path(region_id))]
+                for i, (name, acr) in enumerate(self.get_path(region_id, key=key))]
 
-    def get_lineage_html(self, region_id):
+    def get_lineage_html(self, region_id, key='id'):
         """面板里用的层级块：从最顶层祖先一路列到该脑区自身，自身加粗。
 
         napari 0.8 的状态栏由后台 StatusChecker 线程按图层信息重算，手写 viewer.status
         会被立刻冲掉，所以脑区名和上级链只在这个面板里显示。
         """
-        path = self.get_path(region_id)
+        path = self.get_path(region_id, key=key)
         if not path:
             return "<i style='color:#a66;'>该 ID 不在 ontology 中</i>"
         lines = []
@@ -156,7 +223,20 @@ class DataLoader:
             arr = tifffile.imread(path)
         else:
             arr = sitk.GetArrayFromImage(sitk.ReadImage(path))
-        return arr.astype(dtype) if dtype is not None else arr
+        if dtype is None:
+            return arr
+        # 标签图按无符号整型读时先把负值归零。ClearMap 的 volume/result.mhd 是
+        # elastix 按 (ResultImagePixelType "short") 写出来的，而 CCF/DeMBA 的
+        # 部分 id 超过 32767（本机 p5 图谱里 128 个），在 int16 里已经溢出成负数；
+        # 直接 astype(uint32) 会变成 40 多亿的假 id，hover 显示 "Region 4294935936"。
+        # 归零 = 当作背景，比假 id 诚实（受影响体素约 1%）。
+        if np.issubdtype(np.dtype(dtype), np.unsignedinteger) and np.issubdtype(arr.dtype, np.signedinteger):
+            n_neg = int((arr < 0).sum())
+            if n_neg:
+                print(f"⚠️ 标签图有 {n_neg} 个负值体素（{os.path.basename(path)} 是 "
+                      f"{arr.dtype}，大 id 在写文件时已溢出），按背景处理。")
+                arr = np.where(arr < 0, 0, arr)
+        return arr.astype(dtype)
 
     @staticmethod
     def open_volume_lazy(path):
@@ -231,22 +311,114 @@ class DataLoader:
 
     @staticmethod
     def resolve_native_paths(target_dir):
-        """Find the raw sample image + atlas-labels-warped-to-sample-space
-        file, whichever pipeline produced them:
-          ClearMap: resampled.tif + volume/result.mhd
-          ANTs:     <name>_fine_*um.nii.gz + <name>_labels_in_sample.nii.gz
-        Returns (img_path, labels_path), either may be None if not found.
+        """Find everything the Native view needs, whichever pipeline produced it.
+
+        Returns a dict:
+          pipeline  'clearmap' | 'ants' | None
+          img       降采样样本图，定义 Native 视图的世界坐标网格（= 细胞表第 4-6
+                    列 "resample 空间" 坐标所在的网格，两条流程都是**未裁剪**的
+                    那一份：ClearMap 的 resampled.tif（cellMap.py 里
+                    sink_shape 固定用全图）/ ANTs 的 <name>_fine_*um.nii.gz）
+          labels    图谱标签图 warp 回样本空间的结果
+          ref_gray  图谱参考灰度图 warp 回样本空间的结果（只有 ClearMap 有：它是
+                    把 reference 当 moving 配到样本上的，elastix 的 result.1 就是
+                    这张图）。标签图缺失时用它替代，好歹还能肉眼核对配准。
+          cropped   labels/ref_gray 是否处在"裁剪后"的网格上（见下）
+
+        ClearMap 的 registration.crop_for_registration 会先把 resampled.tif 裁一
+        块出来当 elastix 的 fixed image，于是 volume/result.mhd 和 elastix 的
+        result.*.mhd 都在裁剪后的小网格上，而细胞坐标在全图网格上 —— 两者要对齐得
+        先按裁剪偏移补回去（clearmap_crop_info + pad_to_grid 负责）。ANTs 那边 labels_in_sample
+        是写回未裁剪 fine 网格的（实测 251×517×295，和 fine_20um 同形状），不需要。
         """
         cm_img = os.path.join(target_dir, 'resampled.tif')
         cm_labels = os.path.join(target_dir, 'volume', 'result.mhd')
+        cm_ref = os.path.join(target_dir, 'elastix_auto_to_reference', 'result.1.mhd')
         if os.path.exists(cm_img) or os.path.exists(cm_labels):
-            return (cm_img if os.path.exists(cm_img) else None,
-                    cm_labels if os.path.exists(cm_labels) else None)
+            return {
+                'pipeline': 'clearmap',
+                'img': cm_img if os.path.exists(cm_img) else None,
+                'labels': cm_labels if os.path.exists(cm_labels) else None,
+                'ref_gray': cm_ref if os.path.exists(cm_ref) else None,
+                'cropped': True,
+            }
 
         fine_matches = glob.glob(os.path.join(target_dir, '*_fine_*um.nii.gz'))
         labels_matches = glob.glob(os.path.join(target_dir, '*_labels_in_sample.nii.gz'))
-        return (fine_matches[0] if fine_matches else None,
-                labels_matches[0] if labels_matches else None)
+        return {
+            'pipeline': 'ants' if (fine_matches or labels_matches) else None,
+            'img': fine_matches[0] if fine_matches else None,
+            'labels': labels_matches[0] if labels_matches else None,
+            'ref_gray': None,
+            'cropped': False,
+        }
+
+    # "Cropped resampled image: (296, 517, 252) -> (296, 517, 232), offset=[ 0.  0. 20.]"
+    # —— cellMap.py 的 crop_resampled_for_registration() 打进 log.txt 的那行，
+    # 是裁剪偏移唯一被落盘的地方（形状之差只能给出裁掉了多少，给不出从哪裁的）。
+    _CM_CROP_RE = re.compile(
+        r"Cropped resampled image:\s*\(([^)]*)\)\s*->\s*\(([^)]*)\)\s*,\s*offset=\[([^\]]*)\]")
+
+    @staticmethod
+    def clearmap_crop_info(target_dir):
+        """从 log.txt 解析裁剪信息，返回 {'offset', 'full_shape', 'cropped_shape'}
+        （都换成 napari 的 (z, y, x) 轴序），解析不到就返回 None。
+
+        log.txt 里的三个数是 ClearMap 自己的 (X, Y, Z) 轴序，而磁盘上的 tif /
+        mhd 读进来是 (Z, Y, X)（ClearMap/IO/TIF.py 的 array_to_tif 写盘时就把轴
+        反过来了），所以倒序即可。
+        """
+        log_path = os.path.join(target_dir, 'log.txt')
+        if not os.path.exists(log_path):
+            return None
+        info = None
+        try:
+            with open(log_path, 'r', errors='replace') as f:
+                for line in f:
+                    m = DataLoader._CM_CROP_RE.search(line)
+                    if m:  # 同一目录可能跑过多次，取最后一次
+                        info = m
+        except Exception as e:
+            print(f"⚠️ 解析 log.txt 里的裁剪信息失败 ({type(e).__name__}: {e})")
+            return None
+        if info is None:
+            return None
+
+        def _triple(text):
+            vals = [int(round(float(v))) for v in text.replace(',', ' ').split()]
+            return tuple(reversed(vals)) if len(vals) == 3 else None
+
+        out = {'full_shape': _triple(info.group(1)),
+               'cropped_shape': _triple(info.group(2)),
+               'offset': _triple(info.group(3))}
+        return out if all(v is not None for v in out.values()) else None
+
+    @staticmethod
+    def pad_to_grid(arr, offset, full_shape, what=""):
+        """把裁剪后的小体积按 offset 摆回全图网格（周围补 0）。
+
+        用补零而不是给图层加 translate：hover / 点击取值是直接拿
+        viewer.cursor.position 去索引 current_atlas_labels 的（见 setup_callbacks），
+        translate 只挪显示、不挪数组下标，标签图一旦带 translate，鼠标读到的就是
+        错位的体素。补零后"世界坐标 = 全图网格下标"这条前提对所有图层都成立，
+        旋转、highlight 图层 np.zeros_like 之类的下游逻辑一行都不用改。
+        20 µm 网格下整卷也就几十 MB，代价可以忽略。
+        """
+        if arr is None: return None
+        if tuple(arr.shape) == tuple(full_shape) and not any(offset):
+            return arr
+        if any(o < 0 for o in offset) or any(
+                o + s > f for o, s, f in zip(offset, arr.shape, full_shape)):
+            print(f"⚠️ {what} 形状 {tuple(arr.shape)} + 偏移 {tuple(offset)} 超出全图网格 "
+                  f"{tuple(full_shape)}，放弃对齐。")
+            return None
+        out = np.zeros(tuple(full_shape), dtype=arr.dtype)
+        out[offset[0]:offset[0] + arr.shape[0],
+            offset[1]:offset[1] + arr.shape[1],
+            offset[2]:offset[2] + arr.shape[2]] = arr
+        print(f"   ↳ {what} 从裁剪网格 {tuple(arr.shape)} 补回全图网格 "
+              f"{tuple(full_shape)}，偏移 (z,y,x)={tuple(offset)}")
+        return out
 
     @staticmethod
     def normalize_image_8bit(img_path):
@@ -264,6 +436,10 @@ class DataLoader:
         9 mapped_id, 10 region name, 11 slice_name, 12 tile_name, 13 score
         (后三者仅在 cellMap.py 较新版本生成的文件中存在)。coord_start 指定坐标起始列
         (3=resample空间, 6=atlas空间)。
+
+        第 9 列的编号空间随流程而异（ClearMap 是 graph_order、ANTs 是 atlas id），
+        所以脑区名直接用文件里第 10 列写好的那个，只在它为空时才回退到按编号查字典；
+        另外额外算一列 label_id = 换算到标签图编号空间的 id，供细胞点取脑区颜色用。
         """
         all_dfs = []
         if not os.path.exists(folder_path): return pd.DataFrame()
@@ -289,7 +465,11 @@ class DataLoader:
                         df_clean = pd.DataFrame(napari_pts, columns=['z', 'y', 'x'])
                         df_clean['class_name'] = class_name
                         df_clean['mapped_id'] = ids
-                        df_clean['region'] = [ontology.get_name(uid) for uid in ids]
+                        # 第 10 列的脑区名（ClearMap 写 name，ANTs 同一位置写 name）。
+                        # 编号空间判定和名字显示都用它，见下面的 detect_cell_value_key。
+                        csv_names = (df_raw.iloc[:, 10].values[valid_mask]
+                                     if df_raw.shape[1] > 10 else np.array([''] * len(ids)))
+                        df_clean['csv_region'] = [DataLoader.clean_part(n) for n in csv_names]
 
                         # 原始像素坐标 (0-2列) 始终存在，用于标记细胞后回溯原始 tile。
                         raw_xyz = df_raw.iloc[:, 0:3].values.astype(float)[valid_mask]
@@ -314,7 +494,26 @@ class DataLoader:
                 except Exception as e:
                     print(f"❌ 解析 '{class_name}' 坐标出错: {e}")
 
-        return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+        if not all_dfs:
+            return pd.DataFrame()
+
+        df = pd.concat(all_dfs, ignore_index=True)
+
+        # 先定编号空间（拿名字列对答案），再据此补 region / label_id 两列。
+        sample = df.sample(min(len(df), 5000), random_state=0)
+        key = ontology.detect_cell_value_key(sample['mapped_id'].values, sample['csv_region'].values)
+        print(f"🔢 细胞表第 9 列编号空间判定为 '{key}'"
+              f"（{'ClearMap' if key == 'graph_order' else 'ANTs / 原始 id'} 风格）。")
+
+        # 名字优先用文件里那一列；空的（老文件没写 name）才按编号查字典。
+        fallback = df['csv_region'].eq('')
+        df['region'] = df['csv_region']
+        if fallback.any():
+            df.loc[fallback, 'region'] = [ontology.get_name(uid, key=key)
+                                          for uid in df.loc[fallback, 'mapped_id']]
+        id_map = {uid: ontology.to_label_id(uid, key=key) for uid in df['mapped_id'].unique()}
+        df['label_id'] = df['mapped_id'].map(id_map)
+        return df
 
 
 # ================= 🎮 3. 主控制器 =================
@@ -355,24 +554,46 @@ class MainController:
         self.on_mode_change(self.combo_sample.currentText())
 
     def setup_highlight_layers(self, shape):
+        """shape=None（没有任何标签体积可高亮）时只建细胞高亮层 —— 细胞的脑区筛选
+        靠 csv 里的名字，不需要标签图，缺标签图时搜索仍应该能用。"""
         for name in [">> Highlight Atlas <<", ">> Highlight Cells <<", "✨ Selection"]:
             if name in self.viewer.layers: self.viewer.layers.remove(name)
-                
-        self.highlight_atlas = self.viewer.add_labels(np.zeros(shape, dtype=np.uint32), name=">> Highlight Atlas <<", opacity=0.8)
+
+        self.highlight_atlas = None
+        if shape is not None:
+            self.highlight_atlas = self.viewer.add_labels(np.zeros(shape, dtype=np.uint32),
+                                                          name=">> Highlight Atlas <<", opacity=0.8)
         self.highlight_cells = self.viewer.add_points(np.empty((0, 3)), ndim=3, name=">> Highlight Cells <<",
                                                       face_color='white', border_color='yellow', size=self.spin_point_size.value(), opacity=1.0)
 
+    @staticmethod
+    def _fallback_region_color(label_id):
+        """没有标签图层时给细胞点配色：按 id 定死的伪随机颜色。
+
+        标签图缺失（如 ClearMap 的 volume/result.mhd 没生成成功）时以前是直接
+        return、一个细胞都不画 —— 而细胞的脑区归属本来就写在 csv 里，不依赖标签图，
+        不画等于把这个目录里唯一还完好的数据也藏起来。这里保证同一脑区在两种视图、
+        多次启动之间颜色一致（种子只由 id 决定），只是和标签图的配色不是同一套。
+        """
+        rng = np.random.default_rng((abs(int(label_id)) * 2654435761) % (2 ** 32))
+        return np.array([*rng.uniform(0.35, 1.0, 3), 1.0])
+
     def render_cells_from_df(self, df_cells, labels_layer):
-        if df_cells.empty or labels_layer is None: return
+        if df_cells.empty: return
 
         # --- 新增：如果未勾选，则过滤掉 mapped_id 为 0 的背景细胞 ---
         if hasattr(self, 'cb_show_bg') and not self.cb_show_bg.isChecked():
             df_cells = df_cells[df_cells['mapped_id'] != 0]
         # -------------------------------------------------------------
+        if df_cells.empty: return
 
+        # 颜色跟标签图层保持一致（拿换算到 id 空间的 label_id 去问它要颜色）；
+        # 没有标签图层就退回自算的固定配色，细胞照画。
         id_color_map = {0: np.array([0.5, 0.5, 0.5, 1.0])}
-        for uid in df_cells['mapped_id'].unique():
-            if uid != 0: id_color_map[uid] = labels_layer.get_color(uid)
+        for uid in df_cells['label_id'].unique():
+            if uid == 0: continue
+            id_color_map[uid] = (labels_layer.get_color(uid) if labels_layer is not None
+                                 else self._fallback_region_color(uid))
 
         # 动态读取并渲染独特的 class_name
         unique_classes = sorted(df_cells['class_name'].unique())
@@ -381,7 +602,7 @@ class MainController:
             sub_df = df_cells[df_cells['class_name'] == cls_name]
             if len(sub_df) > 0:
                 coords = sub_df[['z', 'y', 'x']].values
-                colors = np.array([id_color_map[uid] for uid in sub_df['mapped_id']])
+                colors = np.array([id_color_map[uid] for uid in sub_df['label_id']])
                 
                 is_vis = self.cell_checkboxes[cls_name].isChecked() if cls_name in self.cell_checkboxes else True
                 
@@ -412,15 +633,16 @@ class MainController:
         self.last_highlighted_df = pd.DataFrame()
 
         if not keyword:
-            if self.highlight_cells: self.highlight_cells.data = np.empty((0, 3))
-            if self.highlight_atlas and self.current_atlas_labels is not None:
+            if self.highlight_cells is not None: self.highlight_cells.data = np.empty((0, 3))
+            if self.highlight_atlas is not None and self.current_atlas_labels is not None:
                 self.highlight_atlas.data = np.zeros_like(self.current_atlas_labels)
             self.viewer.status = "Ready."
             return
-            
+
         self.viewer.status = f"Searching: {keyword}..."
-        
-        # 1. 过滤 Atlas
+
+        # 1. 过滤 Atlas。name_to_id 是 atlas 原始 id 空间的表，标签体积里存的也是
+        #    原始 id，两边编号空间一致（细胞那边的 graph_order 不参与这一步）。
         matched_ids = []
         if search_mode == 'Exact':
             for name, region_id in self.ontology.name_to_id.items():
@@ -428,15 +650,16 @@ class MainController:
         else:
             for name, region_id in self.ontology.name_to_id.items():
                 if keyword.lower() in name.lower(): matched_ids.append(region_id)
-                
-        if matched_ids and self.current_atlas_labels is not None:
-            mask = np.isin(self.current_atlas_labels, matched_ids)
-            h_data = np.zeros_like(self.current_atlas_labels)
-            h_data[mask] = self.current_atlas_labels[mask]
-            self.highlight_atlas.data = h_data
-        else:
-            if self.highlight_atlas: self.highlight_atlas.data = np.zeros_like(self.current_atlas_labels)
-            
+
+        if self.highlight_atlas is not None and self.current_atlas_labels is not None:
+            if matched_ids:
+                mask = np.isin(self.current_atlas_labels, matched_ids)
+                h_data = np.zeros_like(self.current_atlas_labels)
+                h_data[mask] = self.current_atlas_labels[mask]
+                self.highlight_atlas.data = h_data
+            else:
+                self.highlight_atlas.data = np.zeros_like(self.current_atlas_labels)
+
         # 2. 过滤 Cells
         if not self.current_cells_df.empty:
             active_classes = [name for name, cb in self.cell_checkboxes.items() if cb.isChecked()]
@@ -528,12 +751,48 @@ class MainController:
               f"scale={tuple(round(s, 4) for s in scale)}")
         return True, scale
 
+    def _native_grid_offset(self, vol_shape, grid_shape, what):
+        """裁剪后的体积在全图网格里的 (z,y,x) 偏移；返回 None 表示不该显示这一卷。
+
+        形状本来就一致 → 偏移全 0。不一致时只可能是 ClearMap 的
+        crop_for_registration：偏移从 log.txt 解析（config 里的
+        labels_crop_offset 优先，日志被清掉或跑的是老版本 cellMap.py 时用它兜底）。
+        两处都拿不到就宁可不画 —— 静默错位几十个体素比缺一层危险得多，判断配准好坏
+        看的就是这个偏移量级的边界差。
+        """
+        if tuple(vol_shape) == tuple(grid_shape):
+            return (0, 0, 0)
+        override = CONFIG.get('labels_crop_offset')
+        if override:
+            offset = tuple(int(v) for v in override)
+        else:
+            info = DataLoader.clearmap_crop_info(self.target_dir)
+            offset = info['offset'] if info else None
+        if offset is None:
+            print(f"⚠️ {what} 形状 {tuple(vol_shape)} 和样本网格 {tuple(grid_shape)} 不一致，"
+                  "且无法确定裁剪偏移 ——\n"
+                  "   ClearMap 开了 registration.crop_for_registration 时会这样。偏移写在该目录 "
+                  "log.txt 的\n   \"Cropped resampled image: ... offset=[...]\" 一行；日志不在了就在 "
+                  "config 里手写\n   labels_crop_offset: [z, y, x]（注意是 napari 轴序，"
+                  "和 log.txt 里的 [x,y,z] 相反）。\n"
+                  "   现在跳过这一层，不做对齐。")
+            return None
+        return offset
+
     def load_sample_native_view(self):
         self.viewer.layers.clear()
+        # 图层清空后这些引用指向的都是已经被移除的图层，必须一起作废，
+        # 否则 perform_search 会往一个不在 viewer 里的图层写数据。
         self.current_cells_df = pd.DataFrame()
+        self.current_atlas_labels = None
+        self.highlight_atlas = None
+        self.highlight_cells = None
         print(f"\n🚀 Loading Native View from: {self.target_dir}")
-        
-        resampled_path, mhd_path = DataLoader.resolve_native_paths(self.target_dir)
+
+        paths = DataLoader.resolve_native_paths(self.target_dir)
+        resampled_path, mhd_path = paths['img'], paths['labels']
+        if paths['pipeline']:
+            print(f"   ↳ 识别为 {paths['pipeline']} 产出")
         cell_reg_dir = os.path.join(self.target_dir, 'cell_registration')
 
         img_path = self._resolve_native_image_path(resampled_path)
@@ -548,16 +807,44 @@ class MainController:
         # 使用 cell_registration.csv 中已经算好的 resample 空间坐标 (第4-6列, 0-indexed 3:6)
         df_cells = DataLoader.load_cells_from_registration(cell_reg_dir, self.ontology, coord_start=3)
 
-        # 参考网格取降采样图本身：cell_registration.csv 的 "resample space" 列就是按
-        # 它算的 (registration_ants/cell_points.py 拿 sample_fine 做 physical→index)，
-        # 标签图只是恰好被 warp 到同一个网格上，缺标签图时不至于静默错位。
-        # 放在旋转之前算 —— 这时两个 shape 都还是文件里的原始轴序。
+        # 世界坐标网格 = 降采样图本身：cell_registration.csv 的 "resample space" 列就是按
+        # 它算的（ANTs 见 registration_ants/cell_points.py 拿 sample_fine 做
+        # physical→index；ClearMap 见 cellMap.py 的 transformation()，sink_shape 固定
+        # 用未裁剪的 resampled 形状），标签图则可能处在裁剪后的小网格上，得补回来。
+        # 放在旋转之前算 —— 这时所有 shape 都还是文件里的原始轴序。
+        grid_shape = DataLoader.volume_shape(resampled_path)
+        if grid_shape is None and paths['cropped']:
+            # 降采样图被删了（大文件常被清），但 log.txt 里同时记着裁剪前后的形状。
+            info = DataLoader.clearmap_crop_info(self.target_dir)
+            if info:
+                grid_shape = info['full_shape']
+                print(f"   ↳ 降采样图不在，从 log.txt 取全图网格 {grid_shape}")
+        if grid_shape is None and mhd is not None and not paths['cropped']:
+            grid_shape = mhd.shape
+        if grid_shape is None and mhd is not None:
+            print("⚠️ 拿不到未裁剪的样本网格形状，无法确认标签图和细胞点是否在同一网格上，"
+                  "标签图按原样显示。")
+
+        if mhd is not None and grid_shape is not None:
+            offset = self._native_grid_offset(mhd.shape, grid_shape, "样本空间标签图")
+            mhd = (DataLoader.pad_to_grid(mhd, offset, grid_shape, "样本空间标签图")
+                   if offset is not None else None)
+
+        # 标签图缺失时退而用"图谱参考灰度图 warp 回样本空间"的结果（ClearMap 的
+        # elastix_auto_to_reference/result.1.mhd —— 它把 reference 当 moving 配到样本
+        # 上，所以 result 就在样本空间）。它不是标签图、不能用来查脑区，但叠在样本图
+        # 上仍然能直接看出配准偏没偏，否则 Native 视图就只剩一张原图什么都对不了。
+        ref_gray = None
+        if mhd is None and paths['ref_gray'] and grid_shape is not None:
+            ref_gray = DataLoader.load_volume(paths['ref_gray'])
+            if ref_gray is not None:
+                offset = self._native_grid_offset(ref_gray.shape, grid_shape, "图谱参考灰度图")
+                ref_gray = (DataLoader.pad_to_grid(ref_gray, offset, grid_shape, "图谱参考灰度图")
+                            if offset is not None else None)
+
         scale = None
         if img is not None:
-            ref_shape = DataLoader.volume_shape(resampled_path)
-            if ref_shape is None and mhd is not None:
-                ref_shape = mhd.shape
-            ok, scale = self._native_image_placement(img.shape, ref_shape)
+            ok, scale = self._native_image_placement(img.shape, grid_shape)
             if not ok:
                 img = None
 
@@ -568,10 +855,16 @@ class MainController:
                 if scale and k % 2:  # rot90 把 y/x 两轴换了位置，scale 也得跟着换
                     scale = (scale[0], scale[2], scale[1])
             if mhd is not None:
-                orig_shape = mhd.shape
                 mhd = DataLoader.rotate_vol(mhd, k)
-                if not df_cells.empty:
-                    df_cells[['z', 'y', 'x']] = DataLoader.rotate_pts(df_cells[['z', 'y', 'x']].values, k, orig_shape)
+            if ref_gray is not None:
+                ref_gray = DataLoader.rotate_vol(ref_gray, k)
+            # 细胞点跟着世界坐标网格转，而不是跟着标签图转 —— 以前用的是标签图形状，
+            # 标签图缺失时整段跳过，图转了点没转，无声错位。
+            if not df_cells.empty and grid_shape is not None:
+                df_cells[['z', 'y', 'x']] = DataLoader.rotate_pts(
+                    df_cells[['z', 'y', 'x']].values, k, grid_shape)
+            if grid_shape is not None and k % 2:
+                grid_shape = (grid_shape[0], grid_shape[2], grid_shape[1])
 
         if img is not None:
             limits, full_range = DataLoader.estimate_contrast(img)
@@ -602,7 +895,20 @@ class MainController:
             labels_layer.contour = 1
             self.setup_highlight_layers(mhd.shape)
         else:
-            print(f"⚠️ 找不到样本空间标签图 (volume/result.mhd 或 *_labels_in_sample.nii.gz)，无法为细胞赋予准确的脑区颜色和筛选。")
+            print("⚠️ 找不到（或无法对齐）样本空间标签图 "
+                  "(ClearMap: volume/result.mhd / ANTs: *_labels_in_sample.nii.gz)：\n"
+                  "   hover 查脑区和图谱轮廓这两项不可用。细胞的脑区归属写在 "
+                  "cell_registration.csv 里，\n   不依赖标签图，所以细胞点、脑区搜索、"
+                  "按脑区筛选仍然照常可用。")
+            if ref_gray is not None:
+                limits, full_range = DataLoader.estimate_contrast(ref_gray)
+                ref_layer = self.viewer.add_image(ref_gray, name="Reference in Sample",
+                                                  colormap="magenta", blending='additive',
+                                                  opacity=0.6, contrast_limits=limits)
+                ref_layer.contrast_limits_range = full_range
+                print("   ↳ 改用图谱参考灰度图 (elastix_auto_to_reference/result.1.mhd) "
+                      "叠在样本图上做目视核对。")
+            self.setup_highlight_layers(None)
 
         self.current_cells_df = df_cells
         self.update_class_filter_ui(df_cells)
@@ -613,6 +919,9 @@ class MainController:
     def load_sample_atlas_view(self):
         self.viewer.layers.clear()
         self.current_cells_df = pd.DataFrame()
+        self.current_atlas_labels = None
+        self.highlight_atlas = None
+        self.highlight_cells = None
         print(f"\n🚀 Loading Atlas Space View from: {self.target_dir}")
 
         atlas_layer = None
@@ -643,6 +952,10 @@ class MainController:
             self.current_atlas_labels = data
             atlas_layer = self.viewer.add_labels(self.current_atlas_labels, name="Atlas Anatomy", opacity=0.3)
             self.setup_highlight_layers(self.current_atlas_labels.shape)
+        else:
+            # 图谱标签图缺失也要能看细胞（细胞的 atlas 空间坐标和脑区名都在 csv 里）。
+            print(f"⚠️ 找不到标准图谱标签文件，只显示细胞点: {atlas_path}")
+            self.setup_highlight_layers(None)
 
         self.current_cells_df = df_cells
         self.update_class_filter_ui(df_cells)

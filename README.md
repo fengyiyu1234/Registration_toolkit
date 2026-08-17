@@ -129,7 +129,21 @@ conda activate antsreg && python edit_sample_labels.py    # opens a path form
   from, for the regions where intensity alone cannot establish correspondence.
   See below.
 - **`single_sample.py`** — napari QC viewer for one registered sample: overlays
-  the warped atlas, the sample, and per-region labels.
+  the warped atlas, the sample, and per-region labels. Reads either pipeline's
+  output directory, auto-detected: ANTs (`*_fine_*um.nii.gz` +
+  `*_labels_in_sample.nii.gz`) or ClearMap's own `cellMap.py`
+  (`resampled.tif` + `volume/result.mhd`). Two things differ between them and
+  are handled automatically — ClearMap registers on a *cropped* copy of the
+  resampled image, so its warped label volume is shifted relative to the cell
+  coordinates (the offset is read back from the run's `log.txt`); and its
+  `cell_registration.csv` stores `graph_order` rather than raw atlas ids, which
+  collide numerically with ids for most regions (the id space is decided per
+  file from the region-name column). Missing pieces degrade instead of
+  disabling the view: with no sample-space label volume you still get the cell
+  points, the region search and the per-region filter (all of which come from
+  the CSV), plus ClearMap's `elastix_auto_to_reference/result.1.mhd` — the
+  atlas reference warped onto the sample — as the overlay to eyeball the
+  registration against.
 - **`align_masks.py`** — see below.
 - **`registration_eval.py`** — Dice/HD95, landmark TRE, Jacobian and
   inverse-consistency metrics across samples and groups.

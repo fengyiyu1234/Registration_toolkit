@@ -16,15 +16,30 @@
 #    这个目录既支持 ANTs 产出（<name>_fine_*um.nii.gz + <name>_labels_in_sample.nii.gz），
 #    也支持 ClearMap 原生产出（resampled.tif + volume/result.mhd），
 #    由 DataLoader.resolve_native_paths 自动判断，不需要在这里声明是哪一种。
+#    两种产出缺件时的降级行为：
+#      - 缺样本空间标签图（ClearMap 的 volume/result.mhd 没跑成功是常见情况）：
+#        细胞点、脑区搜索、按脑区筛选照常（这些只依赖 cell_registration.csv），
+#        只是没有图谱轮廓、hover 查不了脑区；ClearMap 目录会自动改用
+#        elastix_auto_to_reference/result.1.mhd（图谱参考灰度图 warp 回样本空间）
+#        叠在样本图上，仍然能目视判断配准好坏。
+#      - ClearMap 开了 registration.crop_for_registration：标签图和 elastix 结果
+#        都在裁剪后的小网格上，而细胞坐标在未裁剪网格上，脚本按 log.txt 里记的
+#        偏移自动补齐（见下面第 6 条）。
 sample_dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF
 
 # 2. 标准 Atlas 标签文件。必须是**已经按 pipeline 配置里的 orientation /
 #    slicing 转换过**、跟 labels_in_sample.nii.gz 处在同一空间的那一份，
 #    否则 "Atlas Space View" 里图谱和细胞点对不上。
+#    看 ClearMap 的样本时换成 ClearMap 自己 prepare 出来的那一份，例如
+#    ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_annotation_trimmed_<orientation>__<slicing>.tif
+#    （文件名里的 orientation/slicing 要和该样本 log.txt 里记的一致）。
 std_atlas_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um_1_-3_2__320-640_full_full.nii.gz
 
-# 3. JSON 格式脑区字典（需要包含 graph_order 和 id 两个字段，
-#    OntologyManager 两种编号都会建索引）。
+# 3. JSON 格式脑区字典，必须和 std_atlas_path 是同一套图谱的。
+#    ANTs 走 DevCCF（只有 id）；ClearMap 走 CCF v3（id + graph_order 都有，
+#    例如 ClearMap/Resources/Atlas/p5_trimmed/CCF_v3_ontology.json）。
+#    两套编号数值大面积重合，脚本靠 cell_registration.csv 第 10 列的脑区名
+#    自动判断该文件第 9 列用的是哪一套，启动时会打印判定结果，不用在这里声明。
 ontology_json_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
 
 # 4. 可选：Native 视图显示哪张样本图。
@@ -47,3 +62,14 @@ ontology_json_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv
 #    0 = 不旋转，1 = 逆时针 90°，2 = 180°，3 = 顺时针 90°。
 #    细胞坐标会跟着一起旋转（DataLoader.rotate_pts），所以点和图不会错位。
 view_rotate_k: 0
+
+# 6. 可选：样本空间标签图相对未裁剪网格的偏移，按 [z, y, x]（napari 轴序）。
+#    只有 ClearMap 开了 registration.crop_for_registration 时才用得上：那时
+#    volume/result.mhd 在裁剪后的小网格上，而细胞坐标在未裁剪的 resampled.tif
+#    网格上，两者要对齐得先把标签图按裁剪偏移补回去。
+#    默认从该样本目录的 log.txt 里解析（cellMap.py 打的那行
+#    "Cropped resampled image: (296, 517, 252) -> (296, 517, 232), offset=[ 0. 0. 20.]"，
+#    注意日志里是 ClearMap 的 [x,y,z] 轴序，这里要写成反过来的 [z,y,x]）。
+#    日志被清掉、或跑的是不打这行的老版本 cellMap.py 时，在这里手写；
+#    两处都没有的话脚本会跳过标签图而不是画一张错位的（宁缺毋滥）。
+# labels_crop_offset: [20, 0, 0]
