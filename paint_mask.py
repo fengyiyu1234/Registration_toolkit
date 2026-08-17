@@ -18,6 +18,43 @@ kinds, one shared napari GUI, two different export semantics:
     just marks the parts you want excluded, e.g. a crack). Output goes to
     `mask.sample_damage_mask_path` in a pipeline config.
 
+    Set `interpolate: true` to paint on sparse keyframes instead, the way
+    `guide` works. You then PAINT rather than erase, which is what makes
+    interpolation possible at all -- in the dense mode above, "a plane I
+    never touched" and "a plane I decided is fully included" are both
+    all-1, so there is nothing to interpolate between; painting positively
+    makes an untouched plane unambiguous.
+
+    What the brush MEANS is chosen in the GUI, after painting, in the Mask
+    Values panel: each painted label exports as 0 or 1, and so does the
+    complement (everything not painted, on the planes the drawing spans).
+    Circle the hole = label 1 -> 0, complement -> 1, for a void INSIDE the
+    sample. Circle the valid region = label 1 -> 1, complement -> 0, for
+    tissue that simply ends early, an uneven cut face, where there is no
+    hole to circle. Two circles under the same label on one plane share one
+    complement: what is outside both of them. This is deliberately not a
+    config key -- whether a drawing means "this part is gone" or "this part
+    is what is left" is a fact about the drawing, which does not exist
+    until it has been drawn.
+
+    Planes outside every label's keyframe span stay fully included whatever
+    the complement is set to: a sparse mask can only speak about the planes
+    it was drawn on, and defaulting an untouched plane to 0 would silently
+    drop it from the registration entirely. To exclude a whole plane, paint
+    it.
+
+    A complement of 0 is one careless outline away from a tissue
+    silhouette, which as moving_mask is actively harmful (register_to_atlas
+    measured 9% of a squashed sample's missing extent recovered, versus
+    101% for the same mask on the pre-alignment only). Draw generously:
+    what it has to exclude is the territory the cut took away, not all
+    background. The export's coverage warning is the backstop.
+
+  Both kinds get a "Relabel" panel: click-to-fill a single already-painted
+  blob into another label, or renumber one label across the whole volume.
+  In guide mode a bulk renumber carries that label's ontology assignment
+  with it, so the number keeps meaning the same region.
+
   guide: paint a rough outline of a structure that's genuinely present in
     both images but needs help being aligned correctly (e.g. a
     bulged/deformed patch of cortex that keeps ending up mapped to
@@ -176,6 +213,7 @@ def _load_local_config(cli_path=None):
         image_path=cfg["image_path"],
         output_path=cfg["output_path"],
         existing_mask_path=cfg.get("existing_mask_path") or None,
+        interpolate=bool(cfg.get("interpolate", False)),
         role=cfg.get("role", "sample"),
         region_labels=_normalize_region_labels(cfg.get("region_labels") or {}),
         region_ids=_normalize_region_ids(cfg.get("region_ids") or {}),
@@ -738,6 +776,153 @@ def _make_export_dock(viewer, status_label, on_export, button_text, panel_name):
     viewer.window.add_dock_widget(dock, area="right", name=panel_name)
 
 
+def _add_mask_values_panel(viewer, paint_layer):
+    """The panel that decides, per brush label, what the exported mask says.
+
+    Deliberately not a config key: whether a circle you just drew means
+    "this part is valid" or "this part is gone" is a fact about the drawing,
+    which does not exist until the drawing does. So the polarity is chosen
+    here, after painting, and both directions are reachable without
+    restarting the tool.
+
+    Rows are built from whatever is painted when you press 刷新, so a label
+    added later cannot silently inherit someone else's value -- the export
+    refuses on an unmapped label rather than guessing (see
+    damage_mask_from_keyframes).
+
+    Returns SimpleNamespace(values, complement, refresh) -- `values()` and
+    `complement()` read the widgets at export time, never a cached copy.
+    """
+    rows = QWidget()
+    rows_layout = QVBoxLayout(rows)
+    spins = {}
+
+    complement_spin = QSpinBox()
+    complement_spin.setRange(0, 1)
+    complement_spin.setValue(1)
+
+    status = QLabel("按【刷新】读取已画的 label")
+    status.setWordWrap(True)
+
+    def refresh():
+        painted = sorted(int(v) for v in np.unique(paint_layer.data) if v)
+        for label in painted:
+            if label in spins:
+                continue
+            spin = QSpinBox()
+            spin.setRange(0, 1)
+            # 0 = "the thing I circled is what should be dropped", the
+            # commoner of the two and the one that cannot be confused with
+            # a silhouette mask if left alone.
+            spin.setValue(0)
+            spins[label] = spin
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.addWidget(QLabel(f"label {label} →"))
+            row_layout.addWidget(spin)
+            rows_layout.addWidget(row)
+        stale = [lab for lab in spins if lab not in painted]
+        status.setText(
+            f"已画的 label：{painted or '（无）'}"
+            + (f"\n面板里还留着 {stale}，它们现在没有体素，导出时会忽略。" if stale else ""))
+
+    refresh_btn = QPushButton("刷新")
+    refresh_btn.clicked.connect(refresh)
+
+    complement_row = QWidget()
+    complement_layout = QHBoxLayout(complement_row)
+    complement_layout.addWidget(QLabel("圈外（补集）→"))
+    complement_layout.addWidget(complement_spin)
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(QLabel("导出时每个 label 写成 0 还是 1\n（1 = 参与配准，0 = 排除）"))
+    layout.addWidget(rows)
+    layout.addWidget(complement_row)
+    layout.addWidget(QLabel("补集只作用于画过的层区间；\n区间之外的层一律全 1。"))
+    layout.addWidget(refresh_btn)
+    layout.addWidget(_scrollable(status, 60))
+    viewer.window.add_dock_widget(dock, area="right", name="Mask Values")
+
+    refresh()
+    return SimpleNamespace(
+        values=lambda: {lab: int(spin.value()) for lab, spin in spins.items()},
+        complement=lambda: int(complement_spin.value()),
+        refresh=refresh)
+
+
+def _add_relabel_panel(viewer, paint_layer, on_change=None):
+    """A "change what an already-painted region is labelled" panel.
+
+    Two operations, because "the label of this blob is wrong" splits into
+    two different jobs and only one of them is a bulk edit:
+
+      pick + fill: click a blob, it takes the target label. This is napari's
+        own FILL mode, exposed as a button because the tool is otherwise a
+        keyboard shortcut people do not find. n_edit_dimensions is forced to
+        1 first: the default would flood-fill across z, and on a sparse
+        keyframe stack the planes are not connected anyway, so a 3D fill
+        either does nothing extra or -- once the interpolated resume of a
+        previous export is loaded -- silently eats neighbouring planes.
+
+      relabel all: renumber every voxel of one label at once, for when a
+        whole region was drawn under the wrong number.
+
+    on_change is called after a bulk relabel so the caller can refresh
+    anything keyed on label numbers (the guide mode's assignment panel).
+    """
+    from_spin, to_spin = QSpinBox(), QSpinBox()
+    for spin in (from_spin, to_spin):
+        spin.setRange(0, MAX_LABEL)
+    from_spin.setValue(1)
+    to_spin.setValue(2)
+
+    note = QLabel("选中已画的区域改 label")
+    status = QLabel("")
+    status.setWordWrap(True)
+
+    def start_fill():
+        # selected_label is what FILL paints with, so set it from `to`.
+        paint_layer.n_edit_dimensions = 1
+        paint_layer.selected_label = int(to_spin.value())
+        paint_layer.mode = "fill"
+        status.setText(f"填充模式：点任意一块，它就变成 label {int(to_spin.value())}。"
+                       "（改完记得切回画笔模式再继续画）")
+
+    def relabel_all():
+        src, dst = int(from_spin.value()), int(to_spin.value())
+        if src == dst:
+            status.setText("from 和 to 一样，没什么可改的。")
+            return
+        n = relabel_volume(paint_layer.data, src, dst)
+        paint_layer.refresh()
+        if on_change is not None:
+            on_change(src, dst)
+        status.setText(f"label {src} -> {dst}：改了 {n} 个体素。"
+                       + ("" if n else "（那个 label 一个体素都没画过）"))
+
+    fill_btn = QPushButton("点击填充改 label")
+    fill_btn.clicked.connect(start_fill)
+    all_btn = QPushButton("整个 label 全改")
+    all_btn.clicked.connect(relabel_all)
+
+    row = QWidget()
+    row_layout = QHBoxLayout(row)
+    row_layout.addWidget(QLabel("from"))
+    row_layout.addWidget(from_spin)
+    row_layout.addWidget(QLabel("to"))
+    row_layout.addWidget(to_spin)
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(note)
+    layout.addWidget(row)
+    layout.addWidget(fill_btn)
+    layout.addWidget(all_btn)
+    layout.addWidget(_scrollable(status, 60))
+    viewer.window.add_dock_widget(dock, area="right", name="Relabel")
+
+
 # =====================================================================================
 # guide export: sparse multi-label keyframes -> dense multi-label volume
 # =====================================================================================
@@ -1030,9 +1215,260 @@ def load_guide_resume(existing_path, expected_shape):
     )
 
 
+def damage_mask_from_keyframes(keyframes_by_label, full_shape, label_values,
+                                complement_value, interpolate=None):
+    """Sparse painted keyframes + a per-label output value -> dense moving-mask.
+
+    Output is in ants.registration()'s convention (1 = used in the metric,
+    0 = excluded), which is what `mask.sample_damage_mask_path` is handed
+    to, so nothing downstream has to invert anything -- see
+    register.register_to_atlas's note that the files these helpers produce
+    are already in the nonzero=use convention.
+
+    Nothing here decides what the brush "means"; the caller does, per label:
+
+      label_values      {brush label: 0 or 1} -- what that painted region
+                        becomes in the exported mask.
+      complement_value  0 or 1 -- what everything NOT painted becomes, on
+                        the planes the drawing spans. Paint two circles on
+                        one plane and both carry their own value; the
+                        complement is what is outside both of them.
+
+    "Circle the hole" is then {1: 0} + complement 1, and "circle the valid
+    region" is {1: 1} + complement 0 -- the same code path, chosen at export
+    time rather than baked into a config, because which one a drawing means
+    is not knowable until it has been drawn.
+
+    Planes outside every label's keyframe span are always left fully
+    included, whatever complement_value says: a sparse mask can only speak
+    about the planes it was drawn on, and letting an untouched plane default
+    to 0 would silently drop it from the registration entirely -- the more
+    expensive way to be wrong. To exclude a whole plane, paint it.
+
+    A label whose value equals complement_value is invisible in the output
+    (it and its surroundings export as the same number); the caller is
+    expected to say so rather than have it vanish quietly.
+
+    Careful with complement 0: hugging the tissue outline turns that into a
+    silhouette mask, and register_to_atlas measured what it costs as
+    moving_mask -- 9% of a squashed sample's missing extent recovered versus
+    101% when the same mask is used on the pre-alignment only. Draw
+    generously; what it has to exclude is the territory the cut took away,
+    not all background.
+
+    Returns SimpleNamespace(mask, result, invisible_labels) -- `result`
+    being the raw interpolation result, whose slices_by_label/overlap
+    bookkeeping the caller reports.
+    """
+    for value in (*label_values.values(), complement_value):
+        if value not in (0, 1):
+            raise ValueError(f"mask 的取值只能是 0 或 1，得到 {value!r}")
+    result = interpolate_labels_separately(keyframes_by_label, full_shape,
+                                           interpolate=interpolate)
+    missing = sorted(set(result.slices_by_label) - set(label_values))
+    if missing:
+        raise ValueError(f"这些 label 画了但没给取值：{missing}")
+
+    mask = np.ones(full_shape, dtype=np.uint8)
+    for planes in result.slices_by_label.values():
+        if planes:
+            mask[min(planes): max(planes) + 1] = complement_value
+    for label, value in sorted(label_values.items()):
+        mask[result.volume == label] = value
+
+    invisible = sorted(lab for lab, value in label_values.items()
+                       if value == complement_value and lab in result.slices_by_label)
+    return SimpleNamespace(mask=mask, result=result, invisible_labels=invisible)
+
+
+def relabel_volume(volume, from_label, to_label):
+    """Renumber one brush label across a whole painted volume, in place.
+
+    Returns the number of voxels changed. Separate from the GUI so the
+    selftests can pin the semantics: it is a pure renumber, so pointing two
+    labels at the same number MERGES them rather than erroring -- the
+    keyframe bookkeeping downstream is per-label, and a merge is a thing you
+    might actually want (two halves of one region drawn separately).
+    """
+    if not (0 <= to_label <= MAX_LABEL):
+        raise ValueError(f"to_label 必须在 0..{MAX_LABEL} 之间（导出是 uint8），得到 {to_label}")
+    hit = volume == from_label
+    n = int(np.count_nonzero(hit))
+    volume[hit] = to_label
+    return n
+
+
+def load_damage_resume(existing_path, expected_shape):
+    """Restore a previous interpolated damage mask as editable keyframes, or
+    None if it can't be resumed that way.
+
+    Same rule as load_guide_resume, and for the same reason: the exported
+    file is DENSE (interpolation filled every plane between the first and
+    last keyframe), so re-reading it wholesale would make interpolated planes
+    look hand-drawn and the next export would interpolate on top of the
+    previous export's guess. Only the planes the sidecar recorded are
+    restored.
+
+    What counts as "painted" is whatever differs from the complement value
+    the export used, taken from the sidecar rather than assumed -- the mask
+    is binary, so guessing would restore the complement of the drawing
+    exactly half the time.
+
+    Everything comes back as label 1. Two labels that exported to the same
+    number are indistinguishable in a binary mask, and `hand_drawn_slices`
+    is a union over labels (that is the shape of the pre-existing sidecar
+    format), so the per-label split cannot be recovered -- redraw the split
+    if you need it. The recorded label_values are returned so the caller can
+    show what the previous session chose.
+    """
+    sidecar = _output_stem(existing_path)
+    sidecar = sidecar.with_name(sidecar.name + ".annotated_slices.json")
+    if not sidecar.exists():
+        return None
+
+    meta = json.loads(sidecar.read_text())
+    planes = meta.get("hand_drawn_slices") or []
+    if not planes:
+        return None
+    complement_value = int(meta.get("complement_value", 1))
+    label_values = {int(k): int(v) for k, v in (meta.get("label_values") or {}).items()}
+
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(existing_path)))
+    if arr.shape != expected_shape:
+        print(f"WARNING: 续画文件 shape {arr.shape} != 图像 shape {expected_shape}，不预填。")
+        return None
+
+    prefill = np.zeros(expected_shape, dtype=np.uint8)
+    planes = sorted(z for z in planes if 0 <= z < expected_shape[0])
+    for z in planes:
+        prefill[z][arr[z] != complement_value] = 1
+    return SimpleNamespace(prefill=prefill, planes=planes, label_values=label_values,
+                           complement_value=complement_value, sidecar=sidecar)
+
+
+def write_damage_sidecar(output_path, image_path, planes, total_z, spacing_xyz=None,
+                         label_values=None, complement_value=1):
+    """<stem>.annotated_slices.json for an interpolated damage mask -- the
+    same {"hand_drawn_slices": [...]} shape write_guide_sidecars uses, so the
+    file stays readable by the existing sidecar consumers, plus the fields
+    load_damage_resume and a config author need.
+
+    label_values/complement_value are load-bearing on resume, not
+    decoration: the exported mask is binary, so they are the only record of
+    which of the two numbers was the one under the brush."""
+    stem = _output_stem(output_path)
+    slices_path = stem.with_name(stem.name + ".annotated_slices.json")
+    label_values = label_values or {}
+    slices_path.write_text(json.dumps({
+        "hand_drawn_slices": list(planes),
+        "total_z": int(total_z),
+        "kind": "mask",
+        "interpolated": True,
+        "label_values": {str(lab): int(v) for lab, v in sorted(label_values.items())},
+        "complement_value": int(complement_value),
+        "polarity": "exported mask is 1 = used in the metric, 0 = excluded",
+        "image_path": str(image_path),
+        "mask_path": str(output_path),
+        "header_spacing_xyz": list(spacing_xyz) if spacing_xyz is not None else None,
+        "voxel_size_um_note": VOXEL_SIZE_UM_NOTE,
+    }, indent=2, ensure_ascii=False))
+    return slices_path
+
+
+def _run_mask_interpolated(args, sample_sitk, arr):
+    """kind=mask with `interpolate: true` -- sparse keyframes, and what each
+    painted label becomes in the exported mask is chosen in the GUI (see
+    _add_mask_values_panel) rather than in the config."""
+    prefill = np.zeros(arr.shape, dtype=np.uint8)
+    resume = load_damage_resume(args.existing_mask, arr.shape) if args.existing_mask else None
+    if resume is not None:
+        prefill = resume.prefill
+        print(f"[resume] 从 {resume.sidecar.name} 恢复了 {len(resume.planes)} 个手画层"
+              f"（{resume.planes}），插值出来的层已丢弃，继续画即可。"
+              f"\n         上次的取值：label {resume.label_values}，补集 {resume.complement_value}。"
+              f"所有 label 已合并成 1（二值 mask 分不出来），需要的话重新分开画。")
+    elif args.existing_mask:
+        print(f"WARNING: {args.existing_mask} 旁边没有 .annotated_slices.json，无法按关键帧续画。"
+              f"\n         这一版从空白画布开始；要续画请用带 sidecar 的导出结果。")
+
+    viewer, paint_layer = _launch_viewer(
+        arr, prefill, "Paint mask regions", "sample", "regions (paint here)",
+        opacity=0.4, scale=args.display_scale_zyx)
+
+    status_label = QLabel(
+        "用不同画笔号圈出各个区域，只画几个关键层（起始层、结束层、形状变化大的层，\n"
+        "每块至少 2 层），层之间自动插值。画完在右侧 Mask Values 面板里定每个 label\n"
+        "导出成 0 还是 1、圈外（补集）是 0 还是 1，然后点 Export。\n"
+        "没画到的层一律全 1，全部参与配准。")
+
+    values_panel = _add_mask_values_panel(viewer, paint_layer)
+
+    def export():
+        keyframes = sparse_keyframes_by_label(paint_layer.data)
+        if not keyframes:
+            status_label.setText("还没画任何层 -- 没有东西可导出。")
+            return
+
+        values_panel.refresh()          # pick up anything painted since the last press
+        label_values, complement = values_panel.values(), values_panel.complement()
+        try:
+            built = damage_mask_from_keyframes(keyframes, arr.shape, label_values, complement)
+        except ValueError as exc:
+            status_label.setText(f"没导出：{exc}\n（Mask Values 面板已刷新，确认取值后再点 Export）")
+            return
+        planes = sorted({z for zs in built.result.slices_by_label.values() for z in zs})
+
+        out_sitk = sitk.GetImageFromArray(built.mask)
+        out_sitk.CopyInformation(sample_sitk)
+        sitk.WriteImage(out_sitk, args.output_path)
+        slices_path = write_damage_sidecar(args.output_path, args.sample_path, planes,
+                                            arr.shape[0], spacing_xyz=sample_sitk.GetSpacing(),
+                                            label_values=label_values,
+                                            complement_value=complement)
+
+        coverage = 100 * float(built.mask.mean())
+        mapping = "，".join(f"label {lab}→{v}" for lab, v in sorted(label_values.items()))
+        lines = [f"Wrote {args.output_path}", f"Wrote {slices_path}",
+                 f"取值：{mapping}，补集→{complement}",
+                 f"Coverage (1 = used in the metric): {coverage:.1f}%",
+                 f"Excluded: {int((built.mask == 0).sum())} voxels over "
+                 f"{len(planes)} hand-drawn planes {planes}"]
+        if built.invisible_labels:
+            lines.append(f"WARNING: label {built.invisible_labels} 的取值和补集一样，"
+                         "在导出的 mask 里看不出来 —— 画了等于没画。")
+        # A damage mask is a hole in an otherwise all-1 canvas. Anything near
+        # the ~40% a tissue silhouette scores means the polarity got flipped
+        # (tissue painted instead of the void), and register_to_atlas measured
+        # what that costs: a silhouette as moving_mask recovered 9% of a
+        # squashed sample's missing extent where the same mask on the
+        # pre-alignment only recovered 101%.
+        if coverage < 80:
+            lines.append(f"WARNING: 只有 {coverage:.1f}% 参与配准 —— damage mask 应该是"
+                         "「整体全 1、只挖一个洞」。这个数字接近组织轮廓的覆盖率，"
+                         "很可能画反了（画成了要保留的组织）。")
+        # Only the single-plane warning carries over from guide_export_warnings:
+        # the "no region_labels entry" one has no meaning here (an exclusion
+        # region is never paired with an atlas structure), and overlapping
+        # labels are harmless when every label means the same thing.
+        for label, zs in sorted(built.result.slices_by_label.items()):
+            if len(zs) < 2:
+                lines.append(f"WARNING: label {label} 只画了 1 层（{zs}），没有可插值的区间，"
+                             "导出的是一张平面而不是一个体积。每块至少画 2 层。")
+
+        msg = "\n".join(lines)
+        status_label.setText(msg)
+        print(msg)
+
+    _make_export_dock(viewer, status_label, export, "Export Mask", "Mask Export")
+    _add_relabel_panel(viewer, paint_layer)
+
+
 def _run_mask(args):
     _import_gui()
     sample_sitk, arr = _read_sitk_array(args.sample_path)
+
+    if args.interpolate:
+        return _run_mask_interpolated(args, sample_sitk, arr)
 
     prefill = np.ones(arr.shape, dtype=np.uint8)
     if args.existing_mask:
@@ -1337,7 +1773,7 @@ def _run_guide(args):
     # viewer's z slider is driven by the sample alone. Nothing about the atlas
     # display reaches the export, which is ontology ids plus voxel indices on
     # the sample's own grid.
-    atlas = assignment = None
+    atlas = assignment = picker = None
     if args.atlas:
         atlas = _load_atlas_reference(args.atlas)
         if args.display_scale_zyx is None:
@@ -1356,8 +1792,8 @@ def _run_guide(args):
             print(f"WARNING: region_labels label {label} 的 {name!r} 在 ontology 里"
                   f"{'匹配到多个' if n else '匹配不到'}结构（{n} 个），没有转成 id；"
                   f"请在树里重新选一次。")
-        _add_ontology_picker(viewer, atlas, paint_layer, assignment,
-                             resolution_um=args.atlas.resolution_um)
+        picker = _add_ontology_picker(viewer, atlas, paint_layer, assignment,
+                                       resolution_um=args.atlas.resolution_um)
 
     guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask else ""
     header = ("在右侧 ontology 树里选脑区 → 设 brush label → “加到 label”，然后就用那个\n"
@@ -1422,6 +1858,21 @@ def _run_guide(args):
         print(msg)
 
     _make_export_dock(viewer, status_label, export, "Export Outline", "Guide Outline Export")
+
+    # A bulk relabel has to carry the region assignment with it, or the label
+    # keeps its voxels and loses its meaning -- the exact thing the ontology
+    # picker exists to prevent. Merging onto a label that already has a region
+    # keeps the destination's, since that is the one the user just pointed at.
+    def _assignment_follows_relabel(src, dst):
+        if assignment is None:
+            return
+        ids = assignment.pop(src, None)
+        if ids and dst not in assignment:
+            assignment[dst] = ids
+        if picker is not None:
+            picker.refresh_assignment()
+
+    _add_relabel_panel(viewer, paint_layer, on_change=_assignment_follows_relabel)
 
 
 # =====================================================================================
@@ -1664,6 +2115,120 @@ def selftest_single_label_matches_old_behaviour(interp):
     print(f"   ok ({int(old.sum())} voxels, identical)")
 
 
+def selftest_damage_mask_is_inverted_and_resumable(interp, tmp_dir):
+    print("14. interpolated mask, label 1 -> 0 / complement -> 1: the painted blob is the hole")
+    canvas = _canvas()
+    _box(canvas, [2, 8], 1, 10, 20, 10, 20)
+
+    built = damage_mask_from_keyframes(sparse_keyframes_by_label(canvas), SHAPE,
+                                        {1: 0}, 1, interpolate=interp)
+    blob = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                          interpolate=interp).volume > 0
+    assert np.array_equal(built.mask == 0, blob), "exported mask is not the inverse of the painted blob"
+    assert built.mask.dtype == np.uint8, built.mask.dtype
+    # The plane between the keyframes must be excluded too -- that is the
+    # whole point of interpolating rather than erasing plane by plane.
+    assert (built.mask[5] == 0).any(), "interpolated plane 5 was not excluded"
+    # Planes outside the keyframe span stay fully included.
+    assert (built.mask[0] == 1).all(), "plane before the first keyframe was excluded"
+    assert built.mask.mean() > 0.8, built.mask.mean()
+
+    path = tmp_dir / "damage.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(built.mask), str(path))
+    planes = sorted({z for zs in built.result.slices_by_label.values() for z in zs})
+    write_damage_sidecar(path, tmp_dir / "img.nii.gz", planes, SHAPE[0],
+                         label_values={1: 0}, complement_value=1)
+
+    resume = load_damage_resume(path, SHAPE)
+    assert resume is not None, "sidecar written but resume returned None"
+    assert resume.planes == [2, 8], resume.planes
+    # Only the hand-drawn planes come back; the interpolated ones must not,
+    # or the next export would interpolate on top of this export's guess.
+    restored = sorted(z for z in range(SHAPE[0]) if resume.prefill[z].any())
+    assert restored == [2, 8], restored
+    assert np.array_equal(resume.prefill[2] > 0, blob[2]), "keyframe 2 did not survive the round trip"
+    print(f"   ok (coverage {100 * built.mask.mean():.1f}%, keyframes {resume.planes} restored)")
+
+
+def selftest_two_circles_share_one_complement(interp, tmp_dir):
+    print("17. two circles on one plane, both label 1 -> 1: the complement is outside BOTH of them")
+    canvas = _canvas()
+    _box(canvas, [2, 8], 1, 5, 12, 5, 12)
+    _box(canvas, [2, 8], 1, 20, 27, 20, 27)      # same label, second blob
+
+    built = damage_mask_from_keyframes(sparse_keyframes_by_label(canvas), SHAPE,
+                                        {1: 1}, 0, interpolate=interp)
+    blob = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                          interpolate=interp).volume > 0
+    # Inside the keyframe span the mask IS the union of the circles: the
+    # complement is what neither circle covers, not a per-circle hole.
+    for z in range(2, 9):
+        assert np.array_equal(built.mask[z] > 0, blob[z]), f"plane {z} is not the union of the circles"
+    assert (built.mask[2, 5:12, 5:12] == 1).all(), "first circle was not kept"
+    assert (built.mask[2, 20:27, 20:27] == 1).all(), "second circle was not kept"
+    assert (built.mask[2, 15, 15] == 0), "the gap between the circles should be complement"
+    # Outside the span the mask has nothing to say, whatever complement says.
+    # Defaulting those planes to 0 would silently drop them from registration.
+    for z in list(range(0, 2)) + list(range(9, SHAPE[0])):
+        assert (built.mask[z] == 1).all(), f"plane {z} outside the span was excluded"
+
+    # Per-label values and the complement must survive to the sidecar, or a
+    # resume restores the complement of the drawing instead of the drawing.
+    path = tmp_dir / "valid.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(built.mask), str(path))
+    write_damage_sidecar(path, tmp_dir / "img.nii.gz", [2, 8], SHAPE[0],
+                         label_values={1: 1}, complement_value=0)
+    resume = load_damage_resume(path, SHAPE)
+    assert resume.complement_value == 0, resume.complement_value
+    assert resume.label_values == {1: 1}, resume.label_values
+    assert np.array_equal(resume.prefill[2] > 0, blob[2]), "keyframe came back inverted"
+
+    # A label whose value matches the complement is invisible in a binary
+    # mask; that has to be said out loud, not silently produce nothing.
+    same = damage_mask_from_keyframes(sparse_keyframes_by_label(canvas), SHAPE,
+                                       {1: 1}, 1, interpolate=interp)
+    assert same.invisible_labels == [1], same.invisible_labels
+    assert (same.mask == 1).all(), "a label matching the complement still changed the mask"
+
+    # An unmapped label is a refusal, not a guessed default.
+    try:
+        damage_mask_from_keyframes(sparse_keyframes_by_label(canvas), SHAPE, {}, 1,
+                                    interpolate=interp)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a painted label with no value was silently defaulted")
+    print(f"   ok (coverage {100 * built.mask.mean():.1f}%, values round-tripped)")
+
+
+def selftest_relabel_volume(interp):
+    print("18. relabel: renumber one label, merge two, reject out-of-range")
+    canvas = _canvas()
+    _box(canvas, [1, 4], 1, 5, 12, 5, 12)
+    _box(canvas, [1, 4], 2, 20, 27, 20, 27)
+    before_1 = int((canvas == 1).sum())
+    before_2 = int((canvas == 2).sum())
+
+    moved = canvas.copy()
+    n = relabel_volume(moved, 1, 3)
+    assert n == before_1, (n, before_1)
+    assert (moved == 1).sum() == 0 and (moved == 3).sum() == before_1
+    assert (moved == 2).sum() == before_2, "an unrelated label was touched"
+
+    merged = canvas.copy()
+    relabel_volume(merged, 1, 2)
+    assert (merged == 2).sum() == before_1 + before_2, "merge onto an existing label lost voxels"
+
+    assert relabel_volume(canvas.copy(), 99, 5) == 0, "a label nobody painted should be a no-op"
+    try:
+        relabel_volume(canvas.copy(), 1, MAX_LABEL + 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("out-of-range to_label was accepted (the export is uint8)")
+    print(f"   ok ({before_1} voxels moved, merge and no-op behave)")
+
+
 def selftest_sidecars(interp, tmp_dir):
     print("7. sidecars: .regions.json + the .annotated_slices.json convention")
     canvas = _canvas()
@@ -1780,6 +2345,7 @@ def selftest_config_normalizers():
         {1: ["layer 1 of A", "layer 2 of A"]}
     assert _normalize_region_labels(None) == {}
     assert _normalize_region_labels({}) == {}
+
 
     assert _normalize_region_ids({1: 15751, "2": [15623, 15666]}) == \
         {1: [15751], 2: [15623, 15666]}
@@ -1951,8 +2517,11 @@ def run_selftests():
     selftest_unnamed_and_unpainted_labels_warn(interp)
     selftest_single_label_matches_old_behaviour(interp)
     with tempfile.TemporaryDirectory() as tmp:
+        selftest_damage_mask_is_inverted_and_resumable(interp, Path(tmp))
+        selftest_two_circles_share_one_complement(interp, Path(tmp))
         selftest_sidecars(interp, Path(tmp))
         selftest_resume_restores_only_hand_drawn_planes(interp, Path(tmp))
+    selftest_relabel_volume(interp)
     selftest_config_normalizers()
     selftest_interpolator_matches_registration_ants()
     selftest_ontology_node_voxels()
@@ -1976,7 +2545,9 @@ def main():
     cfg = _load_local_config(args_cli.config)
     if cfg.kind == "mask":
         args = SimpleNamespace(sample_path=cfg.image_path, output_path=cfg.output_path,
-                                existing_mask=cfg.existing_mask_path)
+                                existing_mask=cfg.existing_mask_path,
+                                interpolate=cfg.interpolate,
+                                display_scale_zyx=cfg.display_scale_zyx)
         _run_mask(args)
     elif cfg.kind == "guide":
         args = SimpleNamespace(image_path=cfg.image_path, output_path=cfg.output_path,

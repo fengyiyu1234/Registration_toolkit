@@ -582,8 +582,11 @@ class MainController:
             # 值，滑条就提不过 95.5 分位了；QC 时经常要拉亮看暗处，所以放开范围。
             img_layer.contrast_limits_range = full_range
             if scale is not None:
-                print("   ↳ 高分辨率图只适合 2D 逐层看；别切 3D 渲染 (ndisplay=3)，"
-                      "napari 会把整卷塞进显存。")
+                # 3D 纹理每轴上限一般是 2048（本机 llvmpipe 实测就是 2048），原图
+                # y/x 都超了，napari 会整卷读进内存再抽稀到上限以内 —— 既看不到全
+                # 分辨率，又把懒加载的好处清零。3D 看整体形状请用降采样图。
+                print(f"   ↳ 高分辨率图只适合 2D 逐层看：整卷 {img.shape} 有轴超过 3D 纹理上限 "
+                      "(通常 2048)，切 ndisplay=3 会被 napari 抽稀，还要先整卷读进内存。")
         elif img_path:
             print(f"⚠️ 未显示样本图像：{img_path}")
         else:
