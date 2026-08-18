@@ -94,10 +94,18 @@ kinds, one shared napari GUI, two different export semantics:
     for the measured reason it must not share the sample's) as three stacked
     layers -- the grayscale template, the complete annotation in colour, and
     the region currently selected in the tree -- each toggleable from napari's
-    own layer list. It is a reference only, never registered to the sample --
-    what is exported is ids plus voxel indices on the sample's own grid, so
-    nothing about how the atlas is displayed, oriented, or downsampled can
-    reach the output.
+    own layer list, and in three synced ortho panes so a region's shape is
+    visible in all three planes even though the sample is only cut in one
+    (`atlas_ortho_views: false` gives the old single pane back).
+
+    The atlas grid is INDEPENDENT of the sample's: a half-brain sample against
+    a whole-brain atlas is the normal case, and needs nothing but pointing
+    atlas_template_path / atlas_annotation_path at the whole-brain files. The
+    atlas is a reference only, never registered to the sample -- what is
+    exported is ids plus voxel indices on the sample's own grid, so nothing
+    about how the atlas is displayed, oriented, cropped or downsampled can
+    reach the output. The one thing that must match the pipeline's atlas is
+    the ONTOLOGY, since ids are what crosses over.
 
     Several regions at once: the paint layer is a napari Labels layer, so
     label 1/2/3/... are different brush values, one per brain region (see
@@ -165,7 +173,8 @@ import _local_config  # sibling module
 # actual painting GUI, which only ever runs in antsreg.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
 QCheckBox = QHBoxLayout = QLineEdit = QScrollArea = QSpinBox = None
-QTreeWidget = QTreeWidgetItem = Qt = None
+QTreeWidget = QTreeWidgetItem = Qt = QSplitter = None
+ViewerModel = QtViewer = None
 
 
 def _import_gui():
@@ -173,21 +182,27 @@ def _import_gui():
     top of the GUI entry points; import errors surface there rather than at
     module import, which is what keeps --selftest env-independent."""
     global napari, QLabel, QPushButton, QVBoxLayout, QWidget
-    global QCheckBox, QHBoxLayout, QLineEdit, QScrollArea, QSpinBox
+    global QCheckBox, QHBoxLayout, QLineEdit, QScrollArea, QSpinBox, QSplitter
     global QTreeWidget, QTreeWidgetItem, Qt
+    global ViewerModel, QtViewer
     import napari as _napari
+    from napari.components import ViewerModel as _ViewerModel
+    from napari.qt import QtViewer as _QtViewer
     from PyQt5.QtCore import Qt as _Qt
     from PyQt5.QtWidgets import (QCheckBox as _QCheckBox, QHBoxLayout as _QHBoxLayout,
                                  QLabel as _QLabel, QLineEdit as _QLineEdit,
                                  QPushButton as _QPushButton, QScrollArea as _QScrollArea,
-                                 QSpinBox as _QSpinBox,
+                                 QSpinBox as _QSpinBox, QSplitter as _QSplitter,
                                  QTreeWidget as _QTreeWidget, QTreeWidgetItem as _QTreeWidgetItem,
                                  QVBoxLayout as _QVBoxLayout, QWidget as _QWidget)
     napari, QLabel, QPushButton = _napari, _QLabel, _QPushButton
     QVBoxLayout, QWidget = _QVBoxLayout, _QWidget
     QCheckBox, QHBoxLayout, QLineEdit, QSpinBox = _QCheckBox, _QHBoxLayout, _QLineEdit, _QSpinBox
-    QScrollArea = _QScrollArea
+    QScrollArea, QSplitter = _QScrollArea, _QSplitter
     QTreeWidget, QTreeWidgetItem, Qt = _QTreeWidget, _QTreeWidgetItem, _Qt
+    # ViewerModel + QtViewer are the "a napari canvas without its own window"
+    # pair the ortho panes are built from (see _open_atlas_window).
+    ViewerModel, QtViewer = _ViewerModel, _QtViewer
 
 
 def _interpolate_sparse_mask():
@@ -291,6 +306,10 @@ def _atlas_reference_config(cfg):
         resolution_um=float(resolved.get("resolution_um") or 0) or None,
         orientation=resolved.get("orientation") or None,
         downsample=downsample,
+        # Three synced canvases instead of one. Off is the escape hatch for a
+        # small screen, or for a machine where three GL canvases over the same
+        # volume is more than the driver wants to do.
+        ortho=bool(cfg.get("atlas_ortho_views", True)),
     )
 
 
@@ -618,17 +637,97 @@ def annotation_features(atlas):
     return {"index": np.arange(len(atlas.present_ids)), "脑区": names, "id": ids}
 
 
-def _open_atlas_window(atlas, resolution_um):
-    """A SECOND napari window holding the atlas alone, as three stacked layers:
-    the grayscale template underneath, the COMPLETE annotation in colour over
-    it, and on top the highlight layer the ontology tree drives.
+# (dims.order, pane title). napari displays the LAST `ndisplay` axes of
+# dims.order, so each entry names the axis kept on the slider, i.e. the axis
+# the plane is perpendicular to. Index 0 is the sample's own stack axis, so
+# the first pane is the view the sample is painted in and the other two are
+# the reconstructions.
+_ORTHO_PANES = (
+    ((0, 1, 2), "轴0 切面（样本视角）"),
+    ((1, 0, 2), "轴1 切面"),
+    ((2, 0, 1), "轴2 切面"),
+)
 
-    All three are independent napari layers, so the layer list's own
-    checkboxes and opacity slider are the controls: annotation off to read the
-    plain template, annotation on to see where the selected region sits among
-    its neighbours. The annotation starts semi-transparent and the highlight is
+# Layer attributes mirrored from the main pane onto the ortho panes. Only the
+# main pane has a layer list, so these are the knobs a user can actually reach;
+# everything else about the sub-panes is fixed at construction.
+_MIRRORED_LAYER_ATTRS = ("visible", "opacity", "contrast_limits", "gamma", "colormap")
+
+# Starting height in px of the bottom dock holding the two reconstructed
+# views, leaving the main canvas the rest. Draggable afterwards.
+_ORTHO_DOCK_HEIGHT = 300
+
+
+def _add_atlas_layers(model, atlas, scale_kwargs, features):
+    """The atlas's three layers, added to one ViewerModel in draw order.
+
+    Called once per ortho pane. Every pane gets its OWN Layer objects -- one
+    Layer cannot belong to two ViewerModels -- but they are all backed by the
+    same numpy arrays, so three panes cost three sets of slice textures, not
+    three copies of a 287 MB annotation.
+    """
+    template = None
+    if atlas.template is not None:
+        template = model.add_image(atlas.template, name="reference（模板灰度）",
+                                   colormap="gray", **scale_kwargs)
+    # atlas.compact itself, not a copy: 190-odd labels over an 800^3 grid is
+    # the biggest array in the process, and the layer is read-only anyway.
+    annotation = model.add_labels(atlas.compact, name="annotation（全部脑区）",
+                                  opacity=0.45, features=features, **scale_kwargs)
+    annotation.editable = False
+    highlight = model.add_labels(np.zeros(atlas.compact.shape, dtype=np.uint8),
+                                 name="selection（选中的脑区）", opacity=0.85,
+                                 colormap=napari.utils.DirectLabelColormap(
+                                     color_dict={None: "transparent", 1: "red"}),
+                                 **scale_kwargs)
+    highlight.editable = False              # a reference; painting here would mean nothing
+    return SimpleNamespace(template=template, annotation=annotation, highlight=highlight)
+
+
+def mask_centre_index(mask):
+    """(i0, i1, i2) voxel index at the middle of `mask`'s extent on each axis,
+    or None when the mask is empty.
+
+    The median-of-occupied-planes per axis, not the centre of mass: for a
+    C-shaped or bilateral structure the centre of mass can land in a plane the
+    structure never touches, and the whole point of jumping there is to see it
+    in all three panes at once.
+    """
+    centre = []
+    for axis in range(mask.ndim):
+        planes = np.flatnonzero(mask.any(axis=tuple(a for a in range(mask.ndim) if a != axis)))
+        if not planes.size:
+            return None
+        centre.append(int(planes[len(planes) // 2]))
+    return tuple(centre)
+
+
+def _open_atlas_window(atlas, resolution_um, ortho=True):
+    """A SECOND napari window holding the atlas alone.
+
+    THREE LAYERS, bottom to top: the grayscale template, the COMPLETE
+    annotation in colour, and the region the ontology tree currently selects.
+    All three are ordinary napari layers, so the layer list's own checkboxes
+    and opacity slider are the controls -- annotation off to read the plain
+    template, annotation on to see where the selection sits among its
+    neighbours. The annotation starts semi-transparent and the selection is
     forced to solid red rather than taking a colormap colour, so it stays
     distinguishable on top of 190-odd annotation colours.
+
+    THREE PANES (`ortho`), one per anatomical axis, sharing one slice position:
+    the sample is usually cut in one plane only, but the atlas is a volume and
+    a region's shape in the other two planes is what tells you whether the
+    tree selection is the structure you meant. napari has no ortho mode, so
+    each pane is its own ViewerModel with its own dims.order, and
+    `_sync_ortho_panes` keeps their sliders together; pane 0 is the real napari
+    Viewer (it owns the window, the layer list and the layer controls) and the
+    other two are bare QtViewer canvases in a dock beneath it.
+
+    The atlas grid is INDEPENDENT of the sample's -- a half-brain sample
+    against a whole-brain atlas is the normal case here, and works because
+    nothing in this window is registered to the sample. What the export
+    records is ontology ids plus voxel indices on the sample's own grid, so
+    the atlas's own extent, orientation and downsampling cannot reach it.
 
     Kept out of the sample's window on purpose. Sharing one viewer means
     sharing one z slider, whose step is the smallest scale across all layers
@@ -646,23 +745,135 @@ def _open_atlas_window(atlas, resolution_um):
     closing it loses no state, and reopening rebuilds it from `atlas`.
     """
     scale_kwargs = {"scale": [float(resolution_um) * atlas.downsample] * 3} if resolution_um else {}
+    features = annotation_features(atlas)
+    panes = tuple(_ORTHO_PANES if ortho else _ORTHO_PANES[:1])
+
     viewer = napari.Viewer(title="Atlas reference (read-only)")
-    if atlas.template is not None:
-        viewer.add_image(atlas.template, name="reference（模板灰度）",
-                         colormap="gray", **scale_kwargs)
-    # atlas.compact itself, not a copy: 190-odd labels over an 800^3 grid is
-    # the biggest array in the process, and the layer is read-only anyway.
-    annotation = viewer.add_labels(atlas.compact, name="annotation（全部脑区）",
-                                   opacity=0.45, features=annotation_features(atlas),
-                                   **scale_kwargs)
-    annotation.editable = False
-    highlight = viewer.add_labels(np.zeros(atlas.compact.shape, dtype=np.uint8),
-                                  name="selection（选中的脑区）", opacity=0.85,
-                                  colormap=napari.utils.DirectLabelColormap(
-                                      color_dict={None: "transparent", 1: "red"}),
-                                  **scale_kwargs)
-    highlight.editable = False              # a reference; painting here would mean nothing
-    return SimpleNamespace(viewer=viewer, highlight=highlight, annotation=annotation)
+    main = SimpleNamespace(model=viewer, qt=None, order=panes[0][0],
+                           layers=_add_atlas_layers(viewer, atlas, scale_kwargs, features))
+    built = [main]
+
+    for order, title in panes[1:]:
+        model = ViewerModel(ndisplay=2)
+        # Canvas BEFORE layers: napari 0.8.0's QtViewer.__init__ walks the
+        # layers already in the model and reorders them against a visual map
+        # it has not filled in yet, which raises KeyError on the second layer.
+        # Adding to an empty model routes through the same code path one layer
+        # at a time, where the map is always current.
+        qt = QtViewer(model)
+        built.append(SimpleNamespace(
+            model=model, qt=qt, order=order,
+            layers=_add_atlas_layers(model, atlas, scale_kwargs, features)))
+        model.dims.order = order
+        model.reset_view()
+
+    if len(built) > 1:
+        splitter = QSplitter(Qt.Horizontal)
+        for pane, (_order, title) in zip(built[1:], panes[1:]):
+            wrapper = QWidget()
+            layout = QVBoxLayout(wrapper)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(QLabel(title))
+            layout.addWidget(pane.qt)
+            # A bare QtViewer asks for 800x626 and Qt would honour both of
+            # them: two side by side in a bottom dock open a ~1600px-wide
+            # window whose main canvas is a letterbox. A small floor plus the
+            # explicit resizeDocks below makes the ortho row a strip that the
+            # user can then drag to whatever they actually want.
+            pane.qt.setMinimumSize(160, 120)
+            splitter.addWidget(wrapper)
+        dock = viewer.window.add_dock_widget(splitter, area="bottom", name="正交视图（同步）")
+        viewer.window._qt_window.resizeDocks([dock], [_ORTHO_DOCK_HEIGHT], Qt.Vertical)
+        _sync_ortho_panes(built)
+        _mirror_layer_attrs(built)
+        # QtViewer holds a vispy canvas and its GL context; napari only cleans
+        # up the ones its own Window created, so these two have to be closed by
+        # hand or the context outlives the window it was drawn in.
+        viewer.window._qt_window.destroyed.connect(
+            lambda *_a: [pane.qt.close() for pane in built[1:]])
+
+    def set_highlight(mask, name=None):
+        """The selection layer's data, on every pane at once.
+
+        One array shared by all three layers rather than one copy each: the
+        mask is a full-volume allocation and highlight_mask already made it.
+        """
+        for pane in built:
+            pane.layers.highlight.data = mask
+            if name:
+                pane.layers.highlight.name = name
+
+    def centre_on(index):
+        """Point every pane at voxel `index` -- so the two reconstructions land
+        on the selection too, not just the pane whose slider was moved."""
+        for axis, value in enumerate(index):
+            viewer.dims.set_point(axis, value * float(main.layers.highlight.scale[axis]))
+
+    return SimpleNamespace(viewer=viewer, panes=built, highlight=main.layers.highlight,
+                           annotation=main.layers.annotation,
+                           set_highlight=set_highlight, centre_on=centre_on)
+
+
+def _sync_ortho_panes(panes):
+    """Make every pane's slider position follow every other one's.
+
+    All panes carry the same layers on the same grid and scale, so
+    `dims.current_step` is one shared (i0, i1, i2) and can be copied across
+    verbatim -- what differs between panes is only dims.order, i.e. which of
+    the three a pane draws instead of slides.
+
+    The `busy` flag is what stops the obvious infinite loop: assigning
+    current_step on pane B emits B's own current_step event, which would push
+    straight back at A.
+    """
+    busy = {"in": False}
+
+    def follow(source):
+        def _handler(*_args):
+            if busy["in"]:
+                return
+            busy["in"] = True
+            try:
+                step = source.model.dims.current_step
+                for pane in panes:
+                    if pane is not source and pane.model.dims.current_step != step:
+                        pane.model.dims.current_step = step
+            finally:
+                busy["in"] = False
+        return _handler
+
+    for pane in panes:
+        pane.model.dims.events.current_step.connect(follow(pane))
+
+
+def _mirror_layer_attrs(panes):
+    """Push the main pane's layer settings onto the ortho panes.
+
+    Only the main pane has a layer list and layer controls, so a visibility
+    checkbox or opacity slider there has to reach the other two canvases or
+    they drift out of agreement with the window they live in. Attributes are
+    connected by name and skipped where the layer type has no such event
+    (an Image has contrast_limits, a Labels does not), so the same list covers
+    the template, the annotation and the selection.
+    """
+    main, followers = panes[0], panes[1:]
+    for role in ("template", "annotation", "highlight"):
+        source = getattr(main.layers, role)
+        if source is None:
+            continue
+        targets = [getattr(pane.layers, role) for pane in followers]
+        for attr in _MIRRORED_LAYER_ATTRS:
+            emitter = getattr(source.events, attr, None)
+            if emitter is None or not all(hasattr(t, attr) for t in targets):
+                continue
+
+            def _push(*_args, _src=source, _targets=targets, _attr=attr):
+                value = getattr(_src, _attr)
+                for target in _targets:
+                    if getattr(target, _attr) != value:
+                        setattr(target, _attr, value)
+
+            emitter.connect(_push)
 
 
 def _tree_label(sid, info, voxels):
@@ -1589,14 +1800,15 @@ def _seed_assignment(region_labels, region_ids, structures):
     return assignment, unresolved
 
 
-def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=None):
+def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=None, ortho=True):
     """The ontology tree + label-assignment panel, as a dock on the SAMPLE
     viewer's right side.
 
     Selecting any node highlights that structure and everything under it (see
-    highlight_mask) in the separate atlas window -- the only way to see a
-    high-level region at all, since the annotation's own labels sit at
-    ontology depths 2-12 and a depth-3 node owns no voxels under its own id.
+    highlight_mask) in the separate atlas window, in all three of its synced
+    ortho panes at once -- the only way to see a high-level region at all,
+    since the annotation's own labels sit at ontology depths 2-12 and a
+    depth-3 node owns no voxels under its own id.
 
     Everything needed to paint and export lives HERE, in the sample's window:
     the atlas window is a disposable viewer that can be closed and reopened at
@@ -1640,7 +1852,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
     add_btn.setObjectName("ontology_assign")
     remove_btn = QPushButton("从 label 移除")
     remove_btn.setObjectName("ontology_unassign")
-    jump_btn = QPushButton("跳到该脑区中心层")
+    jump_btn = QPushButton("三视角跳到该脑区中心")
     jump_btn.setObjectName("ontology_jump")
     window_btn = QPushButton("打开图谱窗口")
     window_btn.setObjectName("ontology_window")
@@ -1660,7 +1872,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
     def ensure_window():
         """The atlas window, opening one if it isn't up."""
         if not window_open():
-            win = _open_atlas_window(atlas, resolution_um)
+            win = _open_atlas_window(atlas, resolution_um, ortho=ortho)
             win.viewer.window._qt_window.destroyed.connect(_on_window_closed)
             atlas_window["w"] = win
             window_btn.setText("关闭图谱窗口")
@@ -1703,9 +1915,8 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
         # full-volume np.isin over the annotation, too expensive to run on
         # every arrow-key move through the tree with no window open.
         if window_open():
-            win = atlas_window["w"]
-            win.highlight.data = highlight_mask(atlas, sid)
-            win.highlight.name = f"selection: {info['name']}"
+            atlas_window["w"].set_highlight(highlight_mask(atlas, sid),
+                                            name=f"selection: {info['name']}")
 
     def on_jump():
         sid = selected_id()
@@ -1714,13 +1925,12 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
         win = ensure_window()
         if win.highlight.data.max() == 0:
             on_select()
-        planes = np.flatnonzero(win.highlight.data.any(axis=(1, 2)))
-        if not planes.size:
-            return
-        # dims.set_point takes WORLD coordinates, so the plane index has to go
-        # through the layer's own scale.
-        centre = int(planes[len(planes) // 2])
-        win.viewer.dims.set_point(0, centre * float(win.highlight.scale[0]))
+        # All three axes, not just the slider axis: with the ortho panes up,
+        # jumping only pane 0 leaves the other two showing a plane the region
+        # may not even reach.
+        centre = mask_centre_index(win.highlight.data)
+        if centre is not None:
+            win.centre_on(centre)
 
     def on_add():
         sid = selected_id()
@@ -1761,7 +1971,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment, resolution_um=N
 
     dock = QWidget()
     layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("图谱 ontology（选中即在图谱窗口高亮，含全部后代）"))
+    layout.addWidget(QLabel("图谱 ontology（选中即在图谱窗口三个视角同时高亮，含全部后代）"))
     layout.addWidget(search)
     layout.addWidget(hide_empty)
     layout.addWidget(tree)
@@ -1839,7 +2049,8 @@ def _run_guide(args):
                   f"{'匹配到多个' if n else '匹配不到'}结构（{n} 个），没有转成 id；"
                   f"请在树里重新选一次。")
         picker = _add_ontology_picker(viewer, atlas, paint_layer, assignment,
-                                       resolution_um=args.atlas.resolution_um)
+                                       resolution_um=args.atlas.resolution_um,
+                                       ortho=args.atlas.ortho)
 
     guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask else ""
     header = ("在右侧 ontology 树里选脑区 → 设 brush label → “加到 label”，然后就用那个\n"
@@ -2551,6 +2762,50 @@ def selftest_compact_annotation():
     print("   ok")
 
 
+def selftest_atlas_view_geometry():
+    print("14. atlas 三视角: 每个轴各被切一次，跳转中心落在脑区里")
+    # Every axis is the slider axis in exactly one pane, and is drawn in the
+    # other two -- i.e. the three panes really are the three orthogonal views
+    # and not two copies of one.
+    orders = [order for order, _title in _ORTHO_PANES]
+    assert len(orders) == 3, orders
+    sliced = [order[0] for order in orders]
+    assert sorted(sliced) == [0, 1, 2], sliced
+    for order in orders:
+        assert sorted(order) == [0, 1, 2], order
+
+    # A C-shaped structure: the centre of MASS of this mask sits at z=2 in the
+    # hollow, which is exactly the plane where nothing would be visible.
+    mask = np.zeros((5, 9, 7), dtype=np.uint8)
+    mask[0, 1:8, 1:6] = 1
+    mask[4, 1:8, 1:6] = 1
+    centre = mask_centre_index(mask)
+    assert mask[centre] == 1, (centre, "跳转落在了脑区外面")
+    assert centre == (4, 4, 3), centre
+
+    solid = np.zeros((5, 9, 7), dtype=np.uint8)
+    solid[1:4, 2:5, 3:6] = 1
+    assert mask_centre_index(solid) == (2, 3, 4), mask_centre_index(solid)
+    assert mask_centre_index(np.zeros((3, 3, 3), dtype=np.uint8)) is None
+    print("   ok")
+
+
+def selftest_annotation_features():
+    print("15. atlas 图层: compact 索引 -> 真实脑区名/id 的悬停表")
+    atlas = SimpleNamespace(
+        present_ids=np.array([0, 5, 7, 999], dtype=np.int64),
+        structures={5: {"name": "Cortex", "acronym": "CTX"}, 7: {"name": "Thalamus"}})
+    feats = annotation_features(atlas)
+    # napari matches a features row to the value under the cursor through the
+    # 'index' column, so this has to be the COMPACT index, not the real id.
+    assert list(feats["index"]) == [0, 1, 2, 3], feats["index"]
+    assert feats["id"] == [0, 5, 7, 999], feats["id"]
+    assert feats["脑区"][1] == "Cortex (CTX)", feats["脑区"]
+    assert feats["脑区"][2] == "Thalamus", feats["脑区"]
+    assert "999" in feats["脑区"][3], feats["脑区"]     # in the annotation, not in the ontology
+    print("   ok")
+
+
 def run_selftests():
     import tempfile
 
@@ -2574,6 +2829,8 @@ def run_selftests():
     selftest_ontology_tree_filter()
     selftest_seed_assignment()
     selftest_compact_annotation()
+    selftest_atlas_view_geometry()
+    selftest_annotation_features()
     print("=== all selftests passed ===")
     return 0
 

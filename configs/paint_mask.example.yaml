@@ -91,9 +91,25 @@ role: sample                    # 只在 kind == "guide" 时有意义："sample"
 # 配样本 32 µm 时，滑块位置会落在样本平面的分数处，napari 0.8.0 在那里“渲染取哪层”和
 # “落笔写哪层”的取整规则不同，实测 12 个滑块位置里有 5 个会把笔画静默写到前一层。
 #
-# 图谱只是【参考】，不需要和你的样本对齐 —— 导出的是 ontology structure id，
-# 跟图谱怎么显示、什么朝向、降采样几倍都无关。面板上的“跳到该脑区中心层”按钮
-# 只移动图谱窗口，不动样本窗口。
+# 图谱窗口里有三个图层，可以在 napari 左侧图层列表里各自开关、调透明度：
+#   reference（模板灰度）  完整的 template
+#   annotation（全部脑区） 完整的 annotation，全部脑区彩色，默认 45% 透明
+#   selection（选中的脑区）ontology 树里选中的那个（含全部后代），纯红
+# 鼠标停在 annotation 上，状态栏会直接显示脑区名和真实 structure id。
+#
+# 图谱窗口默认是【三个正交视角同步联动】的：主画布（轴0 切面，也就是样本的视角）
+# 下面挂着轴1、轴2 两个切面，拖任意一个滑块另外两个跟着走。样本通常只沿一个方向
+# 切片，但图谱是个体，脑区在另外两个面上的形状才是判断“选中的是不是我要的结构”
+# 的依据。屏幕小或者显卡吃不消可以关掉，退回单画布：
+# atlas_ortho_views: true
+#
+# 图谱只是【参考】，不需要和你的样本对齐，也【不需要和样本同样的范围】——
+# 样本是半脑、图谱用全脑是正常用法，把 atlas_template_path / atlas_annotation_path
+# 指到全脑文件即可，两边的体素网格本来就是独立的（图谱在自己的窗口、自己的
+# voxel size 下显示，从来不和样本配准）。导出的是 ontology structure id +
+# 样本自己网格上的体素下标，跟图谱怎么显示、什么朝向、裁到多大、降采样几倍都无关。
+# 唯一必须和流水线那份图谱对上的是 ONTOLOGY（ontology_path）—— 因为跨过去的是 id。
+# 面板上的“三视角跳到该脑区中心”按钮只移动图谱窗口，不动样本窗口。
 #
 # 路径直接复用 Registration_ants 的图谱预设，不用在两个地方各维护一份。
 # atlas_preset: devccf_p04            # 预设名，见 Registration_ants/configs/atlas_presets_local.yaml
@@ -106,6 +122,10 @@ role: sample                    # 只在 kind == "guide" 时有意义："sample"
 # atlas_template_path:   /path/to/P04_LSFM_20um.nii.gz                 # 可选，只是灰度背景
 # atlas_resolution_um:   20
 # atlas_orientation:     [1, -3, 2]   # 和流水线一致，纯显示用
+#
+# 半脑样本 + 全脑图谱：上面两个 *_path 换成全脑那份文件就行，其它什么都不用改。
+# 全脑文件的轴序/朝向如果和预设里那份不同，用 atlas_orientation 单独调（只影响
+# 显示，不影响导出）。
 #
 # 图谱内存：DevCCF P04 解压后 annotation 1.1 GB、template 573 MB。加载峰值约
 # 2.7 GB，之后常驻会压到 860 MB（annotation 只有 193 个 label，压成 uint8 索引）。
