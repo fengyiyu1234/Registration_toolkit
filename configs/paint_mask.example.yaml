@@ -5,166 +5,30 @@
 #   conda activate antsreg
 #   python paint_mask.py                       # 无命令行参数
 #   python paint_mask.py configs/paint_mask.guide_s12t.yaml   # 或显式指定另一份
-#
-# 旧版本把这份配置放在仓库根目录的 paint_mask_local.yaml，那个位置仍然能读，
-# 但会打印一条迁移提示；直接 mv 到 configs/paint_mask.yaml 即可。
 
-kind: mask                      # "mask" | "guide"
-
-# mask: 要画 mask 的样本图像。
-# guide: role=sample 时是样本，role=atlas 时是图谱模板。
+# 要画 guide outline 的样本图像。
 image_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_fine_25um.nii.gz
 
-output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/modified_mask.nii.gz
+output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/s12t_guide_sample.nii.gz
 
-# 可选。
-# mask（稠密模式）：从已有 mask 开始修（例如自动生成的 <name>_brain_mask.nii.gz）。
-#       留空/删掉就是空白画布 —— 默认全部 included，画 0 标出要排除的地方。
-# mask（interpolate 模式）：指向上次的导出结果 = 续画。只恢复 sidecar 里记着的
-#       手画层，插值出来的层会丢弃（否则下一次就是在上次的猜测上再插值一遍，
-#       5 层的活儿会变 11 层，每轮越飘越远）。二值 mask 分不出 label，
-#       续画时所有 label 会合并成 1，要保留区分就重画。
-# guide: 可选的预填（例如 scripts/project_outline.py 的猜测结果，只在 role=atlas 时用）。
-existing_mask_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_brain_mask.nii.gz
+# 可选，继续画上次的结果
+existing_mask_path: /path/to/上次的_guide_sample.nii.gz
 
-# 可选，只在 kind == "mask" 时有意义。默认 false = 稠密画法：画布预填全 1，
-# 你用橡皮（label 0）把要排除的地方一层一层擦掉，没碰过的层原样保留。
-#
-# true = 稀疏关键帧 + 插值，跟 guide 一样：只画几个关键层，层之间自动插值。
-# 改成正向画（不是擦）才可能插值 —— 稠密模式里"没碰过的层"和"确认全部保留的层"
-# 都是全 1，没有可插值的信息。组织缺失跨几十层时用 true，否则要一层层擦几十次。
-# interpolate: true
+# ===== 图谱参考 + ontology 选区 =====
+# 不配 = 没有图谱窗口、没有 ontology 面板，只能靠下面的 region_labels 手写脑区名。
+# 图谱只是参考，从不和样本配准
+# annotation + ontology 必需，其余可省。
+atlas_annotation_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um.nii.gz
+ontology_path:         /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
+atlas_template_path:   /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_LSFM_20um.nii.gz
+atlas_resolution_um:   20
+# atlas_orientation:     [1, -3, 2]
 
-# ---------------------------------------------------------------------------
-# interpolate 模式：画笔代表什么，【不在这里配】
-# ---------------------------------------------------------------------------
-# 画完之后在 GUI 右侧的 Mask Values 面板里逐 label 选导出成 0 还是 1，再选圈外
-# （补集）是 0 还是 1 —— 圈的含义是画出来之后才知道的事，不该提前写死在配置里。
-#   圈空腔：      label 1 → 0，补集 → 1
-#   圈有效区域：  label 1 → 1，补集 → 0
-# 同一层上两个圈都用 label 1，补集就是两个圈【共同】的外部。也可以混着来
-# （label 1→1、label 2→0、补集→1），面板里每个 label 各自一行。
-#
-# 生效范围是【每个 label 各自的「最小关键帧 ~ 最大关键帧」区间】：
-#   区间之内 —— 按你选的取值和补集处理（中间没画的层由插值填）
-#   区间之外 —— 一律全 1，全部参与配准，跟补集设成什么无关
-# 所以最后一个关键帧不需要画到图像的最后一层；只画前 30 层、后面几十层不动，
-# 后面就是全 1。
-#
-# ⚠ 但补集设 0 时，区间边界是【硬切换】：最后一个关键帧那层只剩圈里参与配准，
-#   下一层突然全部参与。实测（157 层，关键帧画在 20/25/30，label 1→1、补集→0）：
-#       plane 19 = 全 1   plane 25 = 只剩 22%   plane 31 = 全 1   plane 156 = 全 1
-#   意味着如果组织缺失其实延续到第 35 层，而你只画到 30，那 31~35 层就完全没有
-#   约束，而且【不会有任何提示】—— mask 只能对你画过的层发言。
-#
-#   保险的画法：最后一个关键帧放在【第一个组织重新完整的层】上，而不是"画累了"
-#   的那一层，并且那一层的圈画大一点、基本覆盖整个组织，这样过渡是连续的而不是
-#   突变。要整层排除就把那层画出来（画满 + 取值 0），不要指望留空。
-#
-# 导出时的两条防呆：
-#   - 画了但没在面板里给取值的 label —— 直接拒绝导出，不猜默认值；
-#   - 某个 label 的取值和补集一样 —— 告警，那在二值 mask 里看不出来，画了等于没画。
-#
-# ---------------------------------------------------------------------------
-# Relabel 面板（interpolate 模式和 guide 模式都有）
-# ---------------------------------------------------------------------------
-# 画错了 label 不用重画：
-#   「点击填充改 label」—— 切到 napari 的 FILL 模式，点哪块哪块变成目标 label；
-#   「整个 label 全改」 —— from → to 全量重编号。
-# guide 模式下全量重编号会把该 label 的 ontology 分配一起带走，否则 label 保住了
-# 体素却丢了含义。
-
-role: sample                    # 只在 kind == "guide" 时有意义："sample" | "atlas"
-                                # 正常只画 sample：图谱侧由 Registration_ants 按下面的
-                                # 脑区名从 P04_DevCCF_Annotations_20um.nii.gz 自动取。
-                                # atlas 保留给需要手工修正图谱侧区域的情况。
-
-# ===== 图谱参考 + ontology 选区（只在 kind == "guide" 时有意义，可选） =====
-# 配了就会在 napari 右侧多出一个面板：可折叠的 ontology 树 + 搜索框。选中任意
-# 层级的节点，图谱侧就高亮该节点【及其全部后代】（annotation 自己的 label 分布在
-# 第 2~12 层，所以高层节点必须靠后代求并集才看得见东西）。选好脑区 → 设 brush
-# label → 点“加到 label”，画笔会自动切过去，直接开画。
-#
-# 图谱显示在【单独的第二个窗口】里，可以随时用面板上的“打开/关闭图谱窗口”按钮关掉，
-# 关了也不影响画和导出（ontology 树和 label 分配都在样本窗口这一侧）。分开是必须的：
-# 同一个窗口意味着共用一个 z 滑块，而滑块步长取所有图层里最小的 scale —— 图谱 20 µm
-# 配样本 32 µm 时，滑块位置会落在样本平面的分数处，napari 0.8.0 在那里“渲染取哪层”和
-# “落笔写哪层”的取整规则不同，实测 12 个滑块位置里有 5 个会把笔画静默写到前一层。
-#
-# 图谱窗口里有三个图层，可以在 napari 左侧图层列表里各自开关、调透明度：
-#   reference（模板灰度）  完整的 template
-#   annotation（全部脑区） 完整的 annotation，全部脑区彩色，默认 45% 透明
-#   selection（选中的脑区）ontology 树里选中的那个（含全部后代），纯红
-# 鼠标停在 annotation 上，状态栏会直接显示脑区名和真实 structure id。
-#
-# 图谱窗口默认是【三个正交视角同步联动】的：主画布（轴0 切面，也就是样本的视角）
-# 下面挂着轴1、轴2 两个切面，拖任意一个滑块另外两个跟着走。样本通常只沿一个方向
-# 切片，但图谱是个体，脑区在另外两个面上的形状才是判断“选中的是不是我要的结构”
-# 的依据。屏幕小或者显卡吃不消可以关掉，退回单画布：
-# atlas_ortho_views: true
-#
-# 在【任意一个视角里左键单击】，三个视角就一起以该点为中心重切，和常见的三视图
-# 软件一样。青色的“十字准线”图层画出另外两个面切在哪儿（每个面上正好两条线），
-# 不想看可以在图层列表里关掉。拖动是平移画面，不会误触发跳转。
-#
-# 右侧“脑区层级”面板：鼠标停在图谱上，就显示该体素所在脑区的【完整祖先链】
-# （root → ... → 该结构），每一级都带 structure id，▶ 标的是 annotation 实际
-# 存的那一级。因为细粒度 annotation 存的多半是 "layer 5 of primary motor area"
-# 这种叶子，而你真正要选的往往是它的某个上级。
-#
-# 图谱只是【参考】，不需要和你的样本对齐，也【不需要和样本同样的范围】——
-# 样本是半脑、图谱用全脑是正常用法，把 atlas_template_path / atlas_annotation_path
-# 指到全脑文件即可，两边的体素网格本来就是独立的（图谱在自己的窗口、自己的
-# voxel size 下显示，从来不和样本配准）。导出的是 ontology structure id +
-# 样本自己网格上的体素下标，跟图谱怎么显示、什么朝向、裁到多大、降采样几倍都无关。
-# 唯一必须和流水线那份图谱对上的是 ONTOLOGY（ontology_path）—— 因为跨过去的是 id。
-# 面板上的“三视角跳到该脑区中心”按钮只移动图谱窗口，不动样本窗口。
-#
-# 路径直接复用 Registration_ants 的图谱预设，不用在两个地方各维护一份。
-# atlas_preset: devccf_p04            # 预设名，见 Registration_ants/configs/atlas_presets_local.yaml
-# atlas_presets_path: /home/fyu7/My_project/Registration_ants/configs/atlas_presets_local.yaml
-#                                     # 默认就是 ../Registration_ants/configs/atlas_presets_local.yaml
-#
-# 也可以不用预设，直接写路径（写了就覆盖预设里的同名项）：
-# atlas_annotation_path: /path/to/P04_DevCCF_Annotations_20um.nii.gz   # 必需
-# ontology_path:         /path/to/DevCCFv1_ontology.json               # 必需
-# atlas_template_path:   /path/to/P04_LSFM_20um.nii.gz                 # 可选，只是灰度背景
-# atlas_resolution_um:   20
-# atlas_orientation:     [1, -3, 2]   # 和流水线一致，纯显示用
-#
-# 半脑样本 + 全脑图谱：上面两个 *_path 换成全脑那份文件就行，其它什么都不用改。
-# 全脑文件的轴序/朝向如果和预设里那份不同，用 atlas_orientation 单独调（只影响
-# 显示，不影响导出）。
-#
-# 图谱内存：DevCCF P04 解压后 annotation 1.1 GB、template 573 MB。加载峰值约
-# 2.7 GB，之后常驻会压到 860 MB（annotation 只有 193 个 label，压成 uint8 索引）。
-# 设成 2 则常驻降到 108 MB、峰值 2.4 GB，对正确性完全无害（导出的是 id）。
-# atlas_downsample: 1
-
-# 只在 kind == "guide" 时有意义。画笔 label 值 → 脑区名。
-# 配了图谱的话这里可以不填 —— 在 GUI 的 ontology 树里选就行，导出时以 GUI 里的
-# 分配为准；这里填了的会作为初始值预填进面板（名字只有在 ontology 里能【唯一精确】
-# 匹配到一个结构时才会转成 id，匹配不到或匹配到多个都会提示你去树里重选）。
-#
-# 一个 label 可以对应【多个】脑区（值写成列表）：DevCCF 里没有单个 "cortex"，
-# 只有 36 个 "layer N of <area>"，所以单个名字经常不够用。
-#
-# 不填 = 单区域的老用法：只用 label 1 画，导出结果和加多脑区支持之前逐位一致。
-# 画布上出现没登记的 label、或登记了却没画的 label，导出时都会警告（只警告，
-# 文件照写 —— 分几次画是正常用法）。
-# 每个 label 至少要画 2 层，否则插值插不出体积，只会得到孤零零的一薄片。
+# 设置label，也可以在gui里设置，一个label可以对应多个脑区
 # region_labels:
 #   1: ["layer 1 of Isocortex", "layer 2 of Isocortex"]
 #   2: "cerebellar hemisphere"        # 单个的话写成字符串也行
-#
-# 画笔 label → ontology structure id。正常由 GUI 写进 <output>.regions.json，
-# 一般不用手写；写了的话原样带过去（id 是精确匹配，比名字的子串匹配可靠）。
-# region_ids:
-#   1: [15751, 15756]
 
-# 可选，影响 kind == "guide" 和 kind == "mask" 的显示，不影响导出的数值（导出的一直是体素索引）。
-# 注意是 (z, y, x) 顺序 —— 和 SimpleITK 读出来的数组轴序一致，跟流水线配置里
-# voxel_size_um 的 (x, y, z) 顺序正好相反。
-# 原始 registration.tif 是 2.6/2.6/32 µm，z 方向差 12 倍；不设的话 napari 按各向
-# 同性画，正交视图会被压扁 12 倍完全没法看。
-# display_scale_zyx: [32.0, 2.6, 2.6]
+# 可选，只影响显示，不影响导出的数值（导出的一直是体素索引）。
+# 注意是 (z, y, x) 顺序 
+display_scale_zyx: [32.0, 2.6, 2.6]
