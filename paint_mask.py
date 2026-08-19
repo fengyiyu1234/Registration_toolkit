@@ -96,7 +96,10 @@ kinds, one shared napari GUI, two different export semantics:
     the region currently selected in the tree -- each toggleable from napari's
     own layer list, and in three synced ortho panes so a region's shape is
     visible in all three planes even though the sample is only cut in one
-    (`atlas_ortho_views: false` gives the old single pane back).
+    (`atlas_ortho_views: false` gives the old single pane back). Left-clicking
+    any pane recentres all three on that point; hovering shows the full
+    ontology chain of the voxel under the cursor, not just the leaf structure
+    the annotation stores.
 
     The atlas grid is INDEPENDENT of the sample's: a half-brain sample against
     a whole-brain atlas is the normal case, and needs nothing but pointing
@@ -657,9 +660,35 @@ _MIRRORED_LAYER_ATTRS = ("visible", "opacity", "contrast_limits", "gamma", "colo
 # views, leaving the main canvas the rest. Draggable afterwards.
 _ORTHO_DOCK_HEIGHT = 300
 
+# How far the mouse may travel between press and release and still count as a
+# click rather than the start of a camera pan (see _click_moves_crosshair).
+_CLICK_SLOP_PX = 4
+
+
+def crosshair_vectors(centre, shape):
+    """napari Vectors data (3, 2, 3): one full-extent line along each axis,
+    all three crossing at voxel `centre`.
+
+    Two of the three land in any given pane and the third does not, which is
+    exactly the classic ortho crosshair and costs no per-pane bookkeeping. A
+    pane slicing axis k draws the axes it displays: those lines start at 0 on
+    the axes it slices, i.e. at `centre` on the slider axis, so they are in the
+    current slice. The line ALONG axis k starts at 0 on axis k, so it only
+    matches slice 0 and is otherwise (correctly) invisible -- it is the line
+    pointing straight at the viewer.
+    """
+    ndim = len(shape)
+    vectors = np.zeros((ndim, 2, ndim), dtype=float)
+    for axis in range(ndim):
+        start = list(centre)
+        start[axis] = 0
+        vectors[axis, 0] = start
+        vectors[axis, 1, axis] = shape[axis]      # length: the whole extent
+    return vectors
+
 
 def _add_atlas_layers(model, atlas, scale_kwargs, features):
-    """The atlas's three layers, added to one ViewerModel in draw order.
+    """The atlas's four layers, added to one ViewerModel in draw order.
 
     Called once per ortho pane. Every pane gets its OWN Layer objects -- one
     Layer cannot belong to two ViewerModels -- but they are all backed by the
@@ -681,7 +710,12 @@ def _add_atlas_layers(model, atlas, scale_kwargs, features):
                                      color_dict={None: "transparent", 1: "red"}),
                                  **scale_kwargs)
     highlight.editable = False              # a reference; painting here would mean nothing
-    return SimpleNamespace(template=template, annotation=annotation, highlight=highlight)
+    centre = tuple(dim // 2 for dim in atlas.compact.shape)
+    cross = model.add_vectors(crosshair_vectors(centre, atlas.compact.shape),
+                              name="十字准线", edge_color="cyan", edge_width=1.5,
+                              vector_style="line", opacity=0.9, **scale_kwargs)
+    return SimpleNamespace(template=template, annotation=annotation,
+                           highlight=highlight, cross=cross)
 
 
 def mask_centre_index(mask):
@@ -722,6 +756,16 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
     `_sync_ortho_panes` keeps their sliders together; pane 0 is the real napari
     Viewer (it owns the window, the layer list and the layer controls) and the
     other two are bare QtViewer canvases in a dock beneath it.
+
+    ONE CROSSHAIR over all of them: left-clicking any pane recentres all three
+    on the clicked point, the way every other ortho viewer behaves. The
+    crosshair is derived from dims.current_step rather than stored, so clicks,
+    slider drags and "jump to region" all drive it through the same path and
+    it cannot end up pointing at a plane no pane is showing.
+
+    A HOVER PANEL (_add_ancestry_panel) on the right, because the one structure
+    a voxel is labelled with is usually a leaf ("layer 5 of primary motor
+    area") and the level you are actually picking is one of its ancestors.
 
     The atlas grid is INDEPENDENT of the sample's -- a half-brain sample
     against a whole-brain atlas is the normal case here, and works because
@@ -805,13 +849,65 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
 
     def centre_on(index):
         """Point every pane at voxel `index` -- so the two reconstructions land
-        on the selection too, not just the pane whose slider was moved."""
+        on it too, not just the pane whose slider was moved or clicked."""
         for axis, value in enumerate(index):
-            viewer.dims.set_point(axis, value * float(main.layers.highlight.scale[axis]))
+            value = int(np.clip(round(float(value)), 0, atlas.compact.shape[axis] - 1))
+            viewer.dims.set_point(axis, value * float(main.layers.annotation.scale[axis]))
+
+    def refresh_cross(*_args):
+        """The crosshair is DERIVED from the slice position, never stored
+        separately: slider drag, click, and 'jump to region' then all reach it
+        through one path, and none of them can leave it pointing somewhere the
+        panes are not showing."""
+        step = viewer.dims.current_step
+        if len(step) != atlas.compact.ndim:
+            # Closing the window empties the layer list, which collapses
+            # dims.ndim to 2 and emits current_step on the way down. There is
+            # nothing to draw a crosshair on any more.
+            return
+        data = crosshair_vectors(tuple(int(v) for v in step), atlas.compact.shape)
+        for pane in built:
+            pane.layers.cross.data = data
+
+    # Connected to the MAIN pane only: _sync_ortho_panes pushes every pane's
+    # change into it, so its event is the one place all of them converge.
+    viewer.dims.events.current_step.connect(refresh_cross)
+    for pane in built:
+        pane.model.mouse_drag_callbacks.append(_click_moves_crosshair(pane, centre_on))
+    refresh_cross()
+
+    hover = _add_ancestry_panel(viewer, atlas, built)
 
     return SimpleNamespace(viewer=viewer, panes=built, highlight=main.layers.highlight,
-                           annotation=main.layers.annotation,
+                           annotation=main.layers.annotation, hover=hover,
                            set_highlight=set_highlight, centre_on=centre_on)
+
+
+def _click_moves_crosshair(pane, centre_on):
+    """Left-click anywhere in a pane -> crosshair there, in every pane.
+
+    A generator callback, which is napari's way of telling a click from the
+    start of a drag: napari resumes it on every mouse_move and once more on
+    release, so the decision can be made after the fact. A plain press handler
+    cannot -- the same press that begins a camera pan would jump the crosshair
+    on its way, and the atlas would slide out from under the pan.
+    """
+    def callback(_model, event):
+        if event.button != 1 or event.modifiers:
+            return                          # right-click menus and modified drags stay napari's
+        origin = np.asarray(event.pos, dtype=float)
+        dragged = False
+        yield
+        while event.type == "mouse_move":
+            if np.abs(np.asarray(event.pos, dtype=float) - origin).max() > _CLICK_SLOP_PX:
+                dragged = True
+            yield
+        if not dragged:
+            # event.position is world coords on ALL axes -- the two the pane
+            # draws come from the cursor, the third from its own slider -- so
+            # this is a full 3D point, not just the 2D one that was clicked.
+            centre_on(pane.layers.annotation.world_to_data(event.position))
+    return callback
 
 
 def _sync_ortho_panes(panes):
@@ -836,8 +932,11 @@ def _sync_ortho_panes(panes):
             try:
                 step = source.model.dims.current_step
                 for pane in panes:
-                    if pane is not source and pane.model.dims.current_step != step:
-                        pane.model.dims.current_step = step
+                    if pane is source or pane.model.dims.current_step == step:
+                        continue
+                    if pane.model.dims.ndim != len(step):
+                        continue        # a pane already torn down by window close
+                    pane.model.dims.current_step = step
             finally:
                 busy["in"] = False
         return _handler
@@ -857,7 +956,7 @@ def _mirror_layer_attrs(panes):
     the template, the annotation and the selection.
     """
     main, followers = panes[0], panes[1:]
-    for role in ("template", "annotation", "highlight"):
+    for role in ("template", "annotation", "highlight", "cross"):
         source = getattr(main.layers, role)
         if source is None:
             continue
@@ -874,6 +973,94 @@ def _mirror_layer_attrs(panes):
                         setattr(target, _attr, value)
 
             emitter.connect(_push)
+
+
+def format_ancestry(structures, structure_id):
+    """The whole root -> leaf chain of `structure_id`, one level per line.
+
+    What the status bar can show is the ONE structure a voxel is labelled
+    with, which for a fine-grained annotation is a leaf like "layer 5 of
+    primary motor area" -- true, and useless for deciding whether you are
+    looking at cortex. The ontology already carries the answer in
+    structure_id_path; this just renders it, so the level you actually care
+    about is on screen next to the level the annotation happens to store.
+
+    The voxel's own structure is marked, since it is usually NOT the last line
+    a user cares about, and every line carries its id -- ids are what the
+    export records, so being able to read one off directly is the point.
+    """
+    info = structures.get(structure_id)
+    if info is None:
+        return f"id {structure_id}：不在 ontology 里（annotation 用了这个 label，但字典里查不到）"
+    lines = []
+    for depth, sid in enumerate(info["structure_id_path"]):
+        node = structures.get(sid)
+        marker = "▶" if sid == structure_id else "·"
+        indent = "  " * depth
+        if node is None:
+            lines.append(f"{indent}{marker} [{sid}] ?")
+            continue
+        acronym = node.get("acronym")
+        name = f"{node['name']} ({acronym})" if acronym else node["name"]
+        lines.append(f"{indent}{marker} {name}  [{sid}]")
+    return "\n".join(lines)
+
+
+def _add_ancestry_panel(viewer, atlas, panes):
+    """A dock on the atlas window showing the full ontology chain of whatever
+    the mouse is over, updated live from every pane.
+
+    Returns SimpleNamespace(label=, show=) so the behaviour is testable without
+    synthesising Qt mouse events: `show` takes a compact index and is the whole
+    of what the mouse callbacks do.
+    """
+    label = QLabel("把鼠标放到图谱上，这里显示该体素所在脑区的完整层级。")
+    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    label.setWordWrap(False)
+
+    # mouse_move fires continuously; re-rendering the same chain on every pixel
+    # of travel is pure waste, and the flicker is visible.
+    last = {"index": -1}
+
+    def show(compact_index):
+        if compact_index is None:
+            compact_index = 0
+        compact_index = int(compact_index)
+        if compact_index == last["index"]:
+            return
+        last["index"] = compact_index
+        if compact_index == 0:
+            label.setText("（背景，没有脑区）")
+            return
+        sid = int(atlas.present_ids[compact_index])
+        voxels = atlas.node_voxels.get(sid, 0)
+        label.setText(format_ancestry(atlas.structures, sid)
+                      + f"\n\n该结构（含后代）共 {voxels:,} 体素")
+
+    def watcher(pane):
+        def on_move(_model, event):
+            dims_displayed = getattr(event, "dims_displayed", None)
+            # get_value concatenates this onto a list internally, so it has to
+            # BE a list -- napari's own canvas passes one, but dims.displayed
+            # itself is a tuple and reaches here unchanged on other paths.
+            if dims_displayed is not None:
+                dims_displayed = list(dims_displayed)
+            show(pane.layers.annotation.get_value(
+                event.position,
+                view_direction=getattr(event, "view_direction", None),
+                dims_displayed=dims_displayed,
+                world=True))
+        return on_move
+
+    for pane in panes:
+        pane.model.mouse_move_callbacks.append(watcher(pane))
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(QLabel("鼠标所在脑区的完整层级（▶ 是 annotation 实际存的那一级）"))
+    layout.addWidget(_scrollable(label, 220))
+    viewer.window.add_dock_widget(dock, area="right", name="脑区层级")
+    return SimpleNamespace(label=label, show=show)
 
 
 def _tree_label(sid, info, voxels):
@@ -2806,6 +2993,55 @@ def selftest_annotation_features():
     print("   ok")
 
 
+def selftest_crosshair_vectors():
+    print("16. atlas 十字准线: 每个面正好画到两条线，且交点就是当前切片位置")
+    shape = (6, 8, 10)
+    vectors = crosshair_vectors((4, 5, 7), shape)
+    assert vectors.shape == (3, 2, 3), vectors.shape
+
+    # Each line starts at 0 on its own axis and at the crosshair on the others,
+    # and is exactly as long as the volume, so it spans the whole pane.
+    assert np.array_equal(vectors[:, 0], [[0, 5, 7], [4, 0, 7], [4, 5, 0]]), vectors[:, 0]
+    assert np.array_equal(vectors[:, 1], np.diag(shape)), vectors[:, 1]
+
+    # A pane slicing axis k shows a line iff that line's start sits in the
+    # current slice -- true for the two lines lying in the plane, false for the
+    # one pointing at the viewer. Two lines per pane is the whole trick.
+    for sliced_axis in range(3):
+        in_slice = [i for i in range(3) if vectors[i, 0, sliced_axis] == (4, 5, 7)[sliced_axis]]
+        assert len(in_slice) == 2, (sliced_axis, in_slice)
+        assert sliced_axis not in in_slice, (sliced_axis, in_slice)
+    print("   ok")
+
+
+def selftest_format_ancestry():
+    print("17. atlas 悬停: 显示的是整条祖先链，不是只有最细那一级")
+    structures = {
+        1: {"name": "root", "acronym": "root", "structure_id_path": [1]},
+        2: {"name": "Cerebrum", "acronym": "CH", "structure_id_path": [1, 2]},
+        5: {"name": "Cortex", "acronym": "CTX", "structure_id_path": [1, 2, 5]},
+        9: {"name": "layer 5", "acronym": None, "structure_id_path": [1, 2, 5, 9]},
+    }
+    text = format_ancestry(structures, 9)
+    lines = text.splitlines()
+    assert len(lines) == 4, lines
+    # Root first, leaf last, every ancestor present with its id -- the ids are
+    # what the export records, so they have to be readable off this panel.
+    for sid in (1, 2, 5, 9):
+        assert f"[{sid}]" in text, (sid, text)
+    assert lines[0].startswith("· root"), lines[0]
+    assert "▶" in lines[-1] and lines[-1].count("▶") == 1, lines[-1]
+    assert sum("▶" in line for line in lines) == 1, lines
+    assert "(CTX)" in lines[2], lines[2]      # acronym shown when the node has one
+    assert "(None)" not in lines[3], lines[3] # and not faked when it does not
+
+    # A mid-level pick marks itself, not the deepest node it knows about.
+    assert "▶ Cortex" in format_ancestry(structures, 5)
+    # A label the annotation carries but the ontology never describes.
+    assert "不在 ontology" in format_ancestry(structures, 4242)
+    print("   ok")
+
+
 def run_selftests():
     import tempfile
 
@@ -2831,6 +3067,8 @@ def run_selftests():
     selftest_compact_annotation()
     selftest_atlas_view_geometry()
     selftest_annotation_features()
+    selftest_crosshair_vectors()
+    selftest_format_ancestry()
     print("=== all selftests passed ===")
     return 0
 
