@@ -15,16 +15,9 @@ output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/s12t_guide_sa
 existing_mask_path: /path/to/上次的_guide_sample.nii.gz
 
 # ===== 图谱 ontology 选区（只用来把脑区分配到 brush label，不显示图谱）=====
-# 不配 = 没有 ontology 面板，只能靠下面的 region_labels 手写脑区名。
-# 图谱只是参考，从不和样本配准。annotation + ontology 必需，其余可省。
-# 要实际看图谱（三视角 + 高亮），用独立的 atlas_view.py（见 configs/atlas_view.example.yaml），
-# 跟这边的 ontology 面板互不联动。atlas_template_path/atlas_orientation 这两项这里也不需要
-# （paint_mask.py 从不显示图谱），留着只是方便整段复制到 atlas_view.yaml。
+
 atlas_annotation_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um.nii.gz
 ontology_path:         /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
-atlas_template_path:   /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_LSFM_20um.nii.gz
-atlas_resolution_um:   20
-atlas_orientation:     [1, -3, 2]
 
 # 设置label，也可以在gui里设置，一个label可以对应多个脑区
 # region_labels:
