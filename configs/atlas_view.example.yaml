@@ -1,0 +1,25 @@
+# atlas_view.py 的配置模板。复制成 configs/atlas_view.yaml（gitignored）
+# 再改成本机的真实路径：
+#
+#   cp configs/atlas_view.example.yaml configs/atlas_view.yaml
+#   conda activate antsreg
+#   python atlas_view.py                       # 无命令行参数
+#   python atlas_view.py configs/atlas_view.devccf.yaml   # 或显式指定另一份
+
+# 必需：annotation + ontology。这是一个独立的图谱浏览器，跟 paint_mask.py
+# 互不联动 -- 两边各自的 configs/*.yaml 可以指向同一份图谱，但改这边不会影响
+# paint_mask.py 里的脑区分配，反过来也一样。
+atlas_annotation_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um.nii.gz
+ontology_path:         /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
+
+# 可选：灰度模板，叠在 annotation 下面做背景。
+atlas_template_path:   /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_LSFM_20um.nii.gz
+
+atlas_resolution_um:   20
+atlas_orientation:     [1, -3, 2]
+
+# 可选，>=1，只影响显示速度/精细度，不影响 ontology 本身。
+# atlas_downsample: 1
+
+# 三个正交视角同步显示；关掉的话只剩样本视角那一个。
+atlas_ortho_views: true
