@@ -477,7 +477,6 @@ def _add_region_panel(viewer, atlas, win):
 
     tree = QTreeWidget()
     tree.setHeaderLabels(["脑区", "体素", "id"])
-    tree.setColumnWidth(0, 260)
     # Ctrl/Shift-click (or a drag) adds to the selection instead of replacing
     # it -- the default SingleSelection would make multi-region highlighting
     # impossible no matter what on_select() does with it.
@@ -487,6 +486,12 @@ def _add_region_panel(viewer, atlas, win):
     # height regardless.
     tree.setMinimumHeight(400)
     items = ontology_tree_ui.populate_ontology_tree(tree, atlas.structures, atlas.node_voxels)
+    # Content-driven, not a hardcoded pixel count -- the name column then fits
+    # whatever's actually loaded instead of permanently claiming a fixed slice
+    # of the window's width regardless of what's on screen. Still just the
+    # starting point: Interactive is the header's default resize mode, so the
+    # user can still drag it (and the dock) narrower or wider afterwards.
+    tree.resizeColumnToContents(0)
 
     status = QLabel()
     jump_btn = QPushButton("跳到选中脑区中心（三视角同步）")
