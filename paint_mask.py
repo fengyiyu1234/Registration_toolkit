@@ -57,6 +57,13 @@ blob rather than something that needs a meaningful value on every plane.
     renumber carries that label's ontology assignment with it, so the number
     keeps meaning the same region.
 
+  An "Erase" panel: lasso a polygon around a mistake and everything inside
+    it is erased on that plane, whatever label it carried -- rubbing a whole
+    wrong blob out with the eraser brush is the slow way to do the same
+    thing. The brush/eraser size slider is also widened past napari's own
+    1..40 ceiling (see MAX_BRUSH_SIZE), since 40 voxels is a dot on a plane
+    several hundred voxels across.
+
   Several regions at once: the paint layer is a napari Labels layer, so
     label 1/2/3/... are different brush values, one per brain region (see
     `region_labels` in configs/paint_mask.example.yaml). One label can carry
@@ -97,7 +104,7 @@ no command-line arguments.
 
     conda activate antsreg
     python paint_mask.py
-    python paint_mask.py configs/paint_mask.guide_s12t.yaml  # 或指定另一份配置
+    python paint_mask.py configs/paint_mask.guide_s12t.yaml  # or point at another config
 
 To actually look at the atlas (not just assign regions to brush labels),
 run the separate atlas_view.py -- see its own docstring.
@@ -165,8 +172,8 @@ def _interpolate_sparse_mask():
     from registration_ants import mask_utils
     return mask_utils.interpolate_sparse_mask
 
-# 这份配置以前放在仓库根目录，现在统一到 configs/ 下（和其它工具一致）。
-# 旧位置仍然能读，只是会打印一条迁移提示。
+# This config used to live in the repo root; it now sits in configs/ like every
+# other tool's. The old location is still read, with a migration note printed.
 _LEGACY_CONFIG_PATHS = (Path(__file__).resolve().parent / "paint_mask_local.yaml",)
 
 
@@ -206,7 +213,8 @@ def _normalize_label_map(raw, key_name, coerce, describe):
     if not raw:
         return {}
     if not isinstance(raw, dict):
-        raise ValueError(f"{key_name} 应该是 {{label: {describe}}} 映射，实际是 {type(raw).__name__}")
+        raise ValueError(f"{key_name} should be a {{label: {describe}}} mapping, "
+                         f"got {type(raw).__name__}")
 
     normalized = {}
     for key, entries in raw.items():
@@ -214,19 +222,22 @@ def _normalize_label_map(raw, key_name, coerce, describe):
             label = int(key)
         except (TypeError, ValueError):
             raise ValueError(
-                f"{key_name} 的 key 必须是画笔 label（整数），得到 {key!r}") from None
+                f"{key_name} keys must be brush labels (integers), got {key!r}") from None
         if label < 1:
-            raise ValueError(f"{key_name} 的 label 必须 >= 1（0 是背景/橡皮），得到 {label}")
+            raise ValueError(f"{key_name} labels must be >= 1 (0 is background/eraser), "
+                             f"got {label}")
         if label in normalized:
-            raise ValueError(f"{key_name} 里 label {label} 出现了两次（int 和 str key 各一次？）")
+            raise ValueError(f"{key_name} lists label {label} twice "
+                             "(once as an int key and once as a str key?)")
         if isinstance(entries, (str, int)):
             entries = [entries]
         try:
             entries = [coerce(e) for e in entries]
         except (TypeError, ValueError):
-            raise ValueError(f"{key_name} 里 label {label} 的值应该是 {describe}，得到 {entries!r}") from None
+            raise ValueError(f"{key_name} label {label} should map to {describe}, "
+                             f"got {entries!r}") from None
         if not entries:
-            raise ValueError(f"{key_name} 里 label {label} 的{describe}是空的")
+            raise ValueError(f"{key_name} label {label} has an empty {describe}")
         normalized[label] = entries
     return normalized
 
@@ -242,14 +253,14 @@ def _normalize_region_labels(raw):
     """{brush label -> [brain region name, ...]}. Whether a name actually
     resolves in the atlas ontology is checked by the ontology picker when an
     atlas is configured, and on the Registration_ants side otherwise."""
-    return _normalize_label_map(raw, "region_labels", _region_name, "脑区名")
+    return _normalize_label_map(raw, "region_labels", _region_name, "brain region name")
 
 
 def _normalize_region_ids(raw):
     """{brush label -> [ontology structure id, ...]}. Normally written by the
     GUI's ontology picker rather than by hand; ids beat names downstream
     because they are matched exactly instead of as substrings."""
-    return _normalize_label_map(raw, "region_ids", int, "ontology structure id（整数）")
+    return _normalize_label_map(raw, "region_ids", int, "ontology structure id (integer)")
 
 
 def _normalize_display_scale(raw):
@@ -265,11 +276,13 @@ def _normalize_display_scale(raw):
     try:
         scale = [float(v) for v in raw]
     except (TypeError, ValueError):
-        raise ValueError(f"display_scale_zyx 应该是三个数 [z, y, x]，实际是 {raw!r}") from None
+        raise ValueError(f"display_scale_zyx should be three numbers [z, y, x], "
+                         f"got {raw!r}") from None
     if len(scale) != 3:
-        raise ValueError(f"display_scale_zyx 需要正好 3 个数 [z, y, x]，得到 {len(scale)} 个")
+        raise ValueError(f"display_scale_zyx needs exactly 3 numbers [z, y, x], "
+                         f"got {len(scale)}")
     if any(v <= 0 for v in scale):
-        raise ValueError(f"display_scale_zyx 必须全是正数，得到 {scale}")
+        raise ValueError(f"display_scale_zyx must be all positive numbers, got {scale}")
     return scale
 
 
@@ -288,6 +301,53 @@ def _load_mask_array(path, expected_shape):
     return arr
 
 
+# napari 0.8 builds its brush-size slider with a hardcoded 1..40 range
+# (_qt/layer_controls/widgets/_labels/qt_brush_size_slider.py). A guide
+# outline is painted on planes several hundred voxels across, so 40 is a
+# small dot -- both to fill a region and, mostly, to rub one out again.
+MAX_BRUSH_SIZE = 100
+
+
+def _widen_brush_size_slider(paint_layer, maximum=MAX_BRUSH_SIZE):
+    """Raise the ceiling of napari's brush/eraser size slider to `maximum`.
+
+    Two paths, because each on its own has a hole:
+
+      the layer side -- the slider widens its own maximum whenever the layer
+        reports a brush_size above it (QtBrushSizeSliderControl.
+        _on_brush_size_change) and never narrows it again, so pushing the
+        value up and putting it straight back leaves a 1..maximum slider
+        behind. That only reaches controls that already exist.
+
+      the class side -- napari builds a fresh controls widget per layer, and
+        a new one starts from the hardcoded 40 again, so the widget class
+        itself is patched to widen on construction. That is a private module
+        path, hence the guarded import: if it ever moves, the layer-side bump
+        still covers the one layer this tool creates.
+    """
+    try:
+        from napari._qt.layer_controls.widgets._labels.qt_brush_size_slider import (
+            QtBrushSizeSliderControl)
+    except ImportError:
+        QtBrushSizeSliderControl = None
+
+    if QtBrushSizeSliderControl is not None and not getattr(
+            QtBrushSizeSliderControl, "_paint_mask_widened", False):
+        original_init = QtBrushSizeSliderControl.__init__
+
+        def _init(self, parent, layer, _original=original_init):
+            _original(self, parent, layer)
+            if self.brush_size_slider.maximum() < maximum:
+                self.brush_size_slider.setMaximum(maximum)
+
+        QtBrushSizeSliderControl.__init__ = _init
+        QtBrushSizeSliderControl._paint_mask_widened = True
+
+    previous = paint_layer.brush_size
+    paint_layer.brush_size = maximum
+    paint_layer.brush_size = previous
+
+
 def _launch_viewer(arr, prefill, scale=None):
     """The sample window: the grayscale volume plus the layer painted on.
 
@@ -301,6 +361,7 @@ def _launch_viewer(arr, prefill, scale=None):
     viewer.add_image(arr, name="sample", colormap="gray", **scale_kwargs)
     paint_layer = viewer.add_labels(prefill.copy(), name="guide outline (paint here)",
                                     **scale_kwargs)
+    _widen_brush_size_slider(paint_layer)
     return viewer, paint_layer
 
 
@@ -308,13 +369,14 @@ def format_assignment(assignment, structures):
     """The label -> region panel text. Also the thing you check before
     exporting, so it spells out ids as well as names."""
     if not assignment:
-        return "还没有分配任何脑区。\n在上面的树里选一个脑区，设好 label 号，点“加到 label”。"
+        return ("No region assigned yet.\nPick a region in the tree above, set a brush "
+                "label, then click Assign to label.")
     lines = []
     for label in sorted(assignment):
         entries = assignment[label]
         names = ", ".join(f"{structures[sid]['name']} [{sid}]" for sid in entries)
         lines.append(f"  label {label} = {names}")
-    return "brush label → 脑区：\n" + "\n".join(lines)
+    return "brush label -> region:\n" + "\n".join(lines)
 
 
 def voxel_size_um_from_display_scale(display_scale_zyx):
@@ -342,9 +404,9 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
     stay human-facing.
     """
     voxel = list(voxel_size_um) if voxel_size_um else ["?", "?", "?"]
-    note = ("# 原图 (x,y,z) µm，由 display_scale_zyx 反序得到 -- 核对一下"
+    note = ("# source image (x,y,z) um, reversed from display_scale_zyx -- double-check it"
             if voxel_size_um else
-            "# 原图 (x,y,z) µm -- tif header 里没有，必须手填")
+            "# source image (x,y,z) um -- not in the tif header, fill it in by hand")
     lines = [
         "mask:",
         "  guide_regions:",
@@ -401,7 +463,7 @@ def _add_relabel_panel(viewer, paint_layer, on_change=None):
     from_spin.setValue(1)
     to_spin.setValue(2)
 
-    note = QLabel("选中已画的区域改 label")
+    note = QLabel("Change the label of an already-painted region")
     status = QLabel("")
     status.setWordWrap(True)
 
@@ -410,24 +472,24 @@ def _add_relabel_panel(viewer, paint_layer, on_change=None):
         paint_layer.n_edit_dimensions = 1
         paint_layer.selected_label = int(to_spin.value())
         paint_layer.mode = "fill"
-        status.setText(f"填充模式：点任意一块，它就变成 label {int(to_spin.value())}。"
-                       "（改完记得切回画笔模式再继续画）")
+        status.setText(f"Fill mode: click any blob and it becomes label {int(to_spin.value())}. "
+                       "(switch back to the paint brush before drawing again)")
 
     def relabel_all():
         src, dst = int(from_spin.value()), int(to_spin.value())
         if src == dst:
-            status.setText("from 和 to 一样，没什么可改的。")
+            status.setText("from and to are the same -- nothing to change.")
             return
         n = relabel_volume(paint_layer.data, src, dst)
         paint_layer.refresh()
         if on_change is not None:
             on_change(src, dst)
-        status.setText(f"label {src} -> {dst}：改了 {n} 个体素。"
-                       + ("" if n else "（那个 label 一个体素都没画过）"))
+        status.setText(f"label {src} -> {dst}: {n} voxels changed."
+                       + ("" if n else " (nothing was ever painted with that label)"))
 
-    fill_btn = QPushButton("点击填充改 label")
+    fill_btn = QPushButton("Click-to-fill one blob")
     fill_btn.clicked.connect(start_fill)
-    all_btn = QPushButton("整个 label 全改")
+    all_btn = QPushButton("Relabel the whole label")
     all_btn.clicked.connect(relabel_all)
 
     row = QWidget()
@@ -445,6 +507,78 @@ def _add_relabel_panel(viewer, paint_layer, on_change=None):
     layout.addWidget(all_btn)
     layout.addWidget(ontology_tree_ui.scrollable(status, 60))
     viewer.window.add_dock_widget(dock, area="right", name="Relabel")
+
+
+def _add_erase_panel(viewer, paint_layer):
+    """An "erase what the brush is clumsy at" panel: lasso a polygon and
+    everything inside it, on the plane you are looking at, is erased.
+
+    napari's own eraser is the brush painting label 0 -- fine for nudging an
+    edge, painful for taking out a whole wrong blob, which is exactly what a
+    keyframe drawn on the wrong plane or a region that bled into its
+    neighbour needs. napari 0.8's Labels layer already carries a POLYGON mode
+    (click the corners, double-click or Enter to close); pointing it at label
+    0 turns it into an eraser, which is all this panel wires up -- no new
+    editing path, so undo/redo and the keyframe bookkeeping are unchanged.
+
+    n_edit_dimensions is forced back to 2 on the way in, for two reasons:
+    polygon painting is 2D-only (Labels._get_polygon_mask_and_bbox raises
+    otherwise) and the Relabel panel's click-to-fill leaves it at 1, so
+    erasing after a fill would otherwise throw. 2 also means the erase stays
+    on the plane you can see -- every other plane is hand-drawn work that a
+    polygon dragged somewhere else must not touch.
+
+    It erases every label inside the polygon, not just the selected one:
+    that is what "eraser" means everywhere else in the tool, and the blob
+    you are rubbing out is often exactly the one that came out under the
+    wrong number. Set napari's own "preserve labels" if you need the other
+    behaviour.
+    """
+    # The label to come back to. Remembered rather than read on the way out,
+    # because by then selected_label is 0 (the eraser) and the number the
+    # user was painting with would be lost.
+    last_label = {"value": max(1, int(paint_layer.selected_label))}
+
+    status = QLabel("")
+    status.setWordWrap(True)
+
+    def start_polygon_erase():
+        if paint_layer.selected_label:
+            last_label["value"] = int(paint_layer.selected_label)
+        viewer.layers.selection = {paint_layer}   # modes belong to the active layer
+        paint_layer.n_edit_dimensions = 2
+        paint_layer.selected_label = 0            # 0 = background = erase
+        paint_layer.mode = "polygon"
+        status.setText(
+            "Polygon erase on this plane: left-click each corner, then double-click "
+            "(or press Enter) to close it -- everything inside is erased, whatever "
+            "label it had. Right-click drops the last corner, Esc drops the whole "
+            "polygon, Ctrl+Z undoes a finished erase.")
+
+    def back_to_brush():
+        viewer.layers.selection = {paint_layer}
+        # 2 = napari's default, i.e. the brush paints the plane on screen.
+        # Restored here because the Relabel panel's click-to-fill drops it to
+        # 1 and leaves it there.
+        paint_layer.n_edit_dimensions = 2
+        paint_layer.selected_label = last_label["value"]
+        paint_layer.mode = "paint"
+        status.setText(f"Back to the brush, painting label {last_label['value']}.")
+
+    polygon_btn = QPushButton("Polygon erase")
+    polygon_btn.clicked.connect(start_polygon_erase)
+    brush_btn = QPushButton("Back to brush")
+    brush_btn.clicked.connect(back_to_brush)
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(QLabel(
+        "Erase a mistake with a polygon instead of scrubbing it out with the\n"
+        f"eraser brush. The brush/eraser size slider goes up to {MAX_BRUSH_SIZE}."))
+    layout.addWidget(polygon_btn)
+    layout.addWidget(brush_btn)
+    layout.addWidget(ontology_tree_ui.scrollable(status, 80))
+    viewer.window.add_dock_widget(dock, area="right", name="Erase")
 
 
 # =====================================================================================
@@ -525,7 +659,8 @@ def interpolate_labels_separately(keyframes_by_label, full_shape, interpolate=No
     labels = sorted(keyframes_by_label)
     too_big = [lab for lab in labels if lab > MAX_LABEL or lab < 1]
     if too_big:
-        raise ValueError(f"label 必须在 1..{MAX_LABEL} 之间（导出是 uint8），得到 {too_big}")
+        raise ValueError(f"labels must be within 1..{MAX_LABEL} (the export is uint8), "
+                         f"got {too_big}")
 
     volume = np.zeros(full_shape, dtype=np.uint8)
     contested = None
@@ -717,7 +852,8 @@ def load_guide_resume(existing_path, expected_shape):
 
     arr = sitk.GetArrayFromImage(sitk.ReadImage(str(existing_path)))
     if arr.shape != expected_shape:
-        print(f"WARNING: 续画文件 shape {arr.shape} != 图像 shape {expected_shape}，不预填。")
+        print(f"WARNING: resume file shape {arr.shape} != image shape {expected_shape}, "
+              f"not pre-filling.")
         return None
 
     prefill = np.zeros(expected_shape, dtype=np.uint8)
@@ -748,7 +884,8 @@ def relabel_volume(volume, from_label, to_label):
     might actually want (two halves of one region drawn separately).
     """
     if not (0 <= to_label <= MAX_LABEL):
-        raise ValueError(f"to_label 必须在 0..{MAX_LABEL} 之间（导出是 uint8），得到 {to_label}")
+        raise ValueError(f"to_label must be within 0..{MAX_LABEL} (the export is uint8), "
+                         f"got {to_label}")
     hit = volume == from_label
     n = int(np.count_nonzero(hit))
     volume[hit] = to_label
@@ -824,14 +961,14 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     # "the first spin box" is not this panel's brush-label box.
     search = QLineEdit()
     search.setObjectName("ontology_search")
-    search.setPlaceholderText("按名字/缩写过滤脑区...")
-    hide_empty = QCheckBox("只显示这份 annotation 里有体素的脑区")
+    search.setPlaceholderText("Filter regions by name/acronym...")
+    hide_empty = QCheckBox("Only regions with voxels in this annotation")
     hide_empty.setObjectName("ontology_hide_empty")
     hide_empty.setChecked(True)
 
     tree = QTreeWidget()
     tree.setObjectName("ontology_tree")
-    tree.setHeaderLabels(["脑区", "体素", "id"])
+    tree.setHeaderLabels(["Region", "Voxels", "id"])
     tree.setColumnWidth(0, 260)
     # A floor, not a target: with the whole left side to itself (no other
     # dock sharing this column), the tree fills the rest of the window's
@@ -843,9 +980,9 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     label_spin = QSpinBox()
     label_spin.setObjectName("ontology_brush_label")
     label_spin.setRange(1, MAX_LABEL)
-    add_btn = QPushButton("加到 label")
+    add_btn = QPushButton("Assign to label")
     add_btn.setObjectName("ontology_assign")
-    remove_btn = QPushButton("从 label 移除")
+    remove_btn = QPushButton("Remove from label")
     remove_btn.setObjectName("ontology_unassign")
     # Both grow with use -- picker_status with the selected region's blurb,
     # assign_label with one line per assigned brush label -- so both go in
@@ -872,20 +1009,22 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
         info = atlas.structures[sid]
         voxels = atlas.node_voxels.get(sid, 0)
         if voxels:
-            picker_status.setText(f"{info['name']} [{sid}]，含后代 {voxels:,} 体素。")
+            picker_status.setText(
+                f"{info['name']} [{sid}]: {voxels:,} voxels including descendants.")
         else:
             picker_status.setText(
-                f"{info['name']} [{sid}] 在这份 annotation 里没有任何体素，不能分配 —— "
-                f"流水线遇到匹配不到的区域会直接报错。")
+                f"{info['name']} [{sid}] has no voxels in this annotation and cannot be "
+                f"assigned -- the pipeline errors out on a region it cannot match.")
 
     def on_add():
         sid = selected_id()
         if sid is None:
-            picker_status.setText("先在树里选一个脑区。")
+            picker_status.setText("Select a region in the tree first.")
             return
         if not atlas.node_voxels.get(sid):
             picker_status.setText(
-                f"{atlas.structures[sid]['name']} 在这份 annotation 里没有体素，拒绝分配。")
+                f"{atlas.structures[sid]['name']} has no voxels in this annotation -- "
+                f"refusing to assign it.")
             return
         label = label_spin.value()
         entries = assignment.setdefault(label, [])
@@ -915,8 +1054,9 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
 
     dock = QWidget()
     layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("图谱 ontology（选中即分配到下面的 brush label，不显示图谱本身"
-                            "——要看图谱请另开 atlas_view.py）"))
+    layout.addWidget(QLabel("Atlas ontology -- selecting a node assigns it to the brush label "
+                            "below. The atlas itself is not shown here; run atlas_view.py to "
+                            "look at it."))
     layout.addWidget(search)
     layout.addWidget(hide_empty)
     layout.addWidget(tree)
@@ -945,9 +1085,9 @@ def _run_guide(args):
     if resume is not None:
         prefill = resume.prefill
         planes = sum(len(p) for p in resume.slices_by_label.values())
-        print(f"[resume] 从 {resume.sidecar.name} 恢复了 {planes} 个手画层"
-              f"（{ {lab: p for lab, p in sorted(resume.slices_by_label.items())} }），"
-              f"插值出来的层已丢弃，继续画即可。")
+        print(f"[resume] restored {planes} hand-drawn planes from {resume.sidecar.name} "
+              f"({ {lab: p for lab, p in sorted(resume.slices_by_label.items())} }); "
+              f"the interpolated planes were dropped -- just keep painting.")
     elif args.existing_mask:
         # No sidecar: all this can do is binarize, which merges every region
         # into label 1 and treats interpolated planes as hand-drawn. Usable as
@@ -955,9 +1095,12 @@ def _run_guide(args):
         loaded = _load_mask_array(args.existing_mask, arr.shape)
         if loaded is not None:
             prefill = loaded
-            print(f"WARNING: {args.existing_mask} 旁边没有 .regions.json，无法按关键帧续画。"
-                  f"\n         已按二值预填：所有脑区被合并成 label 1，且插值出来的层会被当成"
-                  f"手画层。\n         只适合当描图底稿；要真正续画，请用带 sidecar 的导出结果。")
+            print(f"WARNING: no .regions.json next to {args.existing_mask}, so it cannot be "
+                  f"resumed as keyframes.\n"
+                  f"         Pre-filled binarized instead: every region is merged into label 1, "
+                  f"and interpolated planes count as hand-drawn.\n"
+                  f"         Good as a tracing backdrop only; to really resume, use an export "
+                  f"that still has its sidecar.")
 
     viewer, paint_layer = _launch_viewer(arr, prefill, scale=args.display_scale_zyx)
 
@@ -977,14 +1120,15 @@ def _run_guide(args):
         seed_ids = resume.region_ids if resume is not None else args.region_ids
         assignment, unresolved = _seed_assignment(seed_labels, seed_ids, atlas.structures)
         for label, name, n in unresolved:
-            print(f"WARNING: region_labels label {label} 的 {name!r} 在 ontology 里"
-                  f"{'匹配到多个' if n else '匹配不到'}结构（{n} 个），没有转成 id；"
-                  f"请在树里重新选一次。")
+            print(f"WARNING: region_labels label {label}: {name!r} matches "
+                  f"{'several' if n else 'no'} structures in the ontology ({n}), so it was not "
+                  f"resolved to an id; pick it again in the tree.")
         picker = _add_ontology_picker(viewer, atlas, paint_layer, assignment)
 
     guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask else ""
-    header = ("在左侧 ontology 树里选脑区 → 设 brush label → “加到 label”，然后就用那个\n"
-              "画笔号在样本上画。\n" if atlas else _region_legend(args.region_labels))
+    header = ("Pick a region in the ontology tree on the left, set a brush label, click\n"
+              "Assign to label, then paint the sample with that brush number.\n"
+              if atlas else _region_legend(args.region_labels))
     status_label = QLabel(
         header +
         "Paint a rough outline on a few planes per region (start, end, and\n"
@@ -1034,7 +1178,7 @@ def _run_guide(args):
                 f"{result.slices_by_label[label]} -> {result.voxels_by_label[label]} voxels")
         lines += [f"WARNING: {w}" for w in guide_export_warnings(result, region_labels)]
         if region_ids:
-            lines += ["", "把下面这段粘进流水线 config：", "",
+            lines += ["", "Paste this into the pipeline config:", "",
                       guide_regions_yaml_snippet(
                           region_ids, region_labels, args.output_path,
                           voxel_size_um=voxel_size_um_from_display_scale(args.display_scale_zyx))]
@@ -1059,6 +1203,7 @@ def _run_guide(args):
             picker.refresh_assignment()
 
     _add_relabel_panel(viewer, paint_layer, on_change=_assignment_follows_relabel)
+    _add_erase_panel(viewer, paint_layer)
 
 
 # =====================================================================================
@@ -1465,16 +1610,16 @@ def selftest_config_normalizers():
         else:
             raise AssertionError(f"{value!r} should have been rejected")
 
-    rejects(_normalize_region_labels, {"cortex": 1}, "整数")
+    rejects(_normalize_region_labels, {"cortex": 1}, "integers")
     rejects(_normalize_region_labels, {0: "background"}, ">= 1")
-    rejects(_normalize_region_labels, {1: "cortex", "1": "cortex"}, "两次")
-    rejects(_normalize_region_labels, ["cortex"], "映射")
+    rejects(_normalize_region_labels, {1: "cortex", "1": "cortex"}, "twice")
+    rejects(_normalize_region_labels, ["cortex"], "mapping")
 
     assert _normalize_display_scale([32.0, 2.6, 2.6]) == [32.0, 2.6, 2.6]
     assert _normalize_display_scale(None) is None
-    rejects(_normalize_display_scale, [2.6, 2.6], "3 个")
-    rejects(_normalize_display_scale, [32.0, 0.0, 2.6], "正数")
-    rejects(_normalize_display_scale, "32,2.6,2.6", "三个数")
+    rejects(_normalize_display_scale, [2.6, 2.6], "exactly 3 numbers")
+    rejects(_normalize_display_scale, [32.0, 0.0, 2.6], "positive")
+    rejects(_normalize_display_scale, "32,2.6,2.6", "three numbers")
 
     # uint8 export: a brush value the output can't hold must fail loudly.
     try:
@@ -1556,8 +1701,8 @@ def run_selftests():
     selftest_interpolator_matches_registration_ants()
     selftest_seed_assignment()
     print("=== all selftests passed ===")
-    print("(atlas_reference.py --selftest / atlas_view.py --selftest 覆盖图谱加载、"
-          "ontology 数学和正交视图几何部分)")
+    print("(atlas_reference.py --selftest / atlas_view.py --selftest cover atlas loading, "
+          "ontology maths and the ortho-view geometry)")
     return 0
 
 

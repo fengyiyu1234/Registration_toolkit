@@ -66,16 +66,16 @@ def atlas_reference_config(cfg):
     for required in ("annotation_path", "ontology_path"):
         if not paths[required]:
             key = "ontology_path" if required == "ontology_path" else f"atlas_{required}"
-            raise ValueError(f"图谱参考需要 {key}（配置里没写）")
+            raise ValueError(f"the atlas reference needs {key} (missing from the config)")
         if not Path(paths[required]).exists():
-            raise FileNotFoundError(f"图谱 {required} 不存在: {paths[required]}")
+            raise FileNotFoundError(f"atlas {required} does not exist: {paths[required]}")
     if paths["template_path"] and not Path(paths["template_path"]).exists():
-        raise FileNotFoundError(f"图谱 template_path 不存在: {paths['template_path']}")
+        raise FileNotFoundError(f"atlas template_path does not exist: {paths['template_path']}")
 
     downsample = cfg.get("atlas_downsample")
     downsample = 1 if downsample is None else int(downsample)
     if downsample < 1:
-        raise ValueError(f"atlas_downsample 必须 >= 1，得到 {downsample}")
+        raise ValueError(f"atlas_downsample must be >= 1, got {downsample}")
 
     return SimpleNamespace(
         template_path=paths["template_path"] or None,
@@ -300,7 +300,8 @@ def format_ancestry(structures, structure_id):
     """
     info = structures.get(structure_id)
     if info is None:
-        return f"id {structure_id}：不在 ontology 里（annotation 用了这个 label，但字典里查不到）"
+        return (f"id {structure_id}: not in the ontology (the annotation uses this label, "
+                "but no structure describes it)")
     lines = []
     for depth, sid in enumerate(info["structure_id_path"]):
         node = structures.get(sid)
@@ -331,14 +332,14 @@ def annotation_features(atlas):
         sid = int(sid)
         info = atlas.structures.get(sid)
         if sid == 0:
-            names.append("背景")
+            names.append("background")
         elif info is None:
-            names.append(f"ontology 里没有 id {sid}")
+            names.append(f"id {sid} is not in the ontology")
         else:
             acronym = info.get("acronym")
             names.append(f"{info['name']} ({acronym})" if acronym else info["name"])
         ids.append(sid)
-    return {"index": np.arange(len(atlas.present_ids)), "脑区": names, "id": ids}
+    return {"index": np.arange(len(atlas.present_ids)), "region": names, "id": ids}
 
 
 def visible_tree_ids(structures, node_voxels, text, hide_empty):
@@ -447,7 +448,7 @@ def selftest_compact_annotation():
 
 
 def selftest_annotation_features():
-    print("4. atlas 图层: compact 索引 -> 真实脑区名/id 的悬停表")
+    print("4. atlas layer: compact index -> real region name/id hover table")
     atlas = SimpleNamespace(
         present_ids=np.array([0, 5, 7, 999], dtype=np.int64),
         structures={5: {"name": "Cortex", "acronym": "CTX"}, 7: {"name": "Thalamus"}})
@@ -456,14 +457,14 @@ def selftest_annotation_features():
     # 'index' column, so this has to be the COMPACT index, not the real id.
     assert list(feats["index"]) == [0, 1, 2, 3], feats["index"]
     assert feats["id"] == [0, 5, 7, 999], feats["id"]
-    assert feats["脑区"][1] == "Cortex (CTX)", feats["脑区"]
-    assert feats["脑区"][2] == "Thalamus", feats["脑区"]
-    assert "999" in feats["脑区"][3], feats["脑区"]     # in the annotation, not in the ontology
+    assert feats["region"][1] == "Cortex (CTX)", feats["region"]
+    assert feats["region"][2] == "Thalamus", feats["region"]
+    assert "999" in feats["region"][3], feats["region"]  # in the annotation, not in the ontology
     print("   ok")
 
 
 def selftest_format_ancestry():
-    print("5. atlas 悬停: 显示的是整条祖先链，不是只有最细那一级")
+    print("5. atlas hover: shows the whole ancestor chain, not just the finest level")
     structures = {
         1: {"name": "root", "acronym": "root", "structure_id_path": [1]},
         2: {"name": "Cerebrum", "acronym": "CH", "structure_id_path": [1, 2]},
@@ -486,19 +487,20 @@ def selftest_format_ancestry():
     # A mid-level pick marks itself, not the deepest node it knows about.
     assert "▶ Cortex" in format_ancestry(structures, 5)
     # A label the annotation carries but the ontology never describes.
-    assert "不在 ontology" in format_ancestry(structures, 4242)
+    assert "not in the ontology" in format_ancestry(structures, 4242)
     print("   ok")
 
 
 def selftest_mask_centre_index():
-    print("6. atlas 跳转中心: C 形结构落在脑区里，不落在质心的空洞里")
+    print("6. atlas jump centre: a C-shaped structure lands inside the region, "
+          "not in the hollow at its centre of mass")
     # A C-shaped structure: the centre of MASS of this mask sits at z=2 in the
     # hollow, which is exactly the plane where nothing would be visible.
     mask = np.zeros((5, 9, 7), dtype=np.uint8)
     mask[0, 1:8, 1:6] = 1
     mask[4, 1:8, 1:6] = 1
     centre = mask_centre_index(mask)
-    assert mask[centre] == 1, (centre, "跳转落在了脑区外面")
+    assert mask[centre] == 1, (centre, "jump landed outside the region")
     assert centre == (4, 4, 3), centre
 
     solid = np.zeros((5, 9, 7), dtype=np.uint8)

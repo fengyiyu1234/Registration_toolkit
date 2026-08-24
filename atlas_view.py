@@ -25,7 +25,7 @@ then just run the file -- no command-line arguments.
 
     conda activate antsreg
     python atlas_view.py
-    python atlas_view.py configs/atlas_view.devccf.yaml   # 或指定另一份配置
+    python atlas_view.py configs/atlas_view.devccf.yaml   # or point at another config
 
 The geometry/crosshair logic is separately runnable with no display and no
 config, on purely synthetic data:
@@ -93,9 +93,9 @@ def _load_local_config(cli_path=None):
 # dims.order, so each entry names the axis kept on the slider, i.e. the axis
 # the plane is perpendicular to.
 _ORTHO_PANES = (
-    ((0, 1, 2), "轴0 切面"),
-    ((1, 0, 2), "轴1 切面"),
-    ((2, 0, 1), "轴2 切面"),
+    ((0, 1, 2), "Axis 0 slice"),
+    ((1, 0, 2), "Axis 1 slice"),
+    ((2, 0, 1), "Axis 2 slice"),
 )
 
 # Layer attributes mirrored from the main pane onto the ortho panes. Only the
@@ -144,22 +144,22 @@ def _add_atlas_layers(model, atlas, scale_kwargs, features):
     """
     template = None
     if atlas.template is not None:
-        template = model.add_image(atlas.template, name="reference（模板灰度）",
+        template = model.add_image(atlas.template, name="reference (template grayscale)",
                                    colormap="gray", **scale_kwargs)
     # atlas.compact itself, not a copy: 190-odd labels over an 800^3 grid is
     # the biggest array in the process, and the layer is read-only anyway.
-    annotation = model.add_labels(atlas.compact, name="annotation（全部脑区）",
+    annotation = model.add_labels(atlas.compact, name="annotation (all regions)",
                                   opacity=0.45, features=features, **scale_kwargs)
     annotation.editable = False
     highlight = model.add_labels(np.zeros(atlas.compact.shape, dtype=np.uint8),
-                                 name="selection（选中的脑区）", opacity=0.85,
+                                 name="selection (selected regions)", opacity=0.85,
                                  colormap=napari.utils.DirectLabelColormap(
                                      color_dict={None: "transparent", 1: "red"}),
                                  **scale_kwargs)
     highlight.editable = False              # a reference; painting here would mean nothing
     centre = tuple(dim // 2 for dim in atlas.compact.shape)
     cross = model.add_vectors(crosshair_vectors(centre, atlas.compact.shape),
-                              name="十字准线", edge_color="cyan", edge_width=1.5,
+                              name="crosshair", edge_color="cyan", edge_width=1.5,
                               vector_style="line", opacity=0.9, **scale_kwargs)
     return SimpleNamespace(template=template, annotation=annotation,
                            highlight=highlight, cross=cross)
@@ -241,7 +241,7 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
             # user can then drag to whatever they actually want.
             pane.qt.setMinimumSize(160, 120)
             splitter.addWidget(wrapper)
-        dock = viewer.window.add_dock_widget(splitter, area="bottom", name="正交视图（同步）")
+        dock = viewer.window.add_dock_widget(splitter, area="bottom", name="Ortho views (synced)")
         viewer.window._qt_window.resizeDocks([dock], [_ORTHO_DOCK_HEIGHT], Qt.Vertical)
         _sync_ortho_panes(built)
         _mirror_layer_attrs(built)
@@ -398,7 +398,7 @@ def _add_ancestry_panel(viewer, atlas, panes):
     synthesising Qt mouse events: `show` takes a compact index and is the whole
     of what the mouse callbacks do.
     """
-    label = QLabel("把鼠标放到图谱上，这里显示该体素所在脑区的完整层级。")
+    label = QLabel("Hover over the atlas to see the full region hierarchy of that voxel.")
     label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     label.setWordWrap(False)
 
@@ -414,12 +414,12 @@ def _add_ancestry_panel(viewer, atlas, panes):
             return
         last["index"] = compact_index
         if compact_index == 0:
-            label.setText("（背景，没有脑区）")
+            label.setText("(background -- no region)")
             return
         sid = int(atlas.present_ids[compact_index])
         voxels = atlas.node_voxels.get(sid, 0)
         label.setText(atlas_reference.format_ancestry(atlas.structures, sid)
-                      + f"\n\n该结构（含后代）共 {voxels:,} 体素")
+                      + f"\n\nThis structure (with descendants) covers {voxels:,} voxels")
 
     def watcher(pane):
         def on_move(_model, event):
@@ -441,9 +441,10 @@ def _add_ancestry_panel(viewer, atlas, panes):
 
     dock = QWidget()
     layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("鼠标所在脑区的完整层级（▶ 是 annotation 实际存的那一级）"))
+    layout.addWidget(QLabel("Full hierarchy of the region under the cursor "
+                            "(▶ = the level the annotation actually stores)"))
     layout.addWidget(ontology_tree_ui.scrollable(label, 220))
-    viewer.window.add_dock_widget(dock, area="right", name="脑区层级")
+    viewer.window.add_dock_widget(dock, area="right", name="Region hierarchy")
     return SimpleNamespace(label=label, show=show)
 
 
@@ -471,12 +472,12 @@ def _add_region_panel(viewer, atlas, win):
     side gets the window's full height instead.
     """
     search = QLineEdit()
-    search.setPlaceholderText("按名字/缩写过滤脑区...")
-    hide_empty = QCheckBox("只显示这份 annotation 里有体素的脑区")
+    search.setPlaceholderText("Filter regions by name/acronym...")
+    hide_empty = QCheckBox("Only regions with voxels in this annotation")
     hide_empty.setChecked(True)
 
     tree = QTreeWidget()
-    tree.setHeaderLabels(["脑区", "体素", "id"])
+    tree.setHeaderLabels(["Region", "Voxels", "id"])
     # Ctrl/Shift-click (or a drag) adds to the selection instead of replacing
     # it -- the default SingleSelection would make multi-region highlighting
     # impossible no matter what on_select() does with it.
@@ -494,7 +495,7 @@ def _add_region_panel(viewer, atlas, win):
     tree.resizeColumnToContents(0)
 
     status = QLabel()
-    jump_btn = QPushButton("跳到选中脑区中心（三视角同步）")
+    jump_btn = QPushButton("Jump to selection centre (all three views)")
 
     def selected_ids():
         return [item.data(0, Qt.UserRole) for item in tree.selectedItems()]
@@ -524,14 +525,15 @@ def _add_region_panel(viewer, atlas, win):
         if len(sids) == 1:
             sid, info = sids[0], atlas.structures[sids[0]]
             voxels = atlas.node_voxels.get(sid, 0)
-            status.setText(f"{info['name']} [{sid}]，含后代 {voxels:,} 体素。" if voxels else
-                           f"{info['name']} [{sid}] 在这份 annotation 里没有任何体素。")
+            status.setText(f"{info['name']} [{sid}]: {voxels:,} voxels including descendants."
+                           if voxels else
+                           f"{info['name']} [{sid}] has no voxels in this annotation.")
             layer_name = f"selection: {info['name']}"
         else:
-            shown = "、".join(names[:5]) + ("等" if len(names) > 5 else "")
-            status.setText(f"已选 {len(sids)} 个脑区（{shown}），并集共高亮 {total_voxels:,} 体素"
-                           "（重叠部分只算一次）。")
-            layer_name = f"selection: {len(sids)} 个脑区"
+            shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+            status.setText(f"{len(sids)} regions selected ({shown}); their union highlights "
+                           f"{total_voxels:,} voxels (overlap counted once).")
+            layer_name = f"selection: {len(sids)} regions"
         win.set_highlight(combined, name=layer_name)
 
     def on_jump():
@@ -548,21 +550,22 @@ def _add_region_panel(viewer, atlas, win):
 
     dock = QWidget()
     layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("图谱 ontology（选中即在三个视角同时高亮，含全部后代；"
-                            "Ctrl/Shift 多选可同时高亮多个脑区）"))
+    layout.addWidget(QLabel("Atlas ontology -- selecting a node highlights it and every "
+                            "descendant in all three views; Ctrl/Shift-click to highlight "
+                            "several regions at once."))
     layout.addWidget(search)
     layout.addWidget(hide_empty)
     layout.addWidget(tree)
     layout.addWidget(ontology_tree_ui.scrollable(status, 56))
     layout.addWidget(jump_btn)
-    viewer.window.add_dock_widget(dock, area="left", name="脑区选择")
+    viewer.window.add_dock_widget(dock, area="left", name="Region selection")
 
     refresh_filter()
 
 
 def _run_view(atlas_cfg):
     _import_gui()
-    print("[atlas] 加载图谱参考...")
+    print("[atlas] loading atlas reference...")
     atlas = atlas_reference.load_atlas_reference(atlas_cfg, include_template=True)
     win = _open_atlas_window(atlas, atlas_cfg.resolution_um, ortho=atlas_cfg.ortho)
     _add_region_panel(win.viewer, atlas, win)
@@ -572,7 +575,7 @@ def _run_view(atlas_cfg):
 # selftests -- synthetic arrays only, no GUI, no config, no atlas files on disk
 # =====================================================================================
 def selftest_ortho_panes_geometry():
-    print("1. atlas 三视角: 每个轴各被切一次，跳转中心落在脑区里")
+    print("1. atlas ortho panes: every axis is sliced exactly once")
     # Every axis is the slider axis in exactly one pane, and is drawn in the
     # other two -- i.e. the three panes really are the three orthogonal views
     # and not two copies of one.
@@ -586,7 +589,7 @@ def selftest_ortho_panes_geometry():
 
 
 def selftest_crosshair_vectors():
-    print("2. atlas 十字准线: 每个面正好画到两条线，且交点就是当前切片位置")
+    print("2. atlas crosshair: exactly two lines per pane, crossing at the current slice")
     shape = (6, 8, 10)
     vectors = crosshair_vectors((4, 5, 7), shape)
     assert vectors.shape == (3, 2, 3), vectors.shape
@@ -611,7 +614,7 @@ def run_selftests():
     selftest_ortho_panes_geometry()
     selftest_crosshair_vectors()
     print("=== all selftests passed ===")
-    print("(atlas_reference.py --selftest 覆盖图谱加载/ontology 数学部分)")
+    print("(atlas_reference.py --selftest covers atlas loading / ontology maths)")
     return 0
 
 

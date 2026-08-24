@@ -14,7 +14,7 @@ import html
 
 from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame,
                              QCheckBox, QLineEdit, QPushButton, QDoubleSpinBox, QScrollArea,
-                             QFileDialog, QMessageBox)
+                             QFileDialog, QMessageBox, QSizePolicy)
 from PyQt5.QtCore import Qt
 
 import _local_config  # sibling module
@@ -211,7 +211,7 @@ class OntologyManager:
         """
         path = self.get_path(region_id, key=key)
         if not path:
-            return "<i style='color:#a66;'>该 ID 不在 ontology 中</i>"
+            return "<i style='color:#a66;'>This ID is not in the ontology</i>"
         lines = []
         for i, (name, acr) in enumerate(path):
             text = html.escape(f"{acr} — {name}" if acr else name)
@@ -274,8 +274,9 @@ class DataLoader:
         if np.issubdtype(np.dtype(dtype), np.unsignedinteger) and np.issubdtype(arr.dtype, np.signedinteger):
             n_neg = int((arr < 0).sum())
             if n_neg:
-                print(f"⚠️ 标签图有 {n_neg} 个负值体素（{os.path.basename(path)} 是 "
-                      f"{arr.dtype}，大 id 在写文件时已溢出），按背景处理。")
+                print(f"⚠️ Label volume has {n_neg} negative voxels "
+                      f"({os.path.basename(path)} is {arr.dtype}, so large ids overflowed "
+                      f"when it was written); treating them as background.")
                 arr = np.where(arr < 0, 0, arr)
         return arr.astype(dtype)
 
@@ -296,7 +297,7 @@ class DataLoader:
         size_gb = os.path.getsize(path) / 2**30
         try:
             arr = tifffile.memmap(path, mode='r')
-            print(f"   ↳ memmap 打开 ({size_gb:.1f} GB, shape={arr.shape})，按需读取")
+            print(f"   ↳ opened as a memmap ({size_gb:.1f} GB, shape={arr.shape}), read on demand")
             return arr
         except Exception:
             pass  # 压缩或分块不连续的 tiff memmap 不了，走 zarr
@@ -304,10 +305,11 @@ class DataLoader:
             import dask.array as da
             store = tifffile.imread(path, aszarr=True)
             arr = da.from_zarr(store)
-            print(f"   ↳ zarr/dask 打开 ({size_gb:.1f} GB, shape={arr.shape})，按需解码")
+            print(f"   ↳ opened via zarr/dask ({size_gb:.1f} GB, shape={arr.shape}), decoded on demand")
             return arr
         except Exception as e:
-            print(f"   ↳ 懒加载不可用 ({type(e).__name__}: {e})，整卷读入内存 ({size_gb:.1f} GB)")
+            print(f"   ↳ no lazy path available ({type(e).__name__}: {e}), reading the whole "
+                  f"volume into memory ({size_gb:.1f} GB)")
             return tifffile.imread(path)
 
     @staticmethod
@@ -327,7 +329,7 @@ class DataLoader:
             reader.ReadImageInformation()
             return tuple(reversed(reader.GetSize()))
         except Exception as e:
-            print(f"⚠️ 读取形状失败 ({type(e).__name__}: {e}): {path}")
+            print(f"⚠️ Could not read the shape ({type(e).__name__}: {e}): {path}")
             return None
 
     @staticmethod
@@ -417,7 +419,7 @@ class DataLoader:
                     if m:  # 同一目录可能跑过多次，取最后一次
                         info = m
         except Exception as e:
-            print(f"⚠️ 解析 log.txt 里的裁剪信息失败 ({type(e).__name__}: {e})")
+            print(f"⚠️ Could not parse the crop info in log.txt ({type(e).__name__}: {e})")
             return None
         if info is None:
             return None
@@ -447,15 +449,15 @@ class DataLoader:
             return arr
         if any(o < 0 for o in offset) or any(
                 o + s > f for o, s, f in zip(offset, arr.shape, full_shape)):
-            print(f"⚠️ {what} 形状 {tuple(arr.shape)} + 偏移 {tuple(offset)} 超出全图网格 "
-                  f"{tuple(full_shape)}，放弃对齐。")
+            print(f"⚠️ {what}: shape {tuple(arr.shape)} + offset {tuple(offset)} runs past "
+                  f"the full grid {tuple(full_shape)}; giving up on aligning it.")
             return None
         out = np.zeros(tuple(full_shape), dtype=arr.dtype)
         out[offset[0]:offset[0] + arr.shape[0],
             offset[1]:offset[1] + arr.shape[1],
             offset[2]:offset[2] + arr.shape[2]] = arr
-        print(f"   ↳ {what} 从裁剪网格 {tuple(arr.shape)} 补回全图网格 "
-              f"{tuple(full_shape)}，偏移 (z,y,x)={tuple(offset)}")
+        print(f"   ↳ {what}: padded from the cropped grid {tuple(arr.shape)} back onto the "
+              f"full grid {tuple(full_shape)}, offset (z,y,x)={tuple(offset)}")
         return out
 
     @staticmethod
@@ -528,9 +530,9 @@ class DataLoader:
                             df_clean['score'] = np.nan
 
                         all_dfs.append(df_clean)
-                        print(f"✅ 成功加载 {len(df_clean)} 个 '{class_name}' 细胞。")
+                        print(f"✅ Loaded {len(df_clean)} '{class_name}' cells.")
                 except Exception as e:
-                    print(f"❌ 解析 '{class_name}' 坐标出错: {e}")
+                    print(f"❌ Failed to parse '{class_name}' coordinates: {e}")
 
         if not all_dfs:
             return pd.DataFrame()
@@ -540,8 +542,8 @@ class DataLoader:
         # 先定编号空间（拿名字列对答案），再据此补 region / label_id 两列。
         sample = df.sample(min(len(df), 5000), random_state=0)
         key = ontology.detect_cell_value_key(sample['mapped_id'].values, sample['csv_region'].values)
-        print(f"🔢 细胞表第 9 列编号空间判定为 '{key}'"
-              f"（{'ClearMap' if key == 'graph_order' else 'ANTs / 原始 id'} 风格）。")
+        print(f"🔢 Column 9 of the cell table reads as the '{key}' numbering space "
+              f"({'ClearMap' if key == 'graph_order' else 'ANTs / raw atlas id'} style).")
 
         # 名字优先用文件里那一列；空的（老文件没写 name）才按编号查字典。
         fallback = df['csv_region'].eq('')
@@ -753,9 +755,10 @@ class MainController:
         if not hires:
             return resampled_path
         if not os.path.exists(hires):
-            print(f"⚠️ native_image_path 不存在，退回降采样图: {hires}")
+            print(f"⚠️ native_image_path does not exist, falling back to the downsampled "
+                  f"image: {hires}")
             return resampled_path
-        print(f"🔍 使用原始分辨率图像: {hires}")
+        print(f"🔍 Using the full-resolution image: {hires}")
         return hires
 
     def _native_image_placement(self, img_shape, ref_shape):
@@ -782,15 +785,18 @@ class MainController:
         if override:
             scale = tuple(float(s) for s in override)
         elif ref_shape is None:
-            print("⚠️ 找不到降采样网格 (resampled.tif / *_fine_*um.nii.gz / 标签图)，"
-                  "无法把原始分辨率图对齐到细胞坐标系。\n"
-                  "   请改用降采样图，或在 config 里显式写 native_image_scale。")
+            print("⚠️ No downsampled grid found (resampled.tif / *_fine_*um.nii.gz / label "
+                  "volume), so the full-resolution image cannot be aligned to the cell "
+                  "coordinate system.\n"
+                  "   Use the downsampled image instead, or set native_image_scale "
+                  "explicitly in the config.")
             return False, None
         elif tuple(img_shape) == tuple(ref_shape):
             return True, None
         else:
             scale = tuple(r / i for r, i in zip(ref_shape, img_shape))
-        print(f"   ↳ 对齐到降采样网格 {tuple(ref_shape) if ref_shape else '(scale 来自 config)'}: "
+        print(f"   ↳ aligned to the downsampled grid "
+              f"{tuple(ref_shape) if ref_shape else '(scale from the config)'}: "
               f"scale={tuple(round(s, 4) for s in scale)}")
         return True, scale
 
@@ -812,13 +818,15 @@ class MainController:
             info = DataLoader.clearmap_crop_info(self.target_dir)
             offset = info['offset'] if info else None
         if offset is None:
-            print(f"⚠️ {what} 形状 {tuple(vol_shape)} 和样本网格 {tuple(grid_shape)} 不一致，"
-                  "且无法确定裁剪偏移 ——\n"
-                  "   ClearMap 开了 registration.crop_for_registration 时会这样。偏移写在该目录 "
-                  "log.txt 的\n   \"Cropped resampled image: ... offset=[...]\" 一行；日志不在了就在 "
-                  "config 里手写\n   labels_crop_offset: [z, y, x]（注意是 napari 轴序，"
-                  "和 log.txt 里的 [x,y,z] 相反）。\n"
-                  "   现在跳过这一层，不做对齐。")
+            print(f"⚠️ {what}: shape {tuple(vol_shape)} does not match the sample grid "
+                  f"{tuple(grid_shape)}, and the crop offset cannot be determined --\n"
+                  "   this is what ClearMap's registration.crop_for_registration looks like. "
+                  "The offset is in that\n   directory's log.txt, on the "
+                  "\"Cropped resampled image: ... offset=[...]\" line; if the log is gone, "
+                  "write\n   labels_crop_offset: [z, y, x] in the config by hand "
+                  "(napari axis order, i.e. the reverse\n   of the [x,y,z] in "
+                  "log.txt).\n"
+                  "   Skipping this layer for now, with no alignment.")
             return None
         return offset
 
@@ -835,7 +843,7 @@ class MainController:
         paths = DataLoader.resolve_native_paths(self.target_dir)
         resampled_path, mhd_path = paths['img'], paths['labels']
         if paths['pipeline']:
-            print(f"   ↳ 识别为 {paths['pipeline']} 产出")
+            print(f"   ↳ recognised as {paths['pipeline']} output")
         cell_reg_dir = os.path.join(self.target_dir, 'cell_registration')
 
         img_path = self._resolve_native_image_path(resampled_path)
@@ -844,7 +852,7 @@ class MainController:
             if img.ndim > 3:
                 img = np.squeeze(img)  # ImageJ 超栈常带 (Z,1,Y,X) 这种单元素轴
             if img.ndim != 3:
-                print(f"⚠️ 图像不是 3D (shape={img.shape})，跳过：{img_path}")
+                print(f"⚠️ Image is not 3D (shape={img.shape}), skipping: {img_path}")
                 img = None
         mhd = DataLoader.load_volume(mhd_path, dtype=np.uint32)
         # 使用 cell_registration.csv 中已经算好的 resample 空间坐标 (第4-6列, 0-indexed 3:6)
@@ -861,16 +869,17 @@ class MainController:
             info = DataLoader.clearmap_crop_info(self.target_dir)
             if info:
                 grid_shape = info['full_shape']
-                print(f"   ↳ 降采样图不在，从 log.txt 取全图网格 {grid_shape}")
+                print(f"   ↳ downsampled image is gone; took the full grid {grid_shape} from log.txt")
         if grid_shape is None and mhd is not None and not paths['cropped']:
             grid_shape = mhd.shape
         if grid_shape is None and mhd is not None:
-            print("⚠️ 拿不到未裁剪的样本网格形状，无法确认标签图和细胞点是否在同一网格上，"
-                  "标签图按原样显示。")
+            print("⚠️ Cannot get the uncropped sample grid shape, so there is no way to "
+                  "confirm the label volume and the cell points share one grid; showing the "
+                  "label volume as-is.")
 
         if mhd is not None and grid_shape is not None:
-            offset = self._native_grid_offset(mhd.shape, grid_shape, "样本空间标签图")
-            mhd = (DataLoader.pad_to_grid(mhd, offset, grid_shape, "样本空间标签图")
+            offset = self._native_grid_offset(mhd.shape, grid_shape, "sample-space labels")
+            mhd = (DataLoader.pad_to_grid(mhd, offset, grid_shape, "sample-space labels")
                    if offset is not None else None)
 
         scale = None
@@ -907,12 +916,15 @@ class MainController:
                 # 3D 纹理每轴上限一般是 2048（本机 llvmpipe 实测就是 2048），原图
                 # y/x 都超了，napari 会整卷读进内存再抽稀到上限以内 —— 既看不到全
                 # 分辨率，又把懒加载的好处清零。3D 看整体形状请用降采样图。
-                print(f"   ↳ 高分辨率图只适合 2D 逐层看：整卷 {img.shape} 有轴超过 3D 纹理上限 "
-                      "(通常 2048)，切 ndisplay=3 会被 napari 抽稀，还要先整卷读进内存。")
+                print(f"   ↳ the full-resolution image is for 2D plane-by-plane viewing only: "
+                      f"{img.shape} has an axis past the 3D texture limit (usually 2048), so "
+                      "ndisplay=3 makes napari downsample it -- after reading the whole volume "
+                      "into memory.")
         elif img_path:
-            print(f"⚠️ 未显示样本图像：{img_path}")
+            print(f"⚠️ Sample image not displayed: {img_path}")
         else:
-            print(f"⚠️ 找不到样本图像 (resampled.tif 或 *_fine_*um.nii.gz)，目录: {self.target_dir}")
+            print(f"⚠️ No sample image found (resampled.tif or *_fine_*um.nii.gz) in: "
+                  f"{self.target_dir}")
 
         labels_layer = None
         if mhd is not None:
@@ -924,13 +936,14 @@ class MainController:
             labels_layer.contour = 1
             self.setup_highlight_layers(mhd.shape)
         else:
-            print("⚠️ 找不到（或无法对齐）样本空间标签图 "
-                  "(ClearMap: volume/result.mhd / ANTs: *_labels_in_sample.nii.gz)：\n"
-                  "   hover 查脑区和图谱轮廓这两项不可用。细胞的脑区归属写在 "
-                  "cell_registration.csv 里，\n   不依赖标签图，所以细胞点、脑区搜索、"
-                  "按脑区筛选仍然照常可用。\n"
-                  "   ClearMap 的这个文件由 cellMap.py 的 transform_annotation_volume() 生成，"
-                  "缺了就重跑它补上。")
+            print("⚠️ No sample-space label volume found (or it could not be aligned) "
+                  "(ClearMap: volume/result.mhd / ANTs: *_labels_in_sample.nii.gz):\n"
+                  "   hover-for-region and the atlas outlines are unavailable. Each cell's "
+                  "region is written in\n   cell_registration.csv and does not "
+                  "depend on this volume, so the cell points, the region search\n"
+                  "   and filtering by region all still work.\n"
+                  "   ClearMap writes this file from cellMap.py's transform_annotation_volume(); "
+                  "re-run that to get it back.")
             self.setup_highlight_layers(None)
 
         self.current_cells_df = df_cells
@@ -977,7 +990,7 @@ class MainController:
             self.setup_highlight_layers(self.current_atlas_labels.shape)
         else:
             # 图谱标签图缺失也要能看细胞（细胞的 atlas 空间坐标和脑区名都在 csv 里）。
-            print(f"⚠️ 找不到标准图谱标签文件，只显示细胞点: {atlas_path}")
+            print(f"⚠️ No reference atlas label file found, showing the cell points only: {atlas_path}")
             self.setup_highlight_layers(None)
 
         self.current_cells_df = df_cells
@@ -1055,7 +1068,8 @@ class MainController:
 
     def pin_last_clicked_cell(self):
         if not self.last_clicked_cell:
-            QMessageBox.information(None, "Info", "还没有点击过任何细胞。请先在视图中点击一个细胞点，再点 Pin。")
+            QMessageBox.information(None, "Info", "No cell clicked yet. Click a cell point in "
+                                    "the viewer first, then press Pin.")
             return
         entry = dict(self.last_clicked_cell)
         entry['pinned_at'] = pd.Timestamp.now().isoformat(timespec='seconds')
@@ -1063,28 +1077,31 @@ class MainController:
         if self.flag_layer is not None:
             pt = np.array([[entry['z'], entry['y'], entry['x']]])
             self.flag_layer.data = np.vstack([self.flag_layer.data, pt]) if len(self.flag_layer.data) else pt
-        self.lbl_flag_count.setText(f"🚩 已标记 {len(self.flagged_cells)} 个细胞")
+        self.lbl_flag_count.setText(f"🚩 {len(self.flagged_cells)} cells flagged")
 
     def export_flagged_cells(self):
         if not self.flagged_cells:
-            QMessageBox.information(None, "Info", "还没有标记任何细胞。")
+            QMessageBox.information(None, "Info", "No cells flagged yet.")
             return
         path, _ = QFileDialog.getSaveFileName(None, "Export Flagged Cells", "flagged_cells.csv", "CSV Files (*.csv)")
         if not path: return
         cols = ['sample', 'mode', 'class_name', 'region', 'tile_name', 'slice_name',
                 'raw_x', 'raw_y', 'raw_z', 'z', 'y', 'x', 'score', 'pinned_at']
         pd.DataFrame(self.flagged_cells)[cols].to_csv(path, index=False)
-        QMessageBox.information(None, "Exported", f"已导出 {len(self.flagged_cells)} 个标记细胞 → {path}")
+        QMessageBox.information(None, "Exported",
+                                f"Exported {len(self.flagged_cells)} flagged cells -> {path}")
 
     def clear_flagged_cells(self):
         if not self.flagged_cells: return
-        reply = QMessageBox.question(None, "Confirm", f"确定清空全部 {len(self.flagged_cells)} 个标记吗？此操作不可撤销。",
-                                      QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(None, "Confirm",
+                                     f"Clear all {len(self.flagged_cells)} flags? "
+                                     f"This cannot be undone.",
+                                     QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes: return
         self.flagged_cells = []
         if self.flag_layer is not None:
             self.flag_layer.data = np.empty((0, 3))
-        self.lbl_flag_count.setText("🚩 已标记 0 个细胞")
+        self.lbl_flag_count.setText("🚩 0 cells flagged")
 
     def export_highlighted_cells(self):
         """Bulk export every cell currently matched by Search Regions --
@@ -1092,7 +1109,8 @@ class MainController:
         tiles/slices pulled, not just one outlier cell."""
         df = self.last_highlighted_df
         if df is None or df.empty:
-            QMessageBox.information(None, "Info", "当前没有高亮的细胞可导出。请先用 Search Regions 搜索一个脑区。")
+            QMessageBox.information(None, "Info", "No highlighted cells to export. Search for "
+                                    "a region with Search Regions first.")
             return
         path, _ = QFileDialog.getSaveFileName(None, "Export Highlighted Cells", "highlighted_cells.csv", "CSV Files (*.csv)")
         if not path: return
@@ -1102,7 +1120,7 @@ class MainController:
                 'raw_x', 'raw_y', 'raw_z', 'z', 'y', 'x', 'score']
         cols = [c for c in cols if c in export_df.columns]
         export_df[cols].to_csv(path, index=False)
-        QMessageBox.information(None, "Exported", f"已导出 {len(export_df)} 个细胞 → {path}")
+        QMessageBox.information(None, "Exported", f"Exported {len(export_df)} cells -> {path}")
 
     def setup_callbacks(self):
         @self.viewer.mouse_move_callbacks.append
@@ -1128,7 +1146,7 @@ class MainController:
                             rid, ambiguous = self.ontology.resolve_label_value(val)
                             id_txt = f"ID {val}"
                             if rid is not None and rid != int(val):
-                                id_txt += f" → {rid}{' (多解，取首个)' if ambiguous else ''}"
+                                id_txt += f" -> {rid}{' (ambiguous, first match)' if ambiguous else ''}"
                             # 面板里把整条链从根列到自身（自身加粗），不用鼠标旁边的浮窗，
                             # 免得挡住画面。
                             self.lbl_hover.setText(
@@ -1174,7 +1192,7 @@ class MainController:
 
         # 叠加 = 图谱轮廓压在（高分辨率的）原图上，一眼看出边界偏没偏；
         # 并排 = 每个图层各占一格、相机联动，适合对着看整体形状。
-        self.cb_grid = QCheckBox("Grid 并排 (取消勾选 = 叠加对比)")
+        self.cb_grid = QCheckBox("Grid side-by-side (unchecked = overlay)")
         self.cb_grid.setChecked(not CONFIG.get('native_image_path'))
         self.cb_grid.stateChanged.connect(
             lambda state: setattr(self.viewer.grid, 'enabled', state == Qt.Checked))
@@ -1190,45 +1208,10 @@ class MainController:
         h_size.addWidget(self.spin_point_size)
         layout.addLayout(h_size)
 
-        layout.addSpacing(5); line1 = QFrame(); line1.setFrameShape(QFrame.HLine); layout.addWidget(line1); layout.addSpacing(5)
-
-        layout.addWidget(QLabel("<b>🔍 Search Regions:</b>"))
-        self.input_search = QLineEdit(); self.input_search.setPlaceholderText("Region name...")
-        self.input_search.returnPressed.connect(lambda: self.perform_search())
-        layout.addWidget(self.input_search)
-        
-        h_search_btns = QHBoxLayout()
-        btn_fuzzy = QPushButton("Fuzzy Search")
-        btn_exact = QPushButton("Exact Search")
-        btn_fuzzy.clicked.connect(lambda: self.perform_search("Fuzzy"))
-        btn_exact.clicked.connect(lambda: self.perform_search("Exact"))
-        h_search_btns.addWidget(btn_fuzzy)
-        h_search_btns.addWidget(btn_exact)
-        layout.addLayout(h_search_btns)
-
-        btn_export_highlight = QPushButton("📤 Export Highlighted Cells (tile/slice)")
-        btn_export_highlight.clicked.connect(self.export_highlighted_cells)
-        layout.addWidget(btn_export_highlight)
-
-        self.lbl_hover = QLabel("📍 Hover: None")
-        self.lbl_hover.setStyleSheet("color: #999; font-size: 11px;")
-        self.lbl_hover.setWordWrap(True)
-        self.lbl_hover.setTextFormat(Qt.RichText)
-        self.lbl_hover.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.lbl_hover.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        # DevCCF 最深有十几级，全列出来会很高：固定高度 + 滚动，
-        # 这样鼠标一动整个面板不会跟着抖。
-        hover_scroll = QScrollArea()
-        hover_scroll.setWidgetResizable(True)
-        hover_scroll.setFrameShape(QFrame.NoFrame)
-        hover_scroll.setFixedHeight(180)
-        hover_scroll.setWidget(self.lbl_hover)
-        layout.addWidget(hover_scroll)
-
         layout.addSpacing(5); line_flag = QFrame(); line_flag.setFrameShape(QFrame.HLine); layout.addWidget(line_flag); layout.addSpacing(5)
 
         layout.addWidget(QLabel("<b>🚩 Flag Suspicious Cell:</b> click a cell point, then Pin"))
-        self.lbl_last_click = QLabel("尚未点击任何细胞")
+        self.lbl_last_click = QLabel("No cell clicked yet")
         self.lbl_last_click.setStyleSheet("color: #888; font-size: 11px;")
         self.lbl_last_click.setWordWrap(True)
         layout.addWidget(self.lbl_last_click)
@@ -1241,7 +1224,7 @@ class MainController:
         h_flag_btns.addWidget(btn_pin); h_flag_btns.addWidget(btn_export_flags); h_flag_btns.addWidget(btn_clear_flags)
         layout.addLayout(h_flag_btns)
 
-        self.lbl_flag_count = QLabel("🚩 已标记 0 个细胞")
+        self.lbl_flag_count = QLabel("🚩 0 cells flagged")
         self.lbl_flag_count.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self.lbl_flag_count)
 
@@ -1267,6 +1250,66 @@ class MainController:
         
         layout.addWidget(scroll)
         self.viewer.window.add_dock_widget(dock, area='right', name="Control Panel")
+
+        self.setup_region_panel()
+
+    def setup_region_panel(self):
+        """搜索 + hover 单独一个 dock。
+
+        与 Control Panel 拆开是因为 DevCCF 最深有十几级祖先，挤在控制面板里
+        只能给个固定高度的小框，链一长就得滚动；单独成面板后谱系框拿
+        stretch=1 吃掉剩下的全部空间，只有长到连这些空间都装不下才出现
+        滚动条。面板本身高度固定，鼠标划过不同脉络时布局不会抖。
+        """
+        region_dock = QWidget()
+        region_dock.setMaximumWidth(320)
+        rlayout = QVBoxLayout(region_dock)
+
+        rlayout.addWidget(QLabel("<b>🔍 Search Regions:</b>"))
+        self.input_search = QLineEdit(); self.input_search.setPlaceholderText("Region name...")
+        self.input_search.returnPressed.connect(lambda: self.perform_search())
+        rlayout.addWidget(self.input_search)
+
+        h_search_btns = QHBoxLayout()
+        btn_fuzzy = QPushButton("Fuzzy Search")
+        btn_exact = QPushButton("Exact Search")
+        btn_fuzzy.clicked.connect(lambda: self.perform_search("Fuzzy"))
+        btn_exact.clicked.connect(lambda: self.perform_search("Exact"))
+        h_search_btns.addWidget(btn_fuzzy)
+        h_search_btns.addWidget(btn_exact)
+        rlayout.addLayout(h_search_btns)
+
+        btn_export_highlight = QPushButton("📤 Export Highlighted Cells (tile/slice)")
+        btn_export_highlight.clicked.connect(self.export_highlighted_cells)
+        rlayout.addWidget(btn_export_highlight)
+
+        rlayout.addSpacing(5); rline = QFrame(); rline.setFrameShape(QFrame.HLine); rlayout.addWidget(rline); rlayout.addSpacing(5)
+
+        rlayout.addWidget(QLabel("<b>📍 Hovered Region:</b>"))
+        self.lbl_hover = QLabel("📍 Hover: None")
+        self.lbl_hover.setStyleSheet("color: #999; font-size: 11px;")
+        self.lbl_hover.setWordWrap(True)
+        self.lbl_hover.setTextFormat(Qt.RichText)
+        self.lbl_hover.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.lbl_hover.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        hover_scroll = QScrollArea()
+        hover_scroll.setWidgetResizable(True)
+        hover_scroll.setFrameShape(QFrame.NoFrame)
+        hover_scroll.setMinimumHeight(120)
+        hover_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        hover_scroll.setWidget(self.lbl_hover)
+        rlayout.addWidget(hover_scroll, 1)
+
+        # add_vertical_stretch=False：napari 默认会在 dock 底部塞一个弹簧把控件
+        # 顶到顶部，那样 hover 框的 stretch 就失效了。旧版本没这个参数就回退。
+        try:
+            self.viewer.window.add_dock_widget(
+                region_dock, area='right', name="Region Explorer",
+                add_vertical_stretch=False)
+        except TypeError:
+            self.viewer.window.add_dock_widget(
+                region_dock, area='right', name="Region Explorer")
 
     def on_point_size_change(self, val):
         for layer in self.viewer.layers:
@@ -1313,7 +1356,7 @@ class MainController:
 def main():
     parser = argparse.ArgumentParser(
         description="napari QC viewer for one registered sample "
-                    "(样本/图谱两种视图 + 细胞点 + 脑区搜索)")
+                    "(sample/atlas views + cell points + region search)")
     _local_config.add_config_arg(parser, "single_sample")
     args = parser.parse_args()
 
