@@ -142,6 +142,23 @@ conda activate antsreg && python edit_sample_labels.py    # opens a path form
   disabling the view: with no sample-space label volume there is no region
   outline and no hover lookup, but the cell points, the region search and the
   per-region filter all still work, since those come from the CSV.
+- **`convert_regions_ontology.py`** — translate a painted mask's
+  `.regions.json` `region_ids` between the DevCCF and Allen CCFv3 ontologies,
+  for when the same hand-painted sample gets registered against a different
+  atlas (e.g. moving from DevCCF P04 to DeMBA P5, which is labelled in CCFv3).
+  The painted outlines are never touched — only the atlas-side pairing, which is
+  the only thing that has to change. It reads the DevCCF paper's voxel-overlap
+  crosswalk (Supplementary Data 3), expands the painted coarse node down to the
+  labels the crosswalk actually covers, then aggregates that mass back up the
+  target ontology and reports both **share** (how much of what you painted a
+  target node accounts for) and **purity** (how much of that node is the thing
+  you painted). Two-sided on purpose: DevCCF `midbrain` puts 96.7% of its mass
+  inside CCFv3 `MB`, but `MB` is ~1.9x its volume, and pairing a guide against a
+  structure twice its size is worse than no guide — so such a node is reported
+  as a coarse alternative for a human to accept, never picked silently. Prints a
+  ready-to-paste `atlas_ids` block; `-o`/`--in-place` also writes a converted
+  sidecar `paint_mask.py` can resume from.
+  `python convert_regions_ontology.py ../Registration_ants/atlas/mask/s12t_guide7.regions.json`
 - **`align_masks.py`** — see below.
 - **`registration_eval.py`** — Dice/HD95, landmark TRE, Jacobian and
   inverse-consistency metrics across samples and groups.
