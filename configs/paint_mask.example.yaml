@@ -27,3 +27,44 @@ ontology_path:         /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevC
 # 可选，只影响显示，不影响导出的数值（导出的一直是体素索引）。
 # 注意是 (z, y, x) 顺序 
 display_scale_zyx: [32.0, 2.6, 2.6]
+
+
+# =====================================================================================
+# mode: labels —— 在配准结果上修改（而不是从空白平面开始画）
+# =====================================================================================
+# 默认 mode: guide，就是上面那套：在原图上从零画，自己指定每个 label 对应哪些脑区。
+# 下面这套是另一条路：从跑完的配准结果起手，只改画错的地方。
+#
+#   mode: labels
+#
+# 改成 labels 之后，上面的字段含义有两处变化：
+#   image_path   变成【配准实际跑的那份重采样图】（<name>_fine_25um.nii.gz），
+#                不是原始 tif —— 它必须和 labels_path 在同一个网格上。
+#   output_path  是【稀疏 guide】的输出：只有改过的层 + 层间插值，两端留空，
+#                拿去填 mask.guide_regions 重新配准。
+#
+# 新增字段：
+
+# 跑完配准得到的标签图。工具把它按 partition 折成画笔号当底图。
+# labels_path: /data/.../s12t/DevCCF/tsc12t_labels_in_sample.nii.gz
+
+# 【稠密】输出：每一层都有值（改过的层照你画的，层间插值，两端保留原始配准）。
+# 下次打开就读它继续画。不写的话默认是 output_path 加 _atlas 后缀。
+# 注意它旁边会写一份 .keyframes.json，记着哪些层是真手画的、真正的 baseline
+# 是哪个文件 —— 续做时只有那几层会被读回来，其余从 labels_path 重新折叠。
+# 不这么做的话，这一轮的插值猜测会变成下一轮的"真值"，每次都漂得更远。
+# atlas_output_path: /data/.../s12t/DevCCF/tsc12t_corrected_atlas.nii.gz
+
+# 起始 partition（画笔号 -> 脑区 id）。指向任何一份 .regions.json 都行 ——
+# 包括 mode: guide 自己导出的那份，所以可以直接从已经画好的 guide 接着细化。
+# 不给的话就用下面 region_ids 里写的。
+# partition_path: /home/fyu7/My_project/Registration_ants/atlas/mask/s12t_DeMBAguide7.regions.json
+
+# 展开一个分组时，小于这个体积的子结构不单独成组，留在父组里。
+# 依据是实测：小于 1mm³ 的 guide 区手圈边界误差占比太大，会主动把形变往错误
+# 方向拽，比不加引导更糟（见 Registration_ants/configs/config.example.yaml）。
+# min_region_mm3: 1.0
+
+# mode: labels 下 voxel_size_um 不用手填 —— labels_path 是 NIfTI，头里有真实
+# spacing，导出时直接读出来写进可粘贴的 config 片段。display_scale_zyx 只在
+# 头里是 (1,1,1) 时才作为兜底。

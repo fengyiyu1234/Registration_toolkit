@@ -26,6 +26,7 @@ shared/                  imported, never run
   form_dialog.py           the Qt input form local_config falls back to
   landmark_io.py           the landmark CSV format
   atlas_reference.py       GUI-free atlas loading + ontology math
+  label_partition.py       brush label <-> atlas region, and refining it per region
   ontology_tree_ui.py      the searchable Qt ontology tree
 
 tools/                   the smaller runnable tools
@@ -74,15 +75,29 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
 
 ## The main scripts
 
-- **`paint_mask.py`** — paint a binary inclusion/exclusion mask (`kind: mask`,
-  e.g. excluding a tissue crack) or a guide outline (`kind: guide`, fed to
-  `ants.registration`'s `multivariate_extras`). A guide export can cover
-  several brain regions at once — one napari brush label per region, named in
-  the config's `region_labels`, each interpolated separately and exported as
-  one multi-label volume plus a `<output>.regions.json` sidecar recording which
-  label is which region. That mapping is what lets `../Registration_ants` build
-  the matching atlas-side outline automatically from the atlas annotation
-  volume, so normally only the sample side is painted here.
+- **`paint_mask.py`** — paint the guide outline fed to `ants.registration`'s
+  `multivariate_extras`. Two modes, chosen by `mode:` in the config; both
+  export one multi-label volume plus a `<output>.regions.json` sidecar
+  recording which brush label is which atlas region. That mapping is what lets
+  `../Registration_ants` build the matching atlas-side outline automatically
+  from the atlas annotation volume, so normally only the sample side is
+  painted here.
+
+  - `mode: guide` (default) — trace regions by hand on the raw sample, from
+    blank planes, and assign each brush number to atlas structures in the
+    ontology tree. Sparse keyframes, each label interpolated separately.
+  - `mode: labels` — start from a finished registration
+    (`<name>_labels_in_sample.nii.gz`) collapsed into a *partition* of brush
+    labels, and correct only what came out wrong. A plane that differs from
+    the registration anywhere becomes a whole-plane keyframe (every region on
+    it, not just the edit), and two volumes come out: a sparse guide to
+    re-register with, and a dense one to re-open and carry on from. The
+    partition is refined one region at a time — expand `Hippocampal
+    formation` into CA/DG without changing how coarsely the cerebellum is
+    described — and the atlas-side subtraction that nesting requires
+    (`atlas_exclude_ids`) is derived rather than maintained by hand. See
+    `shared/label_partition.py` for the measured reason a uniform ontology
+    depth is not a usable knob.
 - **`single_sample.py`** — napari QC viewer for one registered sample: overlays
   the warped atlas, the sample, and per-region labels. Reads either pipeline's
   output directory, auto-detected: ANTs (`*_fine_*um.nii.gz` +
