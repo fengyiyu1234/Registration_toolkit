@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidge
                              QFileDialog, QMessageBox, QSizePolicy)
 from PyQt5.QtCore import Qt
 
-import _local_config  # sibling module
+from shared import local_config  # configs/<tool>.yaml
 
 # ================= ⚙️ 用户配置区域 =================
 #
@@ -1357,12 +1357,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="napari QC viewer for one registered sample "
                     "(sample/atlas views + cell points + region search)")
-    _local_config.add_config_arg(parser, "single_sample")
+    local_config.add_config_arg(parser, "single_sample")
     args = parser.parse_args()
 
     # 就地更新，而不是重新绑定：MainController 的方法里直接引用模块级 CONFIG，
     # 换成新 dict 的话那些引用还指着旧的空 dict。
-    CONFIG.update(_local_config.load_config(
+    CONFIG.update(local_config.load_config(
         "single_sample", cli_path=args.config, required=_REQUIRED_KEYS))
 
     viewer = napari.Viewer(title="Spatial Explorer (Single Workspace)")

@@ -37,7 +37,7 @@ it: the prosomeric model files the pretectum under diencephalon and the isthmus
 under hindbrain, both of which CCFv3 calls midbrain, so `MB` is roughly twice the
 volume of what "midbrain" meant while painting. Pairing a guide region against a
 structure 2x its size is worse than having no guide at all (see
-qc_guide_mask.py's "systematic volume mismatch"), so the tool reports such a node
+tools/qc_guide_mask.py's "systematic volume mismatch"), so the tool reports such a node
 as a COARSE ALTERNATIVE for a human to accept or reject, and never picks it
 silently.
 
@@ -58,10 +58,10 @@ Two honest caveats about the crosswalk itself:
 
 Usage (antsreg env; no GUI, runs headless):
 
-    python convert_regions_ontology.py ../Registration_ants/atlas/mask/s12t_guide7.regions.json
-    python convert_regions_ontology.py <sidecar> -o s12t_guide7_ccfv3.regions.json
-    python convert_regions_ontology.py <sidecar> --in-place        # backs up first
-    python convert_regions_ontology.py <sidecar> --purity 0.8 --min-share 0.02
+    python tools/convert_regions_ontology.py ../Registration_ants/atlas/mask/s12t_guide7.regions.json
+    python tools/convert_regions_ontology.py <sidecar> -o s12t_guide7_ccfv3.regions.json
+    python tools/convert_regions_ontology.py <sidecar> --in-place        # backs up first
+    python tools/convert_regions_ontology.py <sidecar> --purity 0.8 --min-share 0.02
 
 Prints a per-label report plus a ready-to-paste `mask.guide_regions.atlas_ids`
 snippet; with -o/--in-place also writes a converted sidecar that paint_mask.py
@@ -80,7 +80,7 @@ from registration_ants import atlas_utils
 
 # Paths of the three reference files, relative to the pipeline repo next door.
 # Defaults only -- every one of them is overridable on the command line.
-_ANTS = Path(__file__).resolve().parent.parent / "Registration_ants"
+_ANTS = Path(__file__).resolve().parents[2] / "Registration_ants"
 DEFAULT_CROSSWALK = _ANTS / "atlas" / "DevCCF" / "41467_2024_53254_MOESM4_ESM.xlsx"
 DEFAULT_DEVCCF_ONTOLOGY = _ANTS / "atlas" / "DevCCF" / "DevCCFv1_ontology.json"
 DEFAULT_CCFV3_ONTOLOGY = _ANTS / "atlas" / "DeMBA" / "CCF_v3_ontology.json"

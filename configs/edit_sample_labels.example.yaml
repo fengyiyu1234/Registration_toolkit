@@ -1,10 +1,10 @@
-# edit_sample_labels.py 的配置模板。复制成 configs/edit_sample_labels.yaml
+# tools/edit_sample_labels.py 的配置模板。复制成 configs/edit_sample_labels.yaml
 # （gitignored）再改成本机的真实路径：
 #
 #   cp configs/edit_sample_labels.example.yaml configs/edit_sample_labels.yaml
 #   conda activate antsreg
-#   python edit_sample_labels.py              # 弹出表单，字段用下面的值预填
-#   python edit_sample_labels.py --no-form    # 不弹表单，直接按这份配置打开 napari
+#   python tools/edit_sample_labels.py              # 弹出表单，字段用下面的值预填
+#   python tools/edit_sample_labels.py --no-form    # 不弹表单，直接按这份配置打开 napari
 #
 # 这份配置是**可选**的：没有它时脚本仍然照旧弹表单（字段用 .dialog_state/ 里
 # 上次用过的值预填）。有它时，这里写了的字段优先于上次记录。
@@ -13,7 +13,7 @@
 sample_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_fine_25um.nii.gz
 
 # 已经跑完配准得到的标签图 —— 这个工具是在它的基础上手工修正，
-# 而不是从零开始画（从零画用 annotate_gt_sam.py）。
+# 而不是从零开始画。
 labels_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_labels_in_sample.nii.gz
 
 # 修正后的整份标签图输出路径。

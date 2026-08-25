@@ -22,7 +22,7 @@ import tifffile
 # registration_ants itself comes from ../Registration_ants's editable install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from registration_ants import atlas_utils, io_utils, register, transforms  # noqa: E402
-import _landmark_io  # noqa: E402
+from shared import landmark_io  # noqa: E402
 import registration_eval as ev  # noqa: E402
 
 
@@ -72,14 +72,14 @@ def make_synthetic_atlas(shape_xyz=(24, 32, 32), resolution_um=25.0):
 
 
 def write_napari_points_csv(path, points_xyz_reversed_to_zyx):
-    """Write a CSV in the exact format place_landmarks.py produces
+    """Write a CSV in the exact format the tools exchange landmarks in
     (index,axis-0,axis-1,axis-2, values in (z,y,x) voxel order).
 
-    Goes through the same _landmark_io writer place_landmarks.py uses, so this
-    test exercises the real format rather than a lookalike that could drift
-    from it.
+    Goes through the same shared.landmark_io writer registration_eval reads
+    these with, so this test exercises the real format rather than a lookalike
+    that could drift from it.
     """
-    _landmark_io.write_landmark_csv(path, points_xyz_reversed_to_zyx)
+    landmark_io.write_landmark_csv(path, points_xyz_reversed_to_zyx)
 
 
 def test_load_points():
@@ -247,7 +247,7 @@ def test_end_to_end_synthetic_registration(tmp_dir):
     assert set(np.unique(arr_written)) == set(np.unique(arr_reread)), "label ids changed across ants<->sitk round trip"
 
     # Per-region ground-truth masks (fabricated identical to the auto labels),
-    # matching edit_sample_labels.py's "Save This Region" output --
+    # matching tools/edit_sample_labels.py's "Save This Region" output --
     # one independent binary mask per region, not one combined multi-label file.
     cortex_mask_path = tmp_dir / "sample_fakecortex_corrected_mask.nii.gz"
     hippo_mask_path = tmp_dir / "sample_fakehippo_corrected_mask.nii.gz"

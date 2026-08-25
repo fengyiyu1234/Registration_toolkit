@@ -7,22 +7,21 @@ ontology and annotation volume, for different reasons:
     tree plus per-node voxel counts (to grey out regions this annotation has
     no voxels for), but never displays the atlas itself.
 
-  atlas_view.py renders the atlas as a three-pane viewer with a region
+  tools/atlas_view.py renders the atlas as a three-pane viewer with a region
     picker of its own -- it needs the same tree, plus the grayscale
     template and a per-region highlight mask.
 
-Splitting this out of paint_mask.py is what lets atlas_view.py exist as an
+Splitting this out of paint_mask.py is what lets tools/atlas_view.py exist as an
 independent script instead of a window paint_mask.py opens, and it is also
 what keeps this half importable with no PyQt5/napari -- the same reason
 paint_mask.py's own _interpolate_sparse_mask() is imported lazily inside a
 function rather than at module scope: a --selftest of the ontology math
-should run with nothing but numpy/SimpleITK, in the gt_sam env too, which
-has neither a display nor the ../Registration_ants editable install
-guaranteed.
+should run with nothing but numpy/SimpleITK -- no display, and no
+../Registration_ants editable install required.
 
-Not runnable as a tool -- `python atlas_reference.py --selftest` runs the
+Not runnable as a tool -- `python shared/atlas_reference.py --selftest` runs the
 synthetic tests below, but the actual atlas configs live in paint_mask.py's
-and atlas_view.py's own configs/*.yaml, each pointing at the same
+and tools/atlas_view.py's own configs/*.yaml, each pointing at the same
 atlas_annotation_path / ontology_path keys.
 """
 
@@ -85,7 +84,7 @@ def atlas_reference_config(cfg):
         orientation=cfg.get("atlas_orientation") or None,
         downsample=downsample,
         # Three synced canvases instead of one -- only meaningful to
-        # atlas_view.py's window; paint_mask.py's tree-only use ignores it.
+        # tools/atlas_view.py's window; paint_mask.py's tree-only use ignores it.
         ortho=bool(cfg.get("atlas_ortho_views", True)),
     )
 
@@ -191,7 +190,7 @@ def load_atlas_reference(atlas_cfg, include_template=True):
 
     include_template=False skips reading atlas_cfg.template_path entirely --
     paint_mask.py's region-assignment tree never displays it (that lives in
-    the separate atlas_view.py now), and the DevCCF template is another
+    the separate tools/atlas_view.py now), and the DevCCF template is another
     ~1 GB SimpleITK read plus a downsample/reorient pass it has no use for.
 
     Returns SimpleNamespace(template, compact, present_ids, index_of_id,
@@ -511,7 +510,7 @@ def selftest_mask_centre_index():
 
 
 def run_selftests():
-    print("=== atlas_reference.py selftests (synthetic data only, no GUI) ===")
+    print("=== shared/atlas_reference.py selftests (synthetic data only, no GUI) ===")
     selftest_ontology_node_voxels()
     selftest_ontology_tree_filter()
     selftest_compact_annotation()
@@ -525,7 +524,7 @@ def run_selftests():
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Shared atlas/ontology loading used by paint_mask.py and atlas_view.py "
+        description="Shared atlas/ontology loading used by paint_mask.py and tools/atlas_view.py "
                      "(not a standalone tool -- this only runs its selftests)")
     parser.add_argument("--selftest", action="store_true",
                         help="run the built-in synthetic tests (no GUI, no atlas files) and exit")

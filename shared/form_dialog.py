@@ -6,7 +6,7 @@ per-script in .dialog_state/<script_name>.json (gitignored, so it
 never shows up as a git diff).
 
 Not runnable on its own, and normally not imported directly either: the
-interactive tools call _local_config.resolve_inputs(), which layers
+interactive tools call local_config.resolve_inputs(), which layers
 configs/<tool>.yaml on top of the remembered values and calls run_form() here
 (or skips it entirely for --no-form). Import this module directly only if a
 tool wants the form with no config layer at all.
@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QPushButton, QSpinBox, QWidget,
 )
 
-_STATE_DIR = Path(__file__).resolve().parent / ".dialog_state"
+_STATE_DIR = Path(__file__).resolve().parents[1] / ".dialog_state"
 
 # Held here for the life of the process -- QApplication has no Python
 # reference otherwise and gets garbage-collected right after the `or`
@@ -90,7 +90,7 @@ def run_form(script_name, title, fields, overrides=None):
     another field currently equals expected_value.
 
     `overrides` (normally configs/<script_name>.yaml, passed in by
-    _local_config.resolve_inputs) pre-fills fields ahead of the remembered
+    local_config.resolve_inputs) pre-fills fields ahead of the remembered
     last-used values -- editing the config has to be visible in the form, or
     there would be no point editing it. Fields absent from `overrides` still
     fall back to .dialog_state/ and then to the field's own default.
@@ -120,8 +120,8 @@ def run_form(script_name, title, fields, overrides=None):
             w = _PathField(remembered or "", mode, f.get("filter", "All files (*)"))
         elif ftype == "text":
             # Free text, for the values that are neither a path nor a single
-            # number -- e.g. fit_initial_transform.py's "2.6 2.6 32.0" voxel
-            # size. Parsing is the caller's; this only collects the string.
+            # number -- e.g. a "2.6 2.6 32.0" voxel size. Parsing is the
+            # caller's; this only collects the string.
             w = QLineEdit("" if remembered is None else str(remembered))
             if f.get("placeholder"):
                 w.setPlaceholderText(f["placeholder"])

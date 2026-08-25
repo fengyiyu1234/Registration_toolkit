@@ -10,25 +10,30 @@
 样本各留一份，互相不覆盖：
 
     python single_sample.py configs/single_sample.local.yaml
+    python tools/atlas_view.py configs/atlas_view.devccf.yaml
+
+configs/ 和 .dialog_state/ 都在仓库根目录，不在这个包里 —— 下面的路径锚点用的是
+`parents[1]`，所以 tools/ 里的工具和根目录的主脚本找到的是同一份配置。
 
 字符串值里的 `~` 和 `${VAR}` 会被展开，方便同一份 config 在数据盘挂载点不同的
 两台机器之间共用。未定义的 `${VAR}` 原样保留（不会静默变成空字符串），这样出错
 时报出来的是那个没展开的路径本身，一眼能看出是哪个变量没设。
 
-弹表单的交互式工具（place_landmarks.py / edit_sample_labels.py /
-fit_initial_transform.py）走 `resolve_inputs()`：配置是**可选**的，有就用来预填
-表单（优先于 .dialog_state/ 里上次用过的值），`--no-form` 则完全不弹窗、直接用
-配置。非交互工具（single_sample.py / paint_mask.py）直接用 `load_config()`。
+弹表单的交互式工具（tools/edit_sample_labels.py）走 `resolve_inputs()`：配置是
+**可选**的，有就用来预填表单（优先于 .dialog_state/ 里上次用过的值），`--no-form`
+则完全不弹窗、直接用配置。其余工具（single_sample.py / paint_mask.py /
+tools/atlas_view.py / tools/qc_guide_mask.py）直接用 `load_config()`。
 
-Not runnable on its own -- imported by single_sample.py, paint_mask.py,
-place_landmarks.py, edit_sample_labels.py, fit_initial_transform.py.
+Not runnable on its own -- imported by paint_mask.py, single_sample.py and the
+tools in tools/.
 """
 import os
+import sys
 from pathlib import Path
 
 import yaml
 
-CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
+CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 
 def example_path(tool):
@@ -64,6 +69,19 @@ def _expand(value):
     return value
 
 
+def _invocation(tool):
+    """错误信息里那条"再跑一遍"的命令。工具分散在仓库根目录和 tools/ 两处，写死
+    `{tool}.py` 会给出一条 tools/ 里的工具根本跑不起来的命令，所以优先用实际的
+    argv[0]。"""
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if argv0 and argv0.suffix == ".py":
+        try:
+            return argv0.resolve().relative_to(CONFIGS_DIR.parent)
+        except ValueError:
+            return argv0
+    return f"{tool}.py"
+
+
 def _missing_message(tool, legacy_paths=()):
     default = default_path(tool)
     example = example_path(tool)
@@ -74,7 +92,7 @@ def _missing_message(tool, legacy_paths=()):
         "",
         "然后在里面改成本机的真实路径。configs/*.yaml 是 gitignored 的，只有",
         "*.example.yaml 会进 git，所以换样本改路径不会产生 git diff。",
-        f"也可以显式指定别的配置：python {tool}.py path/to/other.yaml",
+        f"也可以显式指定别的配置：python {_invocation(tool)} path/to/other.yaml",
     ]
     if legacy_paths:
         lines.append(f"（旧位置 {', '.join(str(p) for p in legacy_paths)} 也不存在。）")
@@ -139,7 +157,7 @@ def load_config(tool, cli_path=None, required=(), legacy_paths=(), optional=Fals
 
 def _field_enabled(field, values):
     """enabled_when=(other_key, expected) —— 另一个字段不等于 expected 时本字段
-    不生效（跟 _form_dialog.run_form 里灰掉输入框是同一套语义）。"""
+    不生效（跟 form_dialog.run_form 里灰掉输入框是同一套语义）。"""
     cond = field.get("enabled_when")
     return cond is None or values.get(cond[0]) == cond[1]
 
@@ -178,5 +196,5 @@ def resolve_inputs(tool, title, fields, cli_path=None, no_form=False):
     cfg = load_config(tool, cli_path, optional=True)
     if no_form:
         return values_from_config(tool, fields, cfg)
-    from _form_dialog import run_form   # 惰性导入：--no-form 这条路不需要 PyQt5
+    from shared.form_dialog import run_form   # 惰性导入：--no-form 这条路不需要 PyQt5
     return run_form(tool, title, fields, overrides=cfg)

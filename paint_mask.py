@@ -33,10 +33,10 @@ blob rather than something that needs a meaningful value on every plane.
     This panel only picks and assigns -- it draws nothing. To actually SEE
     the atlas (three synced ortho panes, a region highlighted among its
     neighbours, hover-to-read-the-full-ontology-chain), run the separate
-    atlas_view.py against the same atlas_annotation_path / ontology_path.
+    tools/atlas_view.py against the same atlas_annotation_path / ontology_path.
     The two tools used to be one window pair, with the atlas side driven
     live from this tree; they are independent scripts now, so nothing
-    painted or assigned here reaches atlas_view.py and nothing selected
+    painted or assigned here reaches tools/atlas_view.py and nothing selected
     there reaches this tool.
 
     The atlas grid is INDEPENDENT of the sample's: a half-brain sample
@@ -107,16 +107,16 @@ no command-line arguments.
     python paint_mask.py configs/paint_mask.guide_s12t.yaml  # or point at another config
 
 To actually look at the atlas (not just assign regions to brush labels),
-run the separate atlas_view.py -- see its own docstring.
+run the separate tools/atlas_view.py -- see its own docstring.
 
 The export logic is separately runnable with no display and no config, on
-purely synthetic data (same style as align_masks.py --selftest):
+purely synthetic data:
 
     python paint_mask.py --selftest
 
-atlas_reference.py --selftest and atlas_view.py --selftest cover the atlas
-loading / ontology math and the ortho-view geometry that used to be tested
-here.
+shared/atlas_reference.py --selftest and tools/atlas_view.py --selftest cover
+the atlas loading / ontology math and the ortho-view geometry that used to be
+tested here.
 """
 
 import argparse
@@ -128,15 +128,15 @@ import numpy as np
 import SimpleITK as sitk
 import yaml
 
-import _local_config  # sibling module
-import atlas_reference  # sibling module -- shared, GUI-free atlas loading
-import ontology_tree_ui  # sibling module -- shared Qt ontology tree widget
+from shared import atlas_reference   # GUI-free atlas loading + ontology math
+from shared import local_config      # configs/<tool>.yaml
+from shared import ontology_tree_ui  # the shared Qt ontology tree widget
 
 # napari/PyQt5 are imported lazily by _import_gui() rather than here, and
 # mask_utils by _interpolate_sparse_mask(), so that --selftest (pure numpy +
-# scipy, no window) runs in the gt_sam env too, which has no
-# ../Registration_ants editable install. Both are hard requirements for the
-# actual painting GUI, which only ever runs in antsreg.
+# scipy, no window) runs with no display and without the ../Registration_ants
+# editable install. Both are hard requirements for the actual painting GUI,
+# which only ever runs in antsreg.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
 QCheckBox = QHBoxLayout = QLineEdit = QSpinBox = None
 QTreeWidget = Qt = None
@@ -180,7 +180,7 @@ _LEGACY_CONFIG_PATHS = (Path(__file__).resolve().parent / "paint_mask_local.yaml
 def _load_local_config(cli_path=None):
     """Paths live in a gitignored configs/paint_mask.yaml instead of constants
     here, so editing them for a new sample never shows up as a git diff."""
-    cfg = _local_config.load_config(
+    cfg = local_config.load_config(
         "paint_mask", cli_path=cli_path,
         required=("image_path", "output_path"),
         legacy_paths=_LEGACY_CONFIG_PATHS)
@@ -744,9 +744,9 @@ def guide_export_warnings(result, region_labels):
 
 def _output_stem(output_path):
     """Path with the image suffix removed, for hanging sidecars off.
-    .nii.gz is special-cased the same way edit_sample_labels.py's
-    _annotation_sidecar_path and annotate_gt_sam.py's sidecar_path_for do
-    it, so the names line up with the sidecar convention already in use."""
+    .nii.gz is special-cased the same way tools/edit_sample_labels.py's
+    _annotation_sidecar_path does it, so the names line up with the sidecar
+    convention already in use."""
     path = Path(output_path)
     name = path.name
     name = name[: -len(".nii.gz")] if name.endswith(".nii.gz") else Path(name).stem
@@ -776,8 +776,8 @@ def write_guide_sidecars(output_path, image_path, result, region_labels, total_z
     <area>` structures.
 
     <stem>.annotated_slices.json is the repo's pre-existing per-mask
-    sidecar (written by edit_sample_labels.py and annotate_gt_sam.py, read
-    by registration_eval.py's load_region_annotation_hint) -- same
+    sidecar (written by tools/edit_sample_labels.py, read by
+    registration_eval.py's load_region_annotation_hint) -- same
     {"hand_drawn_slices": [...]} shape, holding the union over all labels
     of the planes actually painted. It is written so this output drops into
     the evaluation path unchanged; the per-label breakdown that format has
@@ -827,7 +827,7 @@ def load_guide_resume(existing_path, expected_shape):
 
     So only the planes the `.regions.json` sidecar recorded as hand-drawn are
     restored, at their original label values -- the same "overlay only the
-    real keyframes onto a fresh baseline" rule edit_sample_labels.py's
+    real keyframes onto a fresh baseline" rule tools/edit_sample_labels.py's
     _load_prior_hand_drawn follows, for the same reason.
 
     Note the restored plane holds what SURVIVED export: where two labels'
@@ -942,11 +942,11 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     Selecting a node assigns it (and everything under it) to a brush label;
     nothing here is displayed anywhere. To actually SEE the atlas -- a
     region highlighted among its neighbours in three synced panes, hover
-    ancestry -- run the separate atlas_view.py against the same
+    ancestry -- run the separate tools/atlas_view.py against the same
     atlas_annotation_path / ontology_path. The two tools no longer share any
     state: this panel used to drive a second napari window live (see
-    highlight_mask / _open_atlas_window, both now in atlas_view.py /
-    atlas_reference.py); it just assigns now.
+    highlight_mask / _open_atlas_window, both now in tools/atlas_view.py /
+    shared/atlas_reference.py); it just assigns now.
 
     A dedicated left-side dock, not squeezed in with Relabel/Export on the
     right: the ontology sits 2-12 levels deep, so a tree squeezed into a
@@ -1055,7 +1055,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     dock = QWidget()
     layout = QVBoxLayout(dock)
     layout.addWidget(QLabel("Atlas ontology -- selecting a node assigns it to the brush label "
-                            "below. The atlas itself is not shown here; run atlas_view.py to "
+                            "below. The atlas itself is not shown here; run tools/atlas_view.py to "
                             "look at it."))
     layout.addWidget(search)
     layout.addWidget(hide_empty)
@@ -1107,7 +1107,7 @@ def _run_guide(args):
     # The atlas ontology is loaded here only to populate the region-assignment
     # tree and check which structures this annotation actually has voxels
     # for -- nothing about it is displayed. To look at the atlas itself, run
-    # atlas_view.py against the same atlas_annotation_path / ontology_path.
+    # tools/atlas_view.py against the same atlas_annotation_path / ontology_path.
     atlas = assignment = picker = None
     if args.atlas:
         atlas = atlas_reference.load_atlas_reference(args.atlas, include_template=False)
@@ -1213,9 +1213,9 @@ def _reference_interpolate_sparse_mask(keyframe_planes, full_shape):
     """Deliberate standalone minimal copy of
     registration_ants.mask_utils.interpolate_sparse_mask, used by the
     selftests ONLY when registration_ants isn't importable -- it lives in
-    ../Registration_ants, which is pip-installed-editable in the antsreg
-    env but absent from gt_sam, and these tests are meant to run in both
-    (same reasoning as align_masks.py's copy of the Dice/surface code).
+    ../Registration_ants and is pip-installed-editable in the antsreg env, so
+    a checkout without that install (or an env that never had it) can still
+    run --selftest.
     selftest_interpolator_matches_registration_ants() asserts the two agree
     voxel-for-voxel whenever the real one IS available, so drift can't hide.
     """
@@ -1516,7 +1516,7 @@ def selftest_sidecars(interp, tmp_dir):
 
     # Same key registration_eval.load_region_annotation_hint() reads. Asserted
     # by name rather than by importing it: registration_eval pulls in
-    # registration_ants.transforms -> antspyx, which gt_sam does not have.
+    # registration_ants.transforms -> antspyx, which --selftest does without.
     hint = json.loads(slices_path.read_text())
     assert hint["hand_drawn_slices"] == [0, 2, 4, 6, 8], hint
 
@@ -1701,14 +1701,14 @@ def run_selftests():
     selftest_interpolator_matches_registration_ants()
     selftest_seed_assignment()
     print("=== all selftests passed ===")
-    print("(atlas_reference.py --selftest / atlas_view.py --selftest cover atlas loading, "
+    print("(shared/atlas_reference.py --selftest / tools/atlas_view.py --selftest cover atlas loading, "
           "ontology maths and the ortho-view geometry)")
     return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="Paint a guide outline on a sample volume")
-    _local_config.add_config_arg(parser, "paint_mask")
+    local_config.add_config_arg(parser, "paint_mask")
     parser.add_argument("--selftest", action="store_true",
                         help="run the built-in synthetic tests (no GUI, no config) and exit")
     args_cli = parser.parse_args()

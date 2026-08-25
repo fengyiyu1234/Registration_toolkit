@@ -31,19 +31,21 @@ for its design history). Two key simplifications vs. a generic skeleton:
 Ground truth for M2/M3 comes from a semi-manual workflow already built in
 this repo (not new tooling): run the ants pipeline once, then hand-correct
 whichever regions came out wrong --
-  edit_sample_labels.py ("Save This Region")
+  tools/edit_sample_labels.py ("Save This Region")
                                         -> <name>_<region_slug>_corrected_mask.nii.gz,
                                            one per region, wired up via dice_region_masks
   paint_mask.py (KIND="mask")   -> sample_brain_mask_corrected.nii.gz
-Landmarks for M1 come from place_landmarks.py (new tool, this
-session) -- place matching points on the sample and on the atlas in napari.
+Landmarks for M1 are placed in napari by hand: open the sample and the atlas
+template, add a Points layer to each, click the SAME anatomical points in the
+SAME order in both, and save each layer to CSV (row i in one file and row i in
+the other are one landmark -- see shared/landmark_io.py).
 
 ------------------------------------------------------------------------------------
 CRITICAL AXIS-ORDER NOTE -- this file mixes TWO conventions on purpose, matching
 how the rest of this codebase already reads each kind of file:
   * SAMPLE-space label volumes (labels_in_sample.nii.gz, the hand-corrected
     labels/brain-mask files) are read via SimpleITK here, giving array axis
-    order (z,y,x) -- the same convention edit_sample_labels.py and
+    order (z,y,x) -- the same convention tools/edit_sample_labels.py and
     paint_mask.py already read/write with. z_axis=0 always
     for these arrays.
   * ATLAS-space arrays (the annotation used for Jacobian/region masks) come
@@ -78,7 +80,7 @@ from scipy.spatial import cKDTree
 
 from registration_ants import atlas_utils, transforms
 
-import _landmark_io  # sibling module
+from shared import landmark_io  # the landmark CSV format
 
 
 # =====================================================================================
@@ -100,13 +102,13 @@ class Config:
     # Dice/HD95. Explicit override applied to EVERY region regardless of any
     # per-region hint below; None (the default) lets use_annotation_hints
     # decide per region instead. Set this only if you want one fixed set of
-    # slices for all regions no matter what edit_sample_labels.py's
+    # slices for all regions no matter what tools/edit_sample_labels.py's
     # sidecar files say.
     annotated_slices: list[int] | None = None
 
     # When annotated_slices above is None, use each region's own
     # <mask>.annotated_slices.json sidecar (written by
-    # edit_sample_labels.py's "Save This Region") to restrict that
+    # tools/edit_sample_labels.py's "Save This Region") to restrict that
     # region's Dice/HD95 to just the z-planes actually hand-drawn, instead of
     # the full volume (which includes signed-distance-interpolated guesses
     # in between). Set False to ignore any hints and always use the full
@@ -193,18 +195,16 @@ def load_eval_config(path):
 # M1 -- Landmark TRE
 # =====================================================================================
 def load_points(csv_path):
-    """Parse a napari Points-layer CSV export (index,axis-0,axis-1,axis-2 --
-    see place_landmarks.py) into an (N,3) array of voxel coordinates
-    in (x,y,z) order.
+    """Parse a napari Points-layer CSV export (index,axis-0,axis-1,axis-2)
+    into an (N,3) array of voxel coordinates in (x,y,z) order.
 
     napari/SimpleITK's array order for these tools is (z,y,x) (axis-0 = the
     actual imaging/atlas planes) -- reversed here to (x,y,z) to match this
     codebase's established physical-space convention (see module docstring).
-    Parsing and validation live in _landmark_io so this tool,
-    fit_initial_transform.py and place_landmarks.py cannot drift apart on the
-    format.
+    Parsing and validation live in shared/landmark_io.py so this tool and
+    napari's own writer cannot drift apart on the format.
     """
-    return _landmark_io.to_xyz(_landmark_io.read_landmark_csv(csv_path))
+    return landmark_io.to_xyz(landmark_io.read_landmark_csv(csv_path))
 
 
 def apply_transform_to_points(sample_pts_xyz_um, transforms_prefix):
@@ -336,7 +336,7 @@ def load_region_mask(labels_arr, region_name, structures):
     (atlas_utils.region_mask_by_exact_name) -- used for the WARPED-ATLAS side
     of a Dice comparison (labels_in_sample, the registration output), which
     is always one combined multi-label volume. The ground-truth side uses
-    load_binary_mask instead (see edit_sample_labels.py's per-region
+    load_binary_mask instead (see tools/edit_sample_labels.py's per-region
     "Save This Region" output).
     """
     return atlas_utils.region_mask_by_exact_name(labels_arr, structures, region_name)
@@ -345,14 +345,14 @@ def load_region_mask(labels_arr, region_name, structures):
 def load_binary_mask(path):
     """Load an already-binary 0/1 mask (e.g. a hand-corrected brain outline
     from paint_mask.py's `mask` kind, or one region's corrected
-    mask from edit_sample_labels.py) as a bool array, SAMPLE-space
+    mask from tools/edit_sample_labels.py) as a bool array, SAMPLE-space
     (z,y,x) order."""
     return sitk.GetArrayFromImage(sitk.ReadImage(str(path))) > 0
 
 
 def load_region_annotation_hint(mask_path):
     """Read the <mask_path>.annotated_slices.json sidecar
-    edit_sample_labels.py's "Save This Region" writes alongside a
+    tools/edit_sample_labels.py's "Save This Region" writes alongside a
     region's corrected mask -- {"hand_drawn_slices": [...], ...}. Returns the
     hand-drawn z-index list, or None if no sidecar exists (e.g. the mask was
     fully hand-corrected some other way, or predates this feature)."""
@@ -548,7 +548,7 @@ def evaluate_sample(sample_id: str, paths: dict, cfg: Config, atlas_ctx: dict) -
         print(f"[{sample_id}] no sample_brain_mask_corrected configured yet -- skipping whole-brain Dice/HD95.")
 
     # ---- M2 / M3 coarse regions ----
-    # Each region is annotated independently (see edit_sample_labels.py's
+    # Each region is annotated independently (see tools/edit_sample_labels.py's
     # "Save This Region"), so each is skipped on its own rather than all-or-nothing.
     region_masks = paths.get("dice_region_masks") or {}
     if not region_masks:

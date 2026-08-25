@@ -1,10 +1,10 @@
-# qc_guide_mask.py 的配置模板。复制成 configs/qc_guide_mask.yaml（gitignored）
+# tools/qc_guide_mask.py 的配置模板。复制成 configs/qc_guide_mask.yaml（gitignored）
 # 再改成本机的真实路径：
 #
 #   cp configs/qc_guide_mask.example.yaml configs/qc_guide_mask.yaml
 #   conda activate antsreg
-#   python qc_guide_mask.py                                 # 用 configs/qc_guide_mask.yaml
-#   python qc_guide_mask.py configs/qc_guide_mask.s12t.yaml # 或显式指定另一份
+#   python tools/qc_guide_mask.py                                 # 用 configs/qc_guide_mask.yaml
+#   python tools/qc_guide_mask.py configs/qc_guide_mask.s12t.yaml # 或显式指定另一份
 
 # 要审的那份 ../Registration_ants 流程配置。
 #

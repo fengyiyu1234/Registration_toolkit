@@ -24,7 +24,7 @@ any atlas display, and this viewer no longer knows paint_mask exists. Point
 both at the same atlas_annotation_path / ontology_path if you want to browse
 the atlas while painting -- just as two independent windows, not two views of
 one state. The atlas loading + ontology math both tools share lives in
-atlas_reference.py; this file is what turns that data into a window.
+shared/atlas_reference.py; this file is what turns that data into a window.
 
 Usage (needs a display; runs in the antsreg conda env -- same napari+PyQt5+
 SimpleITK requirement as paint_mask.py): edit configs/atlas_view.yaml
@@ -32,13 +32,13 @@ SimpleITK requirement as paint_mask.py): edit configs/atlas_view.yaml
 then just run the file -- no command-line arguments.
 
     conda activate antsreg
-    python atlas_view.py
-    python atlas_view.py configs/atlas_view.devccf.yaml   # or point at another config
+    python tools/atlas_view.py
+    python tools/atlas_view.py configs/atlas_view.devccf.yaml   # or point at another config
 
 The plane geometry (frames, bounds, resampling, crosshairs) is separately
 runnable with no display and no config, on purely synthetic data:
 
-    python atlas_view.py --selftest
+    python tools/atlas_view.py --selftest
 """
 
 import argparse
@@ -46,9 +46,15 @@ from types import SimpleNamespace
 
 import numpy as np
 
-import _local_config       # sibling module
-import atlas_reference      # sibling module -- shared, GUI-free atlas loading
-import ontology_tree_ui     # sibling module -- shared Qt ontology tree widget
+# Run as `python tools/<name>.py`, so sys.path[0] is tools/, not the repo
+# root -- put the root on it before importing anything from shared/.
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from shared import atlas_reference   # GUI-free atlas loading + ontology math
+from shared import local_config      # configs/<tool>.yaml
+from shared import ontology_tree_ui  # the shared Qt ontology tree widget
 
 # napari/PyQt5 are imported lazily by _import_gui(), for the same reason
 # paint_mask.py does it: --selftest (pure numpy, no window) should run
@@ -95,7 +101,7 @@ def _load_local_config(cli_path=None):
     it is the whole tool -- so annotation_path/ontology_path are required by
     _local_config itself rather than left to silently produce an empty
     viewer."""
-    cfg = _local_config.load_config(
+    cfg = local_config.load_config(
         "atlas_view", cli_path=cli_path,
         required=("atlas_annotation_path", "ontology_path"),
         legacy_paths=_LEGACY_CONFIG_PATHS)
@@ -1322,7 +1328,7 @@ def selftest_rotation_drag():
 
 
 def run_selftests():
-    print("=== atlas_view.py selftests (synthetic data only, no GUI) ===")
+    print("=== tools/atlas_view.py selftests (synthetic data only, no GUI) ===")
     selftest_ortho_panes_geometry()
     selftest_frame_algebra()
     selftest_plane_bounds()
@@ -1333,13 +1339,13 @@ def run_selftests():
     selftest_coarse_expansion()
     selftest_rotation_drag()
     print("=== all selftests passed ===")
-    print("(atlas_reference.py --selftest covers atlas loading / ontology maths)")
+    print("(shared/atlas_reference.py --selftest covers atlas loading / ontology maths)")
     return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="Browse an atlas annotation against its ontology")
-    _local_config.add_config_arg(parser, "atlas_view")
+    local_config.add_config_arg(parser, "atlas_view")
     parser.add_argument("--selftest", action="store_true",
                         help="run the built-in synthetic tests (no GUI, no config) and exit")
     args_cli = parser.parse_args()

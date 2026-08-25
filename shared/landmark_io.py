@@ -4,8 +4,9 @@ in this repo, in one place with one set of checks.
 FORMAT
 ------
 `index,axis-0,axis-1,axis-2` -- the layout napari's own Points-layer writer
-produces, so a file written by place_landmarks.py can be dragged back into
-napari, and one exported from napari can be fed to any tool here.
+produces. Landmarks are placed in napari itself (open the image, add a Points
+layer, save it), so a CSV exported from there can be fed straight to any tool
+here, and one written by this module can be dragged back into napari.
 
 The three coordinate columns are VOXEL indices in the image's own numpy array
 order, `(z, y, x)`, axis 0 being the real imaging/atlas planes. That is what
@@ -28,14 +29,12 @@ coordinates that are wrong everywhere and flagged nowhere.
 ROW ORDER IS THE PAIRING
 ------------------------
 Nothing in the file names a landmark. Row i in a sample CSV and row i in the
-atlas CSV are "the same anatomical location" purely by convention, so the
-tools that consume a pair (registration_eval.py's compute_tre,
-fit_initial_transform.py's fit) are only as correct as that ordering.
-read_landmark_csv() cannot check it; fit_initial_transform.py's residual table
-is what catches a mis-ordered row after the fact.
+atlas CSV are "the same anatomical location" purely by convention, so
+registration_eval.py's compute_tre is only as correct as that ordering.
+read_landmark_csv() cannot check it -- a mis-ordered row shows up as one
+landmark with a wildly larger TRE than the rest, and nowhere else.
 
-Not runnable on its own -- imported by place_landmarks.py,
-fit_initial_transform.py, registration_eval.py and the tests.
+Not runnable on its own -- imported by registration_eval.py and the tests.
 """
 from pathlib import Path
 
@@ -62,8 +61,8 @@ def read_landmark_csv(csv_path, shape_zyx=None, role="landmark"):
     if missing:
         raise ValueError(
             f"{csv_path} is missing column(s) {missing}; found {list(df.columns)}.\n"
-            f"Expected the index,axis-0,axis-1,axis-2 layout place_landmarks.py "
-            f"(and napari's own Points writer) produces.")
+            f"Expected the index,axis-0,axis-1,axis-2 layout napari's own "
+            f"Points-layer writer produces.")
     if len(df) == 0:
         raise ValueError(f"{csv_path} has no rows.")
 

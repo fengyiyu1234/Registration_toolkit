@@ -17,9 +17,9 @@ assignments in cell_registration.csv.
 Usage (needs a display; the antsreg env has napari+PyQt5+SimpleITK alongside
 antspyx -- one env for the whole pipeline):
     conda activate antsreg
-    python edit_sample_labels.py                 # form window, then napari
-    python edit_sample_labels.py --no-form       # straight to napari, from the config
-    python edit_sample_labels.py configs/edit_sample_labels.s12t.yaml
+    python tools/edit_sample_labels.py                 # form window, then napari
+    python tools/edit_sample_labels.py --no-form       # straight to napari, from the config
+    python tools/edit_sample_labels.py configs/edit_sample_labels.s12t.yaml
 
     # A form window opens for the sample/labels/output paths and the ontology
     # options, pre-filled from configs/edit_sample_labels.yaml if that exists
@@ -118,7 +118,13 @@ from PyQt5.QtWidgets import (
 # atlas_utils/mask_utils are pure json/numpy/scipy at this import level
 # (atlas_utils only imports ants lazily, inside get_allen_atlas).
 from registration_ants import atlas_utils, mask_utils
-import _local_config  # sibling module
+
+# Run as `python tools/<name>.py`, so sys.path[0] is tools/, not the repo
+# root -- put the root on it before importing anything from shared/.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from shared import local_config  # configs/<tool>.yaml
 
 
 _FORM_FIELDS = [
@@ -203,11 +209,11 @@ def _load_structures(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Hand-correct labels_in_sample.nii.gz")
-    _local_config.add_config_arg(parser, "edit_sample_labels")
-    _local_config.add_no_form_arg(parser)
+    local_config.add_config_arg(parser, "edit_sample_labels")
+    local_config.add_no_form_arg(parser)
     cli = parser.parse_args()
 
-    form = _local_config.resolve_inputs(
+    form = local_config.resolve_inputs(
         "edit_sample_labels", "Edit Sample Labels", _FORM_FIELDS, cli.config, cli.no_form)
     args = SimpleNamespace(
         sample_path=form["sample_path"],

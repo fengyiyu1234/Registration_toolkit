@@ -1,6 +1,6 @@
 """Shared Qt widgets for browsing an ontology tree.
 
-Used by both paint_mask.py's region-assignment panel and atlas_view.py's
+Used by both paint_mask.py's region-assignment panel and tools/atlas_view.py's
 region-selection panel -- the same searchable QTreeWidget, just wired to a
 different action once a node is picked (assign it to a brush label, vs.
 highlight it in the atlas). `scrollable` is a second, more general widget

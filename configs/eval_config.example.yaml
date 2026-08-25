@@ -4,17 +4,15 @@
 #   python registration_eval.py configs/eval_config.yaml
 #
 # 每个样本先在 ../Registration_ants 跑一遍配准 pipeline 得到
-# labels_in_sample.nii.gz，再用下面两条路子之一产出 ground truth：
-#   - edit_sample_labels.py：挑几个关心的脑区手工修正已有的配准标签、逐个
-#     "Save This Region" 单独导出成二值 mask；
-#   - annotate_gt_sam.py：在预先锁定的稀疏 z 层上用 micro_sam 点提示从头画。
-# 两者都会在 mask 旁边写 <...>.annotated_slices.json，下面的 use_annotation_hints
-# 会自动读取。不需要同时修完所有区域，某个样本某个区域还没标注就不写那个
-# key，跳过就行。
+# labels_in_sample.nii.gz，再用 tools/edit_sample_labels.py 产出 ground truth：
+# 挑几个关心的脑区手工修正已有的配准标签、逐个 "Save This Region" 单独导出成
+# 二值 mask。它会在 mask 旁边写 <...>.annotated_slices.json，下面的
+# use_annotation_hints 会自动读取。不需要同时修完所有区域，某个样本某个区域还
+# 没标注就不写那个 key，跳过就行。
 #
-# 算指标之前先跑一遍 align_masks.py，确认每个 mask 跟源图像的 spacing/origin/
-# direction 完全一致——差一个体素的偏移在可视化里看不出来，但会系统性污染
-# HD95 这类表面距离指标。
+# 不管 mask 从哪来，算指标之前都要确认它跟源图像的 spacing/origin/direction
+# 完全一致——差一个体素的偏移在可视化里看不出来，但会系统性污染 HD95 这类
+# 表面距离指标。
 
 # 可选：复用 stats_config.yaml 里已经维护的 TSC/normal 分组，不写就都是 "unknown"。
 groups_manifest: /path/to/stats_config.yaml
@@ -29,7 +27,7 @@ dice_regions:
   - Cerebellum
   - Cerebellar cortex
 
-# 一般不需要手动填这个：edit_sample_labels.py 的 "Save This Region" 会给每个
+# 一般不需要手动填这个：tools/edit_sample_labels.py 的 "Save This Region" 会给每个
 # 区域的 mask 自动写一个 <...>_corrected_mask.annotated_slices.json，记录你实际手绘过
 # 哪几层（其余是插值猜的），下面 use_annotation_hints 默认就会按区域自动读取、只在那几层
 # 上算 Dice/HD95，不需要在这里重复填。只有你想让**所有区域**都强制用同一组 z 平面
@@ -55,7 +53,8 @@ samples:
     sample_resolution_um: 25               # 通常等于 registration.fine_target_um
     atlas_resolution_um: 25
 
-    # M1 TRE：place_landmarks.py 分别在 sample/atlas 上放的匹配点对（可选）。
+    # M1 TRE：在 napari 里分别给 sample 和 atlas 加一个 Points 图层、按同样的
+    # 顺序点同样的解剖点，各自存成 CSV（可选）。
     # sample_landmarks_csv: /path/to/mouse01_sample_landmarks.csv
     # atlas_landmarks_csv: /path/to/atlas_landmarks.csv
     # cortex_landmark_idx: [0, 1, 2]        # 可选：这几个点单独再报一次皮层子集的 TRE
@@ -63,7 +62,7 @@ samples:
     # M2/M3 全脑轮廓：paint_mask.py（KIND="mask"）手工修正的全脑二值 mask（可选）。
     # sample_brain_mask_corrected: /path/to/mouse01_brain_mask_corrected.nii.gz
 
-    # M2/M3 逐脑区 ground truth：edit_sample_labels.py 里每个区域单独
+    # M2/M3 逐脑区 ground truth：tools/edit_sample_labels.py 里每个区域单独
     # "Save This Region" 导出的二值 mask，key 用跟 dice_regions 完全一样的名字。
     # 只标注了一部分区域也没关系，其余的 key 不写就会被跳过（不报错）。
     dice_region_masks:

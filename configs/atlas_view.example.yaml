@@ -1,10 +1,10 @@
-# atlas_view.py 的配置模板。复制成 configs/atlas_view.yaml（gitignored）
+# tools/atlas_view.py 的配置模板。复制成 configs/atlas_view.yaml（gitignored）
 # 再改成本机的真实路径：
 #
 #   cp configs/atlas_view.example.yaml configs/atlas_view.yaml
 #   conda activate antsreg
-#   python atlas_view.py                       # 无命令行参数
-#   python atlas_view.py configs/atlas_view.devccf.yaml   # 或显式指定另一份
+#   python tools/atlas_view.py                       # 无命令行参数
+#   python tools/atlas_view.py configs/atlas_view.devccf.yaml   # 或显式指定另一份
 
 # 必需：annotation + ontology。这是一个独立的图谱浏览器，跟 paint_mask.py
 # 互不联动 -- 两边各自的 configs/*.yaml 可以指向同一份图谱，但改这边不会影响

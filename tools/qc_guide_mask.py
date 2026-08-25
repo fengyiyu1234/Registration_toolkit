@@ -33,10 +33,10 @@ between painting and registering.
 Usage (antsreg env; --napari needs a display):
 
     cp configs/qc_guide_mask.example.yaml configs/qc_guide_mask.yaml   # once
-    python qc_guide_mask.py                        # uses configs/qc_guide_mask.yaml
-    python qc_guide_mask.py configs/other.yaml     # or an explicit one
-    python qc_guide_mask.py --napari               # + open the mask in napari
-    python qc_guide_mask.py --no-atlas             # interpolation only, no atlas
+    python tools/qc_guide_mask.py                        # uses configs/qc_guide_mask.yaml
+    python tools/qc_guide_mask.py configs/other.yaml     # or an explicit one
+    python tools/qc_guide_mask.py --napari               # + open the mask in napari
+    python tools/qc_guide_mask.py --no-atlas             # interpolation only, no atlas
 
 The config only points at the ../Registration_ants pipeline config for the
 sample being audited; every path this tool needs (painted mask, its voxel size,
@@ -59,7 +59,11 @@ import numpy as np
 
 from registration_ants import atlas_utils, config as config_mod
 
-import _local_config  # sibling module
+# Run as `python tools/<name>.py`, so sys.path[0] is tools/, not the repo
+# root -- put the root on it before importing anything from shared/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from shared import local_config  # configs/<tool>.yaml
 
 TOOL = "qc_guide_mask"
 
@@ -249,7 +253,7 @@ def open_napari(dense, raw_path, voxel_size_um, names):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    _local_config.add_config_arg(ap, TOOL)
+    local_config.add_config_arg(ap, TOOL)
     ap.add_argument("--registration-config",
                     help="audit this ../Registration_ants pipeline config directly, "
                          "ignoring configs/%s.yaml" % TOOL)
@@ -268,7 +272,7 @@ def main():
         reg_config_path = args.registration_config
         local = {}
     else:
-        local = _local_config.load_config(TOOL, args.config, required=("registration_config",))
+        local = local_config.load_config(TOOL, args.config, required=("registration_config",))
         reg_config_path = local["registration_config"]
     if not Path(reg_config_path).exists():
         sys.exit(f"registration_config does not exist: {reg_config_path}")
