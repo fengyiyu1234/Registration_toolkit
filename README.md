@@ -36,7 +36,7 @@ tools/                   the smaller runnable tools
   convert_regions_ontology.py
 
 configs/                 <tool>.example.yaml tracked, <tool>.yaml gitignored
-tests/
+tests/                   headless, plus test_gui_smoke.py which builds real windows
 ```
 
 `configs/` and `.dialog_state/` live at the **repo root**, not inside `shared/`,
@@ -88,10 +88,13 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
     ontology tree. Sparse keyframes, each label interpolated separately.
   - `mode: labels` — start from a finished registration
     (`<name>_labels_in_sample.nii.gz`) collapsed into a *partition* of brush
-    labels, and correct only what came out wrong. A plane that differs from
-    the registration anywhere becomes a whole-plane keyframe (every region on
-    it, not just the edit), and two volumes come out: a sparse guide to
-    re-register with, and a dense one to re-open and carry on from. The
+    labels, and correct only what came out wrong. The canvas is still the raw
+    stack: the registration output is regridded up onto it, so you draw at
+    2.6 µm on planes that were actually imaged rather than at 25 µm on
+    interpolated ones. A plane that differs from the registration anywhere
+    becomes a whole-plane keyframe (every region on it, not just the edit),
+    and two volumes come out: a sparse guide to re-register with, and a dense
+    one to re-open and carry on from. The
     partition is refined one region at a time — expand `Hippocampal
     formation` into CA/DG without changing how coarsely the cerebellum is
     described — and the atlas-side subtraction that nesting requires
@@ -266,8 +269,21 @@ conda activate antsreg
 python paint_mask.py --selftest
 python tools/atlas_view.py --selftest
 python shared/atlas_reference.py --selftest
+python shared/label_partition.py --selftest
 python tests/test_tool_inputs_smoke.py
 python tests/test_registration_eval_smoke.py
+python tests/test_gui_smoke.py            # builds real napari windows, ~3 s
 ```
 
-Manual-assert style, no pytest, matching `../Registration_ants/tests/`.
+Manual-assert style, no pytest, matching `../Registration_ants/tests/`. Everything
+except the last one is headless by design and runs over ssh unchanged.
+
+`test_gui_smoke.py` is the exception: it opens the actual windows, because that is
+the only way to cover the parts the `--selftest`s cannot reach — whether clicking
+**Expand** really recollapses the paint layer, whether **Export** writes its five
+files, whether the fill/outline checkbox reaches the layers it names. It needs no
+display of its own: on Linux it re-execs itself under `xvfb-run` (preferred even
+when `$DISPLAY` is set, since a forwarded X11 display advertises GL 1.4 and
+napari's shaders will not compile against it), and skips with a message if there
+is no working GL context to be had. `GUI_SMOKE_USE_DISPLAY=1` forces the current
+display instead, for watching the windows go by.

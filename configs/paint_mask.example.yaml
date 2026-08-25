@@ -37,27 +37,43 @@ display_scale_zyx: [32.0, 2.6, 2.6]
 #
 #   mode: labels
 #
-# 改成 labels 之后，上面的字段含义有两处变化：
-#   image_path   变成【配准实际跑的那份重采样图】（<name>_fine_25um.nii.gz），
-#                不是原始 tif —— 它必须和 labels_path 在同一个网格上。
-#   output_path  是【稀疏 guide】的输出：只有改过的层 + 层间插值，两端留空，
-#                拿去填 mask.guide_regions 重新配准。
+# 【画布仍然是原始 tif】，和 guide 模式完全一样 —— image_path 不用改。
+# 配准结果（labels_in_sample，在 25um 各向同性网格上）会被重网格到原图网格上
+# 叠在原图上给你画。反过来做（把你拖到 25um 网格上画）会丢掉面内约 8 倍的
+# 细节，而且那上面的 z 层是插值出来的、不是真正扫出来的成像平面。
+#
+# 只有 output_path 的含义变了：现在它是【稀疏 guide】—— 只有改过的层加层间
+# 插值，两端留空，拿去填 mask.guide_regions 重新配准。仍然在原图网格上，所以
+# 导出时打印的 voxel_size_um 和 guide 模式是同一个值。
 #
 # 新增字段：
 
-# 跑完配准得到的标签图。工具把它按 partition 折成画笔号当底图。
+# 原图的体素尺寸 (x, y, z)，微米。mode: labels 下这一项【必填且会影响结果】
+# （不像 display_scale_zyx 只影响显示）—— 原始 tif 头里没有体素尺寸，而把
+# 配准结果搬到原图网格上正需要它。不写的话会退回用 display_scale_zyx 反序。
+# voxel_size_um: [2.6, 2.6, 32.0]
+
+# 跑完配准得到的标签图。会按 partition 折成画笔号、再重网格到原图网格当底图。
 # labels_path: /data/.../s12t/DevCCF/tsc12t_labels_in_sample.nii.gz
 
-# 【稠密】输出：每一层都有值（改过的层照你画的，层间插值，两端保留原始配准）。
-# 下次打开就读它继续画。不写的话默认是 output_path 加 _atlas 后缀。
+# 可选。labels_path 的体素尺寸默认从它自己的 NIfTI 头里读：本项目自己写出来的
+# 文件 spacing 直接就是微米（读回来是 25.0），外部下载的按 NIfTI 惯例是毫米
+# （DevCCF 读回来是 0.02）—— 两种都支持，按数量级区分并打印用了哪种。
+# 两种都不对时用这一项强制指定。
+# labels_voxel_size_um: [25.0, 25.0, 25.0]
+
+# 【稠密】输出：每一层都有值（改过的层照你画的，层间插值，两端保留原始配准），
+# 同样在原图网格上。下次打开就读它继续画。不写的话默认是 output_path 加
+# _atlas 后缀。
 # 注意它旁边会写一份 .keyframes.json，记着哪些层是真手画的、真正的 baseline
-# 是哪个文件 —— 续做时只有那几层会被读回来，其余从 labels_path 重新折叠。
-# 不这么做的话，这一轮的插值猜测会变成下一轮的"真值"，每次都漂得更远。
+# 是哪个文件、以及两个网格各自的尺寸 —— 续做时只有那几层会被读回来，其余从
+# labels_path 重新折叠重网格。不这么做的话，这一轮的插值猜测会变成下一轮的
+# "真值"，每次都漂得更远。
 # atlas_output_path: /data/.../s12t/DevCCF/tsc12t_corrected_atlas.nii.gz
 
 # 起始 partition（画笔号 -> 脑区 id）。指向任何一份 .regions.json 都行 ——
 # 包括 mode: guide 自己导出的那份，所以可以直接从已经画好的 guide 接着细化。
-# 不给的话就用下面 region_ids 里写的。
+# 不给的话就用上面 region_ids 里写的。
 # partition_path: /home/fyu7/My_project/Registration_ants/atlas/mask/s12t_DeMBAguide7.regions.json
 
 # 展开一个分组时，小于这个体积的子结构不单独成组，留在父组里。
@@ -65,6 +81,6 @@ display_scale_zyx: [32.0, 2.6, 2.6]
 # 方向拽，比不加引导更糟（见 Registration_ants/configs/config.example.yaml）。
 # min_region_mm3: 1.0
 
-# mode: labels 下 voxel_size_um 不用手填 —— labels_path 是 NIfTI，头里有真实
-# spacing，导出时直接读出来写进可粘贴的 config 片段。display_scale_zyx 只在
-# 头里是 (1,1,1) 时才作为兜底。
+# 【导出耗时】在原图网格上导出是分钟级不是秒级：层间插值要为每个区域、每对
+# 相邻 keyframe 各算一次 signed-distance 场，实测 3974x2273 的平面上一次约
+# 0.5 秒。36 个 keyframe 配十来个区域大约 15-20 分钟，进度打在终端里。

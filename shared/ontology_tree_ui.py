@@ -4,7 +4,8 @@ Used by both paint_mask.py's region-assignment panel and tools/atlas_view.py's
 region-selection panel -- the same searchable QTreeWidget, just wired to a
 different action once a node is picked (assign it to a brush label, vs.
 highlight it in the atlas). `scrollable` is a second, more general widget
-both panels also need for the same reason: see its own docstring.
+both panels also need for the same reason: see its own docstring, and
+`shrinkable`/`set_dock_width` for the width half of the same problem.
 
 PyQt5 is imported lazily inside the functions below rather than at module
 scope, the same pattern paint_mask.py's own _import_gui() uses -- both
@@ -21,6 +22,50 @@ def _import_qt():
     from PyQt5.QtCore import Qt as _Qt
     from PyQt5.QtWidgets import QTreeWidgetItem as _QTreeWidgetItem, QScrollArea as _QScrollArea
     Qt, QTreeWidgetItem, QScrollArea = _Qt, _QTreeWidgetItem, _QScrollArea
+
+
+def shrinkable(widget):
+    """Let a panel be dragged to any width, by dropping the minimum width Qt
+    would otherwise compute from its contents.
+
+    Without this a dock is effectively fixed-width, and it is never obvious
+    why: Qt derives a widget's minimum width from its children's
+    minimumSizeHint, and a QLabel's is the width of its longest line (or, for
+    a word-wrapped one, its whole laid-out text). That propagates up
+    dock content -> QDockWidget -> QMainWindow, so one long caption pins the
+    panel and the splitter simply refuses to move past it. An explicit
+    minimum of 1 overrides the hint; the caption then clips or scrolls
+    instead of dictating the layout.
+
+    Note this is only half the job when the panel ALSO carries an explicit
+    setMaximumWidth -- that caps widening, which no minimum can undo. Use
+    set_dock_width for a starting width instead of a maximum.
+
+    tools/atlas_view.py has its own private copy of this (_shrinkable) from
+    before it was shared; the two are the same one-liner.
+    """
+    _import_qt()
+    widget.setMinimumWidth(1)
+    return widget
+
+
+def set_dock_width(dock_widget, width):
+    """Give a dock a sensible STARTING width without pinning it there.
+
+    The obvious way to make a panel start at 320 px is setMaximumWidth(320),
+    and that is what makes it un-widenable forever after -- the complaint
+    this function exists to remove. QMainWindow.resizeDocks sets the width
+    once, as a layout request, leaving both edges draggable afterwards.
+
+    Reaches the main window through the dock's parent rather than napari's
+    private _qt_window, and does nothing if that is not a QMainWindow: a
+    napari layout change should cost the starting width, not raise.
+    """
+    _import_qt()
+    window = dock_widget.parent() if hasattr(dock_widget, "parent") else None
+    if window is not None and hasattr(window, "resizeDocks"):
+        window.resizeDocks([dock_widget], [width], Qt.Horizontal)
+    return dock_widget
 
 
 def tree_label(sid, info, voxels):

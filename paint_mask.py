@@ -20,6 +20,16 @@ for mask.guide_regions; they differ in what you start from.
     "mode: labels" section further down, and shared/label_partition.py for
     the measured reason a uniform ontology depth is not a usable knob.
 
+    THE CANVAS IS STILL THE RAW STACK. The registration output arrives on
+    the isotropic grid registration ran on (25 um), and is regridded up onto
+    image_path's grid to be overlaid -- never the other way round. Painting
+    on the isotropic grid would mean drawing at 25 um on planes that were
+    interpolated into existence, instead of at 2.6 um on the planes that
+    were actually imaged; pipeline.py's _build_guide_regions_from_labels
+    says the same thing about where a painted volume has to live. So
+    image_path, the exported grid, and the voxel_size_um that goes into the
+    pipeline config are identical to guide mode's.
+
 A guide outline marks a structure that is genuinely present in both images
 but needs help being aligned correctly (e.g. a bulged/deformed patch of
 cortex that keeps ending up mapped to background). It is NOT an
@@ -234,6 +244,13 @@ def _load_local_config(cli_path=None):
         atlas_output_path=cfg.get("atlas_output_path") or None,
         partition_path=cfg.get("partition_path") or None,
         min_region_mm3=float(cfg.get("min_region_mm3", label_partition.DEFAULT_MIN_MM3)),
+        # In mode: labels this is LOAD-BEARING, not cosmetic like
+        # display_scale_zyx: the registration output has to be regridded onto
+        # the raw stack before it can be overlaid on it, and the raw stack's
+        # header does not carry a voxel size (see the module docstring).
+        voxel_size_um=list(cfg["voxel_size_um"]) if cfg.get("voxel_size_um") else None,
+        labels_voxel_size_um=(list(cfg["labels_voxel_size_um"])
+                              if cfg.get("labels_voxel_size_um") else None),
     )
 
 
@@ -347,6 +364,12 @@ def _load_mask_array(path, expected_shape):
 # (_qt/layer_controls/widgets/_labels/qt_brush_size_slider.py). A guide
 # outline is painted on planes several hundred voxels across, so 40 is a
 # small dot -- both to fill a region and, mostly, to rub one out again.
+# Starting width of the region panels, in px. A STARTING width, not a cap:
+# the panels are ontology_tree_ui.shrinkable, so both edges stay draggable --
+# a 12-deep tree of region names needs whatever width the names need, and
+# that is not something a constant can know.
+_ONTOLOGY_PANEL_START_PX = 380
+
 MAX_BRUSH_SIZE = 100
 
 
@@ -491,6 +514,7 @@ def _make_export_dock(viewer, status_label, on_export, button_text, panel_name):
     layout = QVBoxLayout(dock)
     layout.addWidget(ontology_tree_ui.scrollable(status_label, 120))
     layout.addWidget(export_btn)
+    ontology_tree_ui.shrinkable(dock)
     viewer.window.add_dock_widget(dock, area="right", name=panel_name)
 
 
@@ -563,7 +587,43 @@ def _add_relabel_panel(viewer, paint_layer, on_change=None):
     layout.addWidget(fill_btn)
     layout.addWidget(all_btn)
     layout.addWidget(ontology_tree_ui.scrollable(status, 60))
+    ontology_tree_ui.shrinkable(dock)
     viewer.window.add_dock_widget(dock, area="right", name="Relabel")
+
+
+def _add_display_panel(viewer, layers):
+    """A fill/outline switch for the region layers.
+
+    napari's Labels layers are FILLED by default (contour = 0) and this tool
+    has never changed that -- filled is what shows which region a blob
+    actually is. The switch is here for the other half of the job: dropping
+    to a 1-voxel contour uncovers the raw stack underneath, which is how you
+    check whether a boundary sits where the tissue boundary sits. napari's
+    own layer controls carry the same `contour` field per layer; this drives
+    every region layer at once and puts it where it gets used.
+
+    single_sample.py has the same checkbox, with the same default, so the two
+    tools agree about what "showing a region" looks like.
+    """
+    layers = [layer for layer in layers if layer is not None]
+
+    def on_toggled(checked):
+        for layer in layers:
+            layer.contour = 1 if checked else 0
+
+    checkbox = QCheckBox("Region outline only (unchecked = filled)")
+    checkbox.setChecked(False)
+    checkbox.toggled.connect(on_toggled)
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(checkbox)
+    layout.addWidget(QLabel(
+        "Filled shows what each region IS; outline uncovers the image under it,\n"
+        "for checking a boundary against the tissue."))
+    ontology_tree_ui.shrinkable(dock)
+    viewer.window.add_dock_widget(dock, area="right", name="Display")
+    return checkbox
 
 
 def _add_erase_panel(viewer, paint_layer):
@@ -635,6 +695,7 @@ def _add_erase_panel(viewer, paint_layer):
     layout.addWidget(polygon_btn)
     layout.addWidget(brush_btn)
     layout.addWidget(ontology_tree_ui.scrollable(status, 80))
+    ontology_tree_ui.shrinkable(dock)
     viewer.window.add_dock_widget(dock, area="right", name="Erase")
 
 
@@ -1126,7 +1187,11 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     row_layout.addWidget(remove_btn)
     layout.addWidget(row)
     layout.addWidget(ontology_tree_ui.scrollable(assign_label, 80))
-    viewer.window.add_dock_widget(dock, area="left", name="Atlas / Ontology")
+    ontology_tree_ui.shrinkable(dock)
+    ontology_tree_ui.shrinkable(tree)
+    ontology_tree_ui.set_dock_width(
+        viewer.window.add_dock_widget(dock, area="left", name="Atlas / Ontology"),
+        _ONTOLOGY_PANEL_START_PX)
 
     refresh_filter()
     refresh_assignment()
@@ -1261,6 +1326,7 @@ def _run_guide(args):
 
     _add_relabel_panel(viewer, paint_layer, on_change=_assignment_follows_relabel)
     _add_erase_panel(viewer, paint_layer)
+    _add_display_panel(viewer, [paint_layer])
 
 
 # =====================================================================================
@@ -1411,7 +1477,7 @@ def _labels_sidecar_path(atlas_output_path):
 
 
 def write_labels_sidecar(atlas_output_path, guide_output_path, labels_path, result,
-                         partition, structures, total_z):
+                         partition, structures, total_z, grids=None):
     """<atlas_output>.keyframes.json -- what makes the dense volume safely
     re-openable.
 
@@ -1436,6 +1502,10 @@ def write_labels_sidecar(atlas_output_path, guide_output_path, labels_path, resu
         "region_names": {str(g.label): g.name for g in partition},
         "parents": {str(g.label): g.parent.label for g in partition if g.parent is not None},
         "atlas_exclude_ids": {str(k): v for k, v in partition.atlas_exclude_ids(structures).items()},
+        # Both grids, because the volumes here are on the raw stack's while
+        # baseline_labels_path points at one on the registration's -- a resume
+        # has to regrid again and the two voxel sizes are in neither header.
+        "grids": grids,
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
 
@@ -1479,17 +1549,57 @@ def load_labels_resume(atlas_output_path, structures, expected_shape):
     )
 
 
-def voxel_size_um_from_spacing(spacing_xyz):
-    """A NIfTI's own (x,y,z) spacing -> the pipeline's voxel_size_um.
+def labels_voxel_size_um(spacing_xyz, override=None):
+    """The (x,y,z) micron voxel size of a labels_in_sample.nii.gz.
 
-    Unlike the raw registration.tif of guide mode, labels_in_sample.nii.gz
-    carries a real spacing, in MILLIMETRES by NIfTI convention (the DevCCF
-    20 um files read back as 0.02). Returns None for a (1,1,1) header, which
-    means the file never had one and the value must come from the config.
+    Every image this codebase writes carries spacing DIRECTLY IN MICRONS
+    (io_utils.load_tiff_stack_as_ants / resample_to_isotropic are handed
+    micron values and never divide), so a pipeline output reads back as
+    25.0, not 0.025. Files from elsewhere follow the NIfTI convention and
+    are in millimetres -- the DevCCF downloads read back as 0.02. Both have
+    to work here, and getting it wrong by 1000x silently regrids the labels
+    to a sliver of the stack rather than erroring, so the two cases are told
+    apart by magnitude and the choice is announced.
+
+    override wins outright, for the case where neither guess is right.
     """
-    if not spacing_xyz or all(abs(s - 1.0) < 1e-6 for s in spacing_xyz):
-        return None
-    return [round(float(s) * 1000.0, 4) for s in spacing_xyz]
+    if override:
+        return [float(v) for v in override]
+    spacing = [float(s) for s in spacing_xyz]
+    if all(abs(s - 1.0) < 1e-6 for s in spacing):
+        raise ValueError(
+            "labels_path has no voxel size in its header (spacing is 1,1,1). Set "
+            "labels_voxel_size_um in the config -- it is needed to overlay the labels on "
+            "the raw stack, so it cannot be guessed.")
+    if max(spacing) < 1.0:
+        print(f"[labels] header spacing {spacing} is below 1, reading it as MILLIMETRES "
+              f"-> {[s * 1000 for s in spacing]} um. Set labels_voxel_size_um to override.")
+        return [s * 1000.0 for s in spacing]
+    return spacing
+
+
+def regrid_nearest(arr_zyx, src_spacing_zyx, dst_shape_zyx, dst_spacing_zyx):
+    """Nearest-neighbour regrid of a label volume between two axis-aligned
+    grids that share physical origin 0 and identity direction.
+
+    That precondition is not an assumption, it is this codebase's invariant:
+    io_utils.load_tiff_stack_as_ants and resample_to_isotropic never pass a
+    nonzero origin or a non-default direction, and io_utils.crop_to_bounds
+    shifts origin precisely so a crop stays in the same physical space. So
+    the mapping is one multiplication per axis and needs no transform.
+
+    Done as a gather rather than through ants.resample_image_to_target
+    because the destination here is the raw stack -- 2273x3974x157 for the
+    s12t sample. A float32 ANTs round trip of that is ~5.7 GB per copy;
+    indexing a uint8 array straight into place is one output-sized
+    allocation and no interpolation to get wrong on discrete ids.
+    """
+    idx = []
+    for axis in range(3):
+        scale = float(dst_spacing_zyx[axis]) / float(src_spacing_zyx[axis])
+        pos = np.rint(np.arange(dst_shape_zyx[axis]) * scale).astype(np.int64)
+        idx.append(np.clip(pos, 0, arr_zyx.shape[axis] - 1))
+    return arr_zyx[np.ix_(*idx)]
 
 
 def _seed_partition(args, structures, resume):
@@ -1609,14 +1719,29 @@ def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels
     layout.addWidget(row)
     layout.addWidget(isolate)
     layout.addWidget(ontology_tree_ui.scrollable(status, 100))
-    viewer.window.add_dock_widget(dock, area="left", name="Partition")
+    ontology_tree_ui.shrinkable(dock)
+    ontology_tree_ui.shrinkable(listing)
+    ontology_tree_ui.set_dock_width(
+        viewer.window.add_dock_widget(dock, area="left", name="Partition"),
+        _ONTOLOGY_PANEL_START_PX)
     refresh()
     return SimpleNamespace(refresh=refresh)
 
 
 def _run_labels(args):
     """`mode: labels` -- correct a finished registration, export a guide to
-    re-register with plus a dense volume to carry on from."""
+    re-register with plus a dense volume to carry on from.
+
+    Everything happens on the RAW stack's grid, not on the isotropic grid the
+    registration ran on. That is not a preference: the resample to 25 um
+    throws away ~8x of the in-plane detail (2.6 um pixels become 25 um ones)
+    and replaces the real imaging planes with interpolated ones, so the
+    boundaries being corrected are no longer resolvable by eye and the plane
+    being drawn on is not a plane that was ever imaged.
+    pipeline.py's _build_guide_regions_from_labels already states this as the
+    convention for the painted volume; the registration output is brought TO
+    that grid here, rather than the painting being dragged down to it.
+    """
     _import_gui()
     if not args.labels_path:
         raise ValueError("mode: labels needs labels_path (the <name>_labels_in_sample.nii.gz "
@@ -1624,18 +1749,32 @@ def _run_labels(args):
     if not args.atlas:
         raise ValueError("mode: labels needs atlas_annotation_path + ontology_path: the "
                          "partition is expressed in that ontology's ids")
+    raw_voxel_um = args.voxel_size_um or voxel_size_um_from_display_scale(args.display_scale_zyx)
+    if not raw_voxel_um:
+        raise ValueError(
+            "mode: labels needs voxel_size_um: [x, y, z] for image_path -- the raw stack's "
+            "header does not carry one, and it is what puts the registration output onto the "
+            "same grid. (display_scale_zyx is accepted as a fallback, reversed.)")
 
     atlas_output_path = args.atlas_output_path or str(
         _output_stem(args.output_path).with_name(_output_stem(args.output_path).name + "_atlas.nii.gz"))
 
-    labels_sitk, original_labels = _read_sitk_array(args.labels_path)
-    original_labels = original_labels.astype(np.uint32)
-    _, sample_arr = _read_sitk_array(args.image_path)
-    if sample_arr.shape != original_labels.shape:
-        raise ValueError(
-            f"image_path {sample_arr.shape} and labels_path {original_labels.shape} are on "
-            f"different grids. In this mode image_path is the resampled sample the "
-            f"registration ran on (e.g. <name>_fine_25um.nii.gz), not the raw stack.")
+    raw_sitk, sample_arr = _read_sitk_array(args.image_path)
+    labels_sitk, fine_labels = _read_sitk_array(args.labels_path)
+    fine_labels = fine_labels.astype(np.uint32)
+    fine_voxel_um = labels_voxel_size_um(labels_sitk.GetSpacing(), args.labels_voxel_size_um)
+
+    raw_spacing_zyx = list(reversed(raw_voxel_um))
+    fine_spacing_zyx = list(reversed(fine_voxel_um))
+    print(f"[grids] raw stack   {sample_arr.shape} (z,y,x) @ {raw_spacing_zyx} um\n"
+          f"[grids] registration {fine_labels.shape} (z,y,x) @ {fine_spacing_zyx} um")
+    covered = [f * n for f, n in zip(fine_spacing_zyx, fine_labels.shape)]
+    extent = [s * n for s, n in zip(raw_spacing_zyx, sample_arr.shape)]
+    if any(c < 0.9 * e for c, e in zip(covered, extent)):
+        print(f"WARNING: the registration grid spans {[round(c) for c in covered]} um but the raw "
+              f"stack spans {[round(e) for e in extent]} um. Either the two are not the same "
+              f"sample, or a voxel size is wrong -- check voxel_size_um and labels_voxel_size_um "
+              f"before painting, because the overlay will be silently offset.")
 
     atlas = atlas_reference.load_atlas_reference(args.atlas, include_template=False)
     structures = atlas.structures
@@ -1649,7 +1788,7 @@ def _run_labels(args):
               "scales with its cube, so set it if the atlas is not 25 um.")
     voxel_mm3 = (res_um / 1000.0) ** 3 * (atlas.downsample ** 3)
 
-    resume = load_labels_resume(atlas_output_path, structures, original_labels.shape)
+    resume = load_labels_resume(atlas_output_path, structures, sample_arr.shape)
     partition, seed_note = _seed_partition(args, structures, resume)
     if resume is not None and resume.baseline_labels_path and \
             Path(resume.baseline_labels_path).resolve() != Path(args.labels_path).resolve():
@@ -1658,7 +1797,18 @@ def _run_labels(args):
               f"         but labels_path is\n           {args.labels_path}\n"
               f"         Resuming anyway, but the restored planes describe the other volume.")
 
-    state = {"baseline": partition.collapse(original_labels, structures)}
+    def baseline_for(partition):
+        """The registration output in brush space, on the RAW grid.
+
+        Collapsed first and regridded second, deliberately: collapsing works
+        on the small isotropic volume (~20M voxels) and turns uint32 ids into
+        uint8 brush labels, so the one array that reaches the raw grid's ~1.4e9
+        voxels is a byte per voxel instead of four.
+        """
+        return regrid_nearest(partition.collapse(fine_labels, structures), fine_spacing_zyx,
+                              sample_arr.shape, raw_spacing_zyx)
+
+    state = {"baseline": baseline_for(partition)}
     prefill = state["baseline"].copy()
     if resume is not None:
         for z, plane in resume.planes.items():
@@ -1672,28 +1822,56 @@ def _run_labels(args):
         title="Correct a registration result", layer_name="regions (paint here)")
     paint_layer.opacity = 0.5
     scale_kwargs = {"scale": args.display_scale_zyx} if args.display_scale_zyx else {}
-    # The untouched registration output, to compare a keyframe against after
+    # The untouched registration, to compare a keyframe against once
     # interpolation has overwritten the planes between two of them in the
-    # dense volume. Hidden by default: it is a reference, not a target.
-    reference = viewer.add_labels(original_labels, name="original labels (read-only)",
+    # dense volume. In brush space rather than raw ontology ids: that is the
+    # comparison that matters here, and a uint32 copy of the raw grid would
+    # cost 4x this one for no extra information. Hidden by default.
+    reference = viewer.add_labels(state["baseline"], name="registration as-is (read-only)",
                                   visible=False, opacity=0.4, **scale_kwargs)
     reference.editable = False
 
     status_label = QLabel("")
     status_label.setWordWrap(True)
+    hover_label = QLabel("Under cursor: -")
 
     def on_partition_changed():
-        new_baseline = partition.collapse(original_labels, structures)
+        new_baseline = baseline_for(partition)
         paint_layer.data = recollapse_keeping_edits(
             paint_layer.data, state["baseline"], new_baseline)
         state["baseline"] = new_baseline
+        reference.data = new_baseline
 
     panel = _add_partition_panel(viewer, paint_layer, partition, structures, atlas.node_voxels,
                                  own_voxels, voxel_mm3, args.min_region_mm3, on_partition_changed)
 
+    def on_mouse_move(_layer, event):
+        data = paint_layer.data
+        if data.ndim != 3:
+            return
+        z, y, x = (int(round(c)) for c in paint_layer.world_to_data(event.position))
+        if not all(0 <= c < n for c, n in zip((z, y, x), data.shape)):
+            return
+        def described(value):
+            group = partition.groups.get(value)
+            if group is not None:
+                return group.name
+            return "background" if not value else f"unassigned label {value}"
+
+        label = int(data[z, y, x])
+        was = int(state["baseline"][z, y, x])
+        # Showing what the registration said, not just what is there now, is
+        # what tells a correction apart from a region you have not touched --
+        # the whole plane looks hand-drawn once it becomes a keyframe.
+        note = "" if label == was else f"   (registration said: {described(was)})"
+        hover_label.setText(f"Under cursor: {described(label)} [{label}]{note}")
+
+    paint_layer.mouse_move_callbacks.append(on_mouse_move)
+
     def describe():
         planes = sorted(plane_keyframes(paint_layer.data, state["baseline"]))
-        return (f"{seed_note}; {len(partition)} groups.\n"
+        return (f"{seed_note}; {len(partition)} groups. Painting on the raw stack "
+                f"{sample_arr.shape} (z,y,x).\n"
                 f"Planes that differ from the registration so far ({len(planes)}): {planes}\n"
                 "Correct a plane anywhere and the WHOLE plane becomes a keyframe -- every\n"
                 "region on it, not just what you repainted. Planes between two keyframes\n"
@@ -1702,19 +1880,27 @@ def _run_labels(args):
     status_label.setText(describe())
 
     def export():
-        result = labels_export(paint_layer.data, state["baseline"])
-        if result is None:
-            status_label.setText("Nothing differs from the registration yet -- nothing to export.\n"
-                                 + describe())
+        planes = sorted(plane_keyframes(paint_layer.data, state["baseline"]))
+        if not planes:
+            status_label.setText("Nothing differs from the registration yet -- nothing to "
+                                 "export.\n" + describe())
             return
-        status_label.setText(f"Exporting... ({len(result.hand_drawn_slices)} keyframe planes)")
+        # Said out loud because on the raw grid this is minutes, not seconds:
+        # the interpolation runs a signed-distance transform per region per
+        # pair of neighbouring keyframes, on planes of several megapixels.
+        note = (f"Exporting {len(planes)} keyframe planes at {sample_arr.shape[1]}x"
+                f"{sample_arr.shape[2]}. On the raw grid this takes a while (one distance "
+                f"transform per region per keyframe gap) -- watch the terminal.")
+        status_label.setText(note)
+        print(note)
 
+        result = labels_export(paint_layer.data, state["baseline"])
         region_ids = partition.region_ids()
         region_names = partition.region_names(structures)
         painted = set(result.slices_by_label)
         for volume, path in ((result.guide, args.output_path), (result.atlas, atlas_output_path)):
             out = sitk.GetImageFromArray(volume)
-            out.CopyInformation(labels_sitk)
+            out.CopyInformation(raw_sitk)   # the raw stack's own (1,1,1) -- see the module docstring
             sitk.WriteImage(out, str(path))
 
         atlas_info = {
@@ -1724,14 +1910,18 @@ def _run_labels(args):
             "resolution_um": args.atlas.resolution_um,
         }
         regions_path, slices_path = write_guide_sidecars(
-            args.output_path, args.labels_path, result,
+            args.output_path, args.image_path, result,
             {lab: names for lab, names in region_names.items() if lab in painted},
-            original_labels.shape[0], spacing_xyz=labels_sitk.GetSpacing(),
+            sample_arr.shape[0], spacing_xyz=raw_sitk.GetSpacing(),
             region_ids={lab: ids for lab, ids in region_ids.items() if lab in painted},
             atlas_info=atlas_info)
         keyframes_path = write_labels_sidecar(
             atlas_output_path, args.output_path, args.labels_path, result, partition,
-            structures, original_labels.shape[0])
+            structures, sample_arr.shape[0],
+            grids={"raw_shape_zyx": list(sample_arr.shape),
+                   "raw_voxel_size_um_xyz": list(raw_voxel_um),
+                   "labels_shape_zyx": list(fine_labels.shape),
+                   "labels_voxel_size_um_xyz": list(fine_voxel_um)})
 
         lines = [f"Wrote {args.output_path}          (sparse guide -- re-register with this)",
                  f"Wrote {atlas_output_path}   (dense -- re-open this to keep drawing)",
@@ -1742,41 +1932,40 @@ def _run_labels(args):
                          f"{len(result.slices_by_label[label])} planes -> "
                          f"{result.voxels_by_label[label]} voxels")
         # Only the painted groups: guide mode warns about a configured label
-        # with no outline because there it means "you forgot to draw it",
-        # but a partition legitimately covers the whole brain while any one
-        # sample only spans part of it.
+        # with no outline because there it means "you forgot to draw it", but
+        # a partition legitimately covers the whole brain while any one sample
+        # only spans part of it.
         painted_names = {lab: names for lab, names in region_names.items() if lab in painted}
         lines += [f"WARNING: {w}" for w in guide_export_warnings(result, painted_names)]
         lines += [f"WARNING: {w}" for w in labels_export_warnings(
-            result, partition, structures, own_voxels, original_labels.shape[0],
+            result, partition, structures, own_voxels, sample_arr.shape[0],
             node_voxels=atlas.node_voxels, voxel_mm3=voxel_mm3, min_mm3=args.min_region_mm3)]
 
-        # Unlike guide mode's raw .tif, labels_in_sample.nii.gz has a real
-        # spacing, so this is read rather than retyped -- and said to be.
-        voxel_um = voxel_size_um_from_spacing(labels_sitk.GetSpacing())
-        voxel_note = f"# read from {Path(args.labels_path).name}'s header (x,y,z) um"
-        if voxel_um is None:
-            voxel_um = voxel_size_um_from_display_scale(args.display_scale_zyx)
-            voxel_note = None
         exclude = {lab: ids for lab, ids in partition.atlas_exclude_ids(structures).items()
                    if lab in painted}
         lines += ["", "Paste this into the pipeline config:", "",
                   guide_regions_yaml_snippet(
                       {lab: ids for lab, ids in region_ids.items() if lab in painted},
-                      region_names, args.output_path, voxel_size_um=voxel_um,
-                      atlas_exclude_ids=exclude, voxel_size_note=voxel_note)]
+                      region_names, args.output_path, voxel_size_um=raw_voxel_um,
+                      atlas_exclude_ids=exclude,
+                      voxel_size_note="# the raw stack's own (x,y,z) um, same grid as mode: guide")]
 
         msg = "\n".join(lines)
         status_label.setText(msg)
         print(msg)
         panel.refresh()
 
+    dock = QWidget()
+    QVBoxLayout(dock).addWidget(hover_label)
+    ontology_tree_ui.shrinkable(dock)
+    viewer.window.add_dock_widget(dock, area="right", name="Under cursor")
     _make_export_dock(viewer, status_label, export, "Export Guide + Atlas",
                       "Registration Correction Export")
     _add_relabel_panel(viewer, paint_layer, on_change=lambda src, dst: status_label.setText(
         f"Bulk relabel {src} -> {dst} touched every plane it appears on -- each of those is "
         f"now a keyframe.\n" + describe()))
     _add_erase_panel(viewer, paint_layer)
+    _add_display_panel(viewer, [paint_layer, reference])
 
 
 # =====================================================================================
@@ -2398,12 +2587,58 @@ def selftest_yaml_snippet_carries_exclusions():
     print("   ok")
 
 
-def selftest_voxel_size_from_spacing():
-    print("18. mode labels: voxel size comes from the labels header, in um")
-    assert voxel_size_um_from_spacing((0.025, 0.025, 0.025)) == [25.0, 25.0, 25.0]
-    assert voxel_size_um_from_spacing((1.0, 1.0, 1.0)) is None, \
-        "a (1,1,1) header means the file never had a spacing -- must not be reported as 1000 um"
-    assert voxel_size_um_from_spacing(None) is None
+def selftest_labels_voxel_size():
+    print("18. mode labels: the labels' voxel size, um vs mm vs neither")
+    # This codebase's own outputs carry microns directly...
+    assert labels_voxel_size_um((25.0, 25.0, 25.0)) == [25.0, 25.0, 25.0]
+    # ...files from elsewhere (the DevCCF downloads) are in millimetres.
+    assert labels_voxel_size_um((0.02, 0.02, 0.02)) == [20.0, 20.0, 20.0]
+    assert labels_voxel_size_um((0.02, 0.02, 0.02), override=[25, 25, 25]) == [25.0, 25.0, 25.0]
+    try:
+        labels_voxel_size_um((1.0, 1.0, 1.0))
+    except ValueError as exc:
+        assert "labels_voxel_size_um" in str(exc), exc
+    else:
+        raise AssertionError("a (1,1,1) header must refuse to be guessed, not be read as 1 um")
+    print("   ok")
+
+
+def selftest_regrid_nearest():
+    print("19. mode labels: regridding the registration onto the raw stack")
+    # A fine grid at 25 um iso vs the raw stack's 32 um along z / 2.6 um in
+    # plane -- i.e. z is COARSER on the raw grid and x/y much finer, which is
+    # the real s12t geometry and the direction that catches an axis mix-up.
+    fine_spacing = [25.0, 25.0, 25.0]          # (z, y, x)
+    raw_spacing = [32.0, 2.6, 2.6]             # (z, y, x)
+
+    # label == the fine voxel's own index along each axis, so a regridded
+    # voxel can be checked against the index its physical position implies.
+    fine = np.zeros((8, 6, 5), dtype=np.uint16)
+    for z in range(8):
+        for y in range(6):
+            for x in range(5):
+                fine[z, y, x] = z * 100 + y * 10 + x
+
+    raw_shape = (6, 50, 40)
+    out = regrid_nearest(fine, fine_spacing, raw_shape, raw_spacing)
+    assert out.shape == raw_shape, out.shape
+    assert out.dtype == fine.dtype, "a regrid must not change the label dtype"
+
+    for z, y, x in ((0, 0, 0), (3, 20, 17), (5, 49, 39)):
+        want = (min(7, int(round(z * 32.0 / 25.0))) * 100
+                + min(5, int(round(y * 2.6 / 25.0))) * 10
+                + min(4, int(round(x * 2.6 / 25.0))))
+        assert out[z, y, x] == want, f"at {(z, y, x)}: {out[z, y, x]} != {want}"
+
+    # Out-of-range destination voxels clamp to the edge rather than wrapping:
+    # the raw stack legitimately extends past what was registered (crop_for_
+    # registration), and a wrap would paste the far side of the brain there.
+    tall = regrid_nearest(fine, fine_spacing, (40, 6, 5), fine_spacing)
+    assert np.array_equal(tall[-1], fine[-1]), "past the end must clamp, not wrap"
+
+    # Identity when the grids match, whatever the spacing.
+    same = regrid_nearest(fine, fine_spacing, fine.shape, fine_spacing)
+    assert np.array_equal(same, fine)
     print("   ok")
 
 
@@ -2431,7 +2666,8 @@ def run_selftests():
     selftest_labels_export_sparse_vs_dense()
     selftest_recollapse_keeps_edits()
     selftest_yaml_snippet_carries_exclusions()
-    selftest_voxel_size_from_spacing()
+    selftest_labels_voxel_size()
+    selftest_regrid_nearest()
     with tempfile.TemporaryDirectory() as tmp:
         selftest_labels_sidecar_roundtrip(tmp)
     print("=== all selftests passed ===")

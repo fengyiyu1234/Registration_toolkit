@@ -3,8 +3,9 @@
 A read-only reference viewer -- three synced ortho panes (grayscale template,
 full annotation in colour, and whatever the ontology tree currently selects),
 plus an ontology panel to pick one or several regions at once (their union
-highlighted together -- see _add_region_panel) and a hover panel to read off
-the full ancestor chain of whatever the mouse is over. Nothing here writes
+highlighted together -- see _add_region_panel) and a wide hover bar along the
+bottom (_add_hover_bar) reading off the deepest levels of the ancestor chain
+of whatever the mouse is over, in that region's own atlas colour. Nothing here writes
 anything or registers to anything; it exists purely so you can look at an
 atlas and understand its ontology.
 
@@ -61,19 +62,20 @@ from shared import ontology_tree_ui  # the shared Qt ontology tree widget
 # without a display or even PyQt5 installed.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
 QAbstractItemView = QCheckBox = QLineEdit = QSplitter = QTreeWidget = Qt = None
-QDoubleSpinBox = QGridLayout = QSlider = None
+QDoubleSpinBox = QGridLayout = QSlider = QFontMetrics = None
 ViewerModel = QtViewer = None
 
 
 def _import_gui():
     global napari, QLabel, QPushButton, QVBoxLayout, QWidget
     global QAbstractItemView, QCheckBox, QLineEdit, QSplitter, QTreeWidget, Qt
-    global QDoubleSpinBox, QGridLayout, QSlider
+    global QDoubleSpinBox, QGridLayout, QSlider, QFontMetrics
     global ViewerModel, QtViewer
     import napari as _napari
     from napari.components import ViewerModel as _ViewerModel
     from napari.qt import QtViewer as _QtViewer
     from PyQt5.QtCore import Qt as _Qt
+    from PyQt5.QtGui import QFontMetrics as _QFontMetrics
     from PyQt5.QtWidgets import (QAbstractItemView as _QAbstractItemView,
                                  QCheckBox as _QCheckBox, QDoubleSpinBox as _QDoubleSpinBox,
                                  QGridLayout as _QGridLayout, QLabel as _QLabel,
@@ -87,6 +89,7 @@ def _import_gui():
     QCheckBox, QLineEdit, QSplitter = _QCheckBox, _QLineEdit, _QSplitter
     QTreeWidget, Qt = _QTreeWidget, _Qt
     QDoubleSpinBox, QGridLayout, QSlider = _QDoubleSpinBox, _QGridLayout, _QSlider
+    QFontMetrics = _QFontMetrics
     # ViewerModel + QtViewer are the "a napari canvas without its own window"
     # pair the extra ortho panes are built from.
     ViewerModel, QtViewer = _ViewerModel, _QtViewer
@@ -134,6 +137,25 @@ _MIRRORED_LAYER_ATTRS = ("visible", "opacity", "contrast_limits", "gamma", "colo
 # Starting height in px of the bottom dock holding the two reconstructed
 # views, leaving the main canvas the rest. Draggable afterwards.
 _ORTHO_DOCK_HEIGHT = 300
+
+# Starting width in px of the left-hand ontology dock, and a cap on how wide
+# its "Region" column opens. Both are STARTING points, not fixed sizes: every
+# widget in that panel is allowed to shrink (see _shrinkable), so the dock
+# edge can be dragged to any width afterwards. Without the cap the column
+# grows to the longest region name in the atlas ("Anterior cingulate area,
+# dorsal part, layer 6a" and friends), which is most of a screen wide.
+_REGION_DOCK_WIDTH = 340
+_REGION_NAME_COLUMN_WIDTH = 260
+
+# The hover bar along the bottom (_add_hover_bar): its height in px, its type
+# size, and how many ontology levels it will show at most before it starts
+# folding the shallow end away.
+_HOVER_BAR_HEIGHT = 64
+_HOVER_BAR_FONT_PT = 15
+_HOVER_BAR_MAX_LEVELS = 6
+_HOVER_BAR_PADDING_PX = 14
+_HOVER_SEPARATOR = "  \u203a  "
+_HOVER_ELLIPSIS = "\u2026"
 
 # How far the mouse may travel between press and release and still count as a
 # click rather than the start of a camera pan (see _pane_mouse_callback).
@@ -489,15 +511,17 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
     (`state.frame`, `state.centre`), so the sliders, the angle boxes, clicks,
     drags and "jump to region" cannot disagree about where the planes are.
 
-    A HOVER PANEL (_add_ancestry_panel) on the right, because the one structure
+    A HOVER BAR (_add_hover_bar) along the bottom, because the one structure
     a voxel is labelled with is usually a leaf ("layer 5 of primary motor
-    area") and the level you are actually picking is one of its ancestors. A
-    PLANE PANEL (_add_plane_panel) above it holds the frame itself: one
+    area") and the level you are actually picking is one of its ancestors: it
+    reads out the deepest few levels of that chain in large type, painted in
+    the region's own annotation colour. A
+    PLANE PANEL (_add_plane_panel) on the right holds the frame itself: one
     position slider per plane and one angle box per data axis, for the times
     you want an exact 12 degrees rather than a dragged one. A separate
     REGION-SELECTION panel (_add_region_panel) on the left is what drives the
     tree click -> highlight path -- see that function for why it gets its own
-    dedicated side rather than sharing one with the hover panel.
+    dedicated side.
 
     The atlas grid here is INDEPENDENT of any sample grid -- nothing in this
     window is registered to anything, it is a reference only. What the atlas's
@@ -550,6 +574,7 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         built.append(pane)
         model.reset_view()
 
+    ortho_dock = None
     if len(built) > 1:
         splitter = QSplitter(Qt.Horizontal)
         for pane, (order, title) in zip(built[1:], panes[1:]):
@@ -567,8 +592,9 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
             # user can then drag to whatever they actually want.
             pane.qt.setMinimumSize(160, 120)
             splitter.addWidget(wrapper)
-        dock = viewer.window.add_dock_widget(splitter, area="bottom", name="Ortho views (synced)")
-        viewer.window._qt_window.resizeDocks([dock], [_ORTHO_DOCK_HEIGHT], Qt.Vertical)
+        ortho_dock = viewer.window.add_dock_widget(splitter, area="bottom",
+                                                   name="Ortho views (synced)")
+        viewer.window._qt_window.resizeDocks([ortho_dock], [_ORTHO_DOCK_HEIGHT], Qt.Vertical)
         _mirror_layer_attrs(built)
         # QtViewer holds a vispy canvas and its GL context; napari only cleans
         # up the ones its own Window created, so these two have to be closed by
@@ -685,7 +711,7 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         pane.model.mouse_drag_callbacks.append(_pane_mouse_callback(pane, win))
     main.model.reset_view()
 
-    win.hover = _add_ancestry_panel(viewer, atlas, built)
+    win.hover = _add_hover_bar(viewer, atlas, built, below=ortho_dock)
     _add_plane_panel(viewer, win)
     return win
 
@@ -801,6 +827,34 @@ def _mirror_layer_attrs(panes):
             emitter.connect(_push)
 
 
+def _shrinkable(widget):
+    """Let `widget` be squeezed to nothing by the dock it lives in.
+
+    Qt gives a layout the larger of a widget's explicit minimum and its
+    minimumSizeHint, and for a plain QLabel/QCheckBox/QPushButton that hint
+    is THE WHOLE OF ITS TEXT on one line. One long caption in a panel is
+    therefore a hard floor on the dock's width -- and on the main window's,
+    since a dock cannot be dragged below its contents' minimum. That is what
+    made the ontology dock open enormous and refuse to be narrowed: nothing
+    in it was allowed to be narrow.
+
+    Setting an explicit minimum overrides the hint, so the caption clips (or,
+    for a wrapped label inside ontology_tree_ui.scrollable, scrolls) instead
+    of dictating the layout, and the dock edge becomes draggable to any
+    width.
+    """
+    widget.setMinimumWidth(1)
+    return widget
+
+
+def _caption(text, height=52):
+    """A panel's explanatory paragraph: word-wrapped, scrollable, and free to
+    be as narrow as the dock is. See ontology_tree_ui.scrollable for why a
+    bare wrapped label cannot be used -- its height would then grow every
+    time the dock is narrowed, and drag the window's minimum size with it."""
+    return _shrinkable(ontology_tree_ui.scrollable(QLabel(text), height))
+
+
 def _add_plane_panel(viewer, win):
     """The frame itself, as numbers: where each plane sits and how far the
     whole frame is turned.
@@ -828,7 +882,7 @@ def _add_plane_panel(viewer, win):
         swatch.setStyleSheet(f"background: {_PANE_COLOURS[axis]};")
         slider = QSlider(Qt.Horizontal)
         readout = QLabel()
-        readout.setMinimumWidth(90)
+        readout.setMinimumWidth(60)
         positions.addWidget(swatch, axis, 0)
         positions.addWidget(QLabel(f"plane {axis}"), axis, 1)
         positions.addWidget(slider, axis, 2)
@@ -852,7 +906,7 @@ def _add_plane_panel(viewer, win):
         angle_boxes.append(box)
 
     status = QLabel()
-    reset = QPushButton("Reset planes (axis-aligned, centred)")
+    reset = _shrinkable(QPushButton("Reset planes (axis-aligned, centred)"))
 
     def on_position(*_args):
         if busy["in"]:
@@ -902,13 +956,14 @@ def _add_plane_panel(viewer, win):
     reset.clicked.connect(lambda *_a: win.reset_planes())
 
     dock = QWidget()
+    dock.setMinimumWidth(1)
     layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel(
-        "Three orthogonal planes, tiltable together.\n"
-        "Click a view to move all three; Shift+drag inside a view to turn the\n"
-        "frame about that view's own normal (its picture follows the mouse,\n"
-        "the other two views reslice). Coloured lines mark where each other\n"
-        "plane cuts through the view."))
+    layout.addWidget(_caption(
+        "Three orthogonal planes, tiltable together. "
+        "Click a view to move all three; Shift+drag inside a view to turn the "
+        "frame about that view's own normal (its picture follows the mouse, "
+        "the other two views reslice). Coloured lines mark where each other "
+        "plane cuts through the view.", 72))
     layout.addWidget(QLabel("Position along each plane's normal"))
     layout.addLayout(positions)
     layout.addWidget(QLabel("Orientation (rotations about the atlas axes)"))
@@ -922,21 +977,170 @@ def _add_plane_panel(viewer, win):
     return SimpleNamespace(sync=sync, sliders=sliders, angle_boxes=angle_boxes)
 
 
-def _add_ancestry_panel(viewer, atlas, panes):
-    """A dock on the atlas window showing the full ontology chain of whatever
-    the mouse is over, updated live from every pane.
+def ancestry_labels(structures, structure_id):
+    """The root -> voxel chain of `structure_id`, one short label per level.
 
-    Returns SimpleNamespace(label=, show=) so the behaviour is testable without
-    synthesising Qt mouse events: `show` takes a compact index and is the whole
-    of what the mouse callbacks do.
+    The same chain format_ancestry() renders as an indented block, flattened
+    to a list for the one-line hover bar: no indent, no markers, just the
+    names (with acronyms, which are what stays recognisable when a name is
+    long) in ontology order, shallowest first.
     """
-    label = QLabel("Hover over the atlas to see the full region hierarchy of that voxel.")
-    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    label.setWordWrap(False)
+    info = structures.get(structure_id)
+    if info is None:
+        return [f"id {structure_id} (not in the ontology)"]
+    labels = []
+    for sid in info["structure_id_path"]:
+        node = structures.get(sid)
+        if node is None:
+            labels.append(f"[{sid}] ?")
+            continue
+        acronym = node.get("acronym")
+        labels.append(f"{node['name']} ({acronym})" if acronym else node["name"])
+    return labels
 
-    # mouse_move fires continuously; re-rendering the same chain on every pixel
-    # of travel is pure waste, and the flicker is visible.
+
+def render_ancestry_line(labels, folded):
+    """`labels` joined into one bar line, with a leading ellipsis iff levels
+    above them were folded away."""
+    line = _HOVER_SEPARATOR.join(labels)
+    return f"{_HOVER_ELLIPSIS}{_HOVER_SEPARATOR}{line}" if folded else line
+
+
+def fit_ancestry_line(labels, fits, max_levels=_HOVER_BAR_MAX_LEVELS):
+    """The DEEPEST levels of `labels` (root -> leaf) that `fits` accepts, as
+    one line.
+
+    The bar is one row across the window, so which levels get dropped when
+    the chain is too long has to be decided rather than left to clipping. The
+    deep end is the useful end -- the voxel's own region is the level the
+    annotation actually stores, and the levels just above it are what say
+    which structure it belongs to -- so the chain is kept from the leaf
+    backwards and folded away from the SHALLOW (root) end, behind a leading
+    ellipsis. The voxel's own region always survives, even when it alone is
+    too wide to fit.
+
+    `fits` is a predicate on the rendered string, which keeps the decision
+    testable without a window: the GUI passes "QFontMetrics says this is
+    narrower than the bar", the selftest passes a character count.
+    """
+    labels = [str(label) for label in labels if str(label)]
+    if not labels:
+        return ""
+    kept = labels[-max_levels:] if max_levels else list(labels)
+    folded = len(labels) - len(kept)
+    line = render_ancestry_line(kept, folded)
+    while len(kept) > 1 and not fits(line):
+        kept, folded = kept[1:], folded + 1
+        line = render_ancestry_line(kept, folded)
+    return line
+
+
+def hover_bar_colours(rgba):
+    """(background, foreground) CSS colours for a bar painted in one label's
+    own atlas colour.
+
+    The background is exactly the RGB napari draws that label with, so the
+    bar and the voxel under the cursor are visibly the same region. The text
+    colour is then forced to whichever of near-black/white the background can
+    actually carry -- the annotation colormap spans everything from dark
+    navy to pale yellow, and one fixed text colour is unreadable on half of
+    it. Fully transparent (i.e. background label 0) gets a neutral strip.
+    """
+    rgba = [float(v) for v in rgba]
+    if len(rgba) > 3 and rgba[3] <= 0.0:
+        return "#20232a", "#c8ccd4"
+    r, g, b = (min(max(v, 0.0), 1.0) for v in rgba[:3])
+    background = "#%02x%02x%02x" % tuple(int(round(v * 255)) for v in (r, g, b))
+    # Rec. 709 luminance: how bright the colour actually looks, not its mean.
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return background, ("#101010" if luminance > 0.5 else "#ffffff")
+
+
+def _add_hover_bar(viewer, atlas, panes, below=None):
+    """One wide strip along the BOTTOM of the window: the region under the
+    cursor, in large type, painted in that region's own atlas colour.
+
+    This replaces the old right-hand "Region hierarchy" dock, which showed
+    the whole root->leaf chain as an indented block. The chain is still what
+    a voxel's single label is worth reading against (the annotation stores
+    something like "layer 5 of primary motor area" and the level you care
+    about is one of its ancestors), but a tall panel on the right cost a
+    column of window width permanently and put the text as far from the
+    cursor as it could get. A bar instead: the DEEPEST few levels only
+    (fit_ancestry_line folds the rest away from the root end when the line
+    does not fit), big enough to read without looking away from the atlas,
+    and colour-matched to the annotation layer so the bar and the voxel agree
+    at a glance.
+
+    `below` is the ortho-views dock, if there is one: the bar is split
+    beneath it so it spans the whole width at the very bottom rather than
+    being parked beside the ortho panes.
+
+    Returns SimpleNamespace(label=, show=) so the behaviour is testable
+    without synthesising Qt mouse events: `show` takes a compact index and is
+    the whole of what the mouse callbacks do.
+    """
+    resting = "Hover over the atlas to read the region under the cursor."
+
+    class HoverBar(QLabel):
+        """A QLabel that re-fits its line whenever it is resized -- how many
+        levels fit is a function of the bar's width, so narrowing the window
+        has to fold levels away rather than clip them."""
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            render()
+
+    bar = HoverBar(resting)
+    font = bar.font()
+    font.setPointSize(_HOVER_BAR_FONT_PT)
+    font.setBold(True)
+    bar.setFont(font)
+    bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    bar.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    # No word wrap and no minimum width: the line is fitted to the bar by
+    # hand (see render), and a wrapping label would drive the window's
+    # minimum height instead -- see ontology_tree_ui.scrollable.
+    bar.setWordWrap(False)
+    bar.setMinimumWidth(1)
+    bar.setMinimumHeight(_HOVER_BAR_HEIGHT)
+    bar.setMaximumHeight(_HOVER_BAR_HEIGHT)
+
+    def paint(background, foreground):
+        bar.setStyleSheet(f"background: {background}; color: {foreground}; "
+                          f"padding: 0px {_HOVER_BAR_PADDING_PX}px;")
+
+    def colour_of(compact_index):
+        """The RGBA napari paints this compact label with, straight out of
+        the annotation layer's own colormap -- so the bar cannot drift out of
+        step with the picture, whatever colormap the layer ends up on."""
+        try:
+            layer = panes[0].layers.annotation
+            return list(layer.colormap.map(np.array([compact_index]))[0])
+        except Exception:               # any colormap napari might grow later
+            return [0.5, 0.5, 0.5, 1.0]
+
+    # mouse_move fires continuously; re-rendering the same chain on every
+    # pixel of travel is pure waste, and the flicker is visible.
     last = {"index": -1}
+
+    def render():
+        index = last["index"]
+        if index < 0:
+            paint("#20232a", "#c8ccd4")
+            bar.setText(resting)
+            return
+        if index == 0:
+            paint(*hover_bar_colours([0.0, 0.0, 0.0, 0.0]))
+            bar.setText("(background -- no region)")
+            return
+        sid = int(atlas.present_ids[index])
+        metrics = QFontMetrics(bar.font())
+        room = max(bar.width() - 2 * _HOVER_BAR_PADDING_PX - 4, 40)
+        bar.setText(fit_ancestry_line(
+            ancestry_labels(atlas.structures, sid),
+            lambda text: metrics.horizontalAdvance(text) <= room))
+        paint(*hover_bar_colours(colour_of(index)))
 
     def show(compact_index):
         if compact_index is None:
@@ -945,13 +1149,7 @@ def _add_ancestry_panel(viewer, atlas, panes):
         if compact_index == last["index"]:
             return
         last["index"] = compact_index
-        if compact_index == 0:
-            label.setText("(background -- no region)")
-            return
-        sid = int(atlas.present_ids[compact_index])
-        voxels = atlas.node_voxels.get(sid, 0)
-        label.setText(atlas_reference.format_ancestry(atlas.structures, sid)
-                      + f"\n\nThis structure (with descendants) covers {voxels:,} voxels")
+        render()
 
     def watcher(pane):
         def on_move(_model, event):
@@ -964,13 +1162,16 @@ def _add_ancestry_panel(viewer, atlas, panes):
     for pane in panes:
         pane.model.mouse_move_callbacks.append(watcher(pane))
 
-    dock = QWidget()
-    layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("Full hierarchy of the region under the cursor "
-                            "(▶ = the level the annotation actually stores)"))
-    layout.addWidget(ontology_tree_ui.scrollable(label, 220))
-    viewer.window.add_dock_widget(dock, area="right", name="Region hierarchy")
-    return SimpleNamespace(label=label, show=show)
+    render()
+    dock = viewer.window.add_dock_widget(bar, area="bottom", name="Region under cursor")
+    qt_window = viewer.window._qt_window
+    if below is not None:
+        # addDockWidget would put the bar BESIDE the ortho views (Qt fills a
+        # dock area left to right); splitting it off vertically is what makes
+        # it a full-width strip under everything.
+        qt_window.splitDockWidget(below, dock, Qt.Vertical)
+    qt_window.resizeDocks([dock], [_HOVER_BAR_HEIGHT], Qt.Vertical)
+    return SimpleNamespace(label=bar, show=show, dock=dock)
 
 
 def _add_region_panel(viewer, atlas, win):
@@ -991,14 +1192,15 @@ def _add_region_panel(viewer, atlas, win):
     which ones are selected, so it misses exactly the ctrl-click case this
     feature exists for.
 
-    A large, DEDICATED dock on the LEFT, opposite the hover panel on the
-    right: the ontology sits 2-12 levels deep, so a tree squeezed into a
-    fraction of a shared column leaves most of it scrolled out of view. Each
-    side gets the window's full height instead.
+    A large, DEDICATED dock on the LEFT, with the plane panel on the right:
+    the ontology sits 2-12 levels deep, so a tree squeezed into a fraction of
+    a shared column leaves most of it scrolled out of view. Each side gets the
+    window's full height instead. Its WIDTH is a starting size only
+    (_REGION_DOCK_WIDTH) -- see _shrinkable for what used to nail it open.
     """
-    search = QLineEdit()
+    search = _shrinkable(QLineEdit())
     search.setPlaceholderText("Filter regions by name/acronym...")
-    hide_empty = QCheckBox("Only regions with voxels in this annotation")
+    hide_empty = _shrinkable(QCheckBox("Only regions with voxels here"))
     hide_empty.setChecked(True)
 
     tree = QTreeWidget()
@@ -1011,16 +1213,23 @@ def _add_region_panel(viewer, atlas, win):
     # dock sharing this column), the tree fills the rest of the window's
     # height regardless.
     tree.setMinimumHeight(400)
+    # A tree scrolls, so nothing inside it needs to dictate the dock's width.
+    _shrinkable(tree)
     items = ontology_tree_ui.populate_ontology_tree(tree, atlas.structures, atlas.node_voxels)
-    # Content-driven, not a hardcoded pixel count -- the name column then fits
-    # whatever's actually loaded instead of permanently claiming a fixed slice
-    # of the window's width regardless of what's on screen. Still just the
-    # starting point: Interactive is the header's default resize mode, so the
-    # user can still drag it (and the dock) narrower or wider afterwards.
+    # Content-driven, but CAPPED. Sizing the name column to its contents alone
+    # opens it at the longest region name in the atlas -- "Anterior cingulate
+    # area, dorsal part, layer 6a" and friends, times a deep indent -- which
+    # is most of a screen wide before the two number columns even start. The
+    # cap keeps the usual name readable and lets the rest scroll. Both this
+    # and the dock width below are only starting points: Interactive is the
+    # header's default resize mode, so the column and the dock edge can both
+    # be dragged to whatever width you want.
     tree.resizeColumnToContents(0)
+    tree.header().setStretchLastSection(False)
+    tree.setColumnWidth(0, min(tree.columnWidth(0), _REGION_NAME_COLUMN_WIDTH))
 
     status = QLabel()
-    jump_btn = QPushButton("Jump to selection centre (all three views)")
+    jump_btn = _shrinkable(QPushButton("Jump to selection centre"))
 
     def selected_ids():
         return [item.data(0, Qt.UserRole) for item in tree.selectedItems()]
@@ -1072,16 +1281,21 @@ def _add_region_panel(viewer, atlas, win):
     jump_btn.clicked.connect(on_jump)
 
     dock = QWidget()
+    dock.setMinimumWidth(1)
     layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("Atlas ontology -- selecting a node highlights it and every "
-                            "descendant in all three views; Ctrl/Shift-click to highlight "
-                            "several regions at once."))
+    layout.addWidget(_caption("Atlas ontology -- selecting a node highlights it and every "
+                              "descendant in all three views; Ctrl/Shift-click to highlight "
+                              "several regions at once."))
     layout.addWidget(search)
     layout.addWidget(hide_empty)
     layout.addWidget(tree)
-    layout.addWidget(ontology_tree_ui.scrollable(status, 56))
+    layout.addWidget(_shrinkable(ontology_tree_ui.scrollable(status, 56)))
     layout.addWidget(jump_btn)
-    viewer.window.add_dock_widget(dock, area="left", name="Region selection")
+    dock_widget = viewer.window.add_dock_widget(dock, area="left", name="Region selection")
+    # A starting width, not a fixed one: with everything above allowed to
+    # shrink, the dock's own edge is now draggable from here to either
+    # extreme.
+    viewer.window._qt_window.resizeDocks([dock_widget], [_REGION_DOCK_WIDTH], Qt.Horizontal)
 
     refresh_filter()
 
@@ -1327,6 +1541,47 @@ def selftest_rotation_drag():
     print("   ok")
 
 
+def selftest_hover_bar_line():
+    print("10. hover bar: keeps the deepest levels, folds the shallow end away")
+    labels = ["root", "grey matter", "cerebrum", "cortex", "motor area", "layer 5"]
+
+    # Room for everything: no ellipsis, ontology order preserved.
+    line = fit_ancestry_line(labels, lambda _t: True)
+    assert _HOVER_ELLIPSIS not in line, line
+    assert line.split(_HOVER_SEPARATOR) == labels, line
+
+    # Narrower and narrower bars drop shallow levels first, and the voxel's
+    # own region survives every one of them.
+    seen = set()
+    for room in (200, 60, 40, 25, 10, 1):
+        line = fit_ancestry_line(labels, lambda text: len(text) <= room)
+        assert line.endswith("layer 5"), (room, line)
+        parts = [p for p in line.split(_HOVER_SEPARATOR) if p != _HOVER_ELLIPSIS]
+        # Whatever survives is a contiguous DEEP tail of the chain.
+        assert labels[-len(parts):] == parts, (room, line)
+        assert (_HOVER_ELLIPSIS in line) == (len(parts) < len(labels)), (room, line)
+        if len(line) > room:
+            # The only line allowed to overflow is the last level on its own.
+            assert parts == labels[-1:], (room, line)
+        seen.add(len(parts))
+    assert len(seen) > 1, seen              # the bar really does fold, not just clip
+
+    # max_levels caps the chain even when the bar is infinitely wide.
+    capped = fit_ancestry_line(labels, lambda _t: True, max_levels=2)
+    assert capped == render_ancestry_line(labels[-2:], 4), capped
+    assert fit_ancestry_line([], lambda _t: True) == ""
+
+    # The strip is painted the label's own colour, with text that survives it.
+    for rgba, expected_text in (([0.05, 0.05, 0.2, 1.0], "#ffffff"),
+                                ([0.9, 0.95, 0.4, 1.0], "#101010")):
+        background, foreground = hover_bar_colours(rgba)
+        assert background == "#%02x%02x%02x" % tuple(
+            int(round(v * 255)) for v in rgba[:3]), background
+        assert foreground == expected_text, (rgba, foreground)
+    assert hover_bar_colours([0.0, 0.0, 0.0, 0.0])[0] == "#20232a"
+    print("   ok")
+
+
 def run_selftests():
     print("=== tools/atlas_view.py selftests (synthetic data only, no GUI) ===")
     selftest_ortho_panes_geometry()
@@ -1338,6 +1593,7 @@ def run_selftests():
     selftest_crosshair_vectors()
     selftest_coarse_expansion()
     selftest_rotation_drag()
+    selftest_hover_bar_line()
     print("=== all selftests passed ===")
     print("(shared/atlas_reference.py --selftest covers atlas loading / ontology maths)")
     return 0

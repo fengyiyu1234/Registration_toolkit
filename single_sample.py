@@ -17,7 +17,8 @@ from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidge
                              QFileDialog, QMessageBox, QSizePolicy)
 from PyQt5.QtCore import Qt
 
-from shared import local_config  # configs/<tool>.yaml
+from shared import local_config      # configs/<tool>.yaml
+from shared import ontology_tree_ui  # shrinkable / set_dock_width
 
 # ================= ⚙️ 用户配置区域 =================
 #
@@ -30,6 +31,12 @@ CONFIG = {}
 _REQUIRED_KEYS = ("sample_dir", "std_atlas_path", "ontology_json_path")
 
 # ================= 🧠 1. JSON 脑区层级管理器 =================
+
+# 侧边面板的【起始】宽度（px），不是上限 —— 面板都是 ontology_tree_ui.shrinkable
+# 的，两条边都能拖。以前这里写的是 setMaximumWidth(320)，结果就是脑区名一长
+# 就只能看见开头几个字、还拖不宽。
+PANEL_START_WIDTH_PX = 340
+
 
 class OntologyManager:
     """脑区字典，两套编号各建一套索引。
@@ -929,11 +936,11 @@ class MainController:
         labels_layer = None
         if mhd is not None:
             self.current_atlas_labels = mhd
-            # 默认可见 + 轮廓模式：判断配准好坏看的就是脑区边界和解剖结构对不对得上，
-            # 轮廓压在高分辨率原图上能直接看出偏多少，填充模式反而把细节盖住了。
-            # （napari 0.8 的 Labels.__init__ 不收 contour，只能建完再设。）
+            # 默认【填充】：一眼看清哪块是哪个脑区、边界围出来的是什么形状，
+            # 这是日常查看时想要的。轮廓模式（只画边界、压在高分辨率原图上直接
+            # 看边界偏了多少）仍然一键可切，见控制面板里的 cb_outline ——
+            # 判断配准精度时切过去。
             labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.5)
-            labels_layer.contour = 1
             self.setup_highlight_layers(mhd.shape)
         else:
             print("⚠️ No sample-space label volume found (or it could not be aligned) "
@@ -950,6 +957,7 @@ class MainController:
         self.update_class_filter_ui(df_cells)
         self.render_cells_from_df(df_cells, labels_layer)
         self._apply_grid_layout("Atlas Regions")
+        self._apply_region_contour()
         self.setup_flag_layer()
 
     def load_sample_atlas_view(self):
@@ -997,7 +1005,24 @@ class MainController:
         self.update_class_filter_ui(df_cells)
         self.render_cells_from_df(df_cells, atlas_layer)
         self._apply_grid_layout("Atlas Anatomy")
+        self._apply_region_contour()
         self.setup_flag_layer()
+
+    # 跟着开关走的图层：脑区标签本身。高亮层（">> Highlight Atlas <<"）故意不跟 ——
+    # 它是搜索的结果，永远填充才看得见，轮廓化等于把搜到的东西又藏起来。
+    REGION_LAYER_NAMES = ("Atlas Regions", "Atlas Anatomy")
+
+    def _apply_region_contour(self):
+        """把"填充/轮廓"开关应用到当前存在的脑区标签层。
+
+        每次切换视图都要重调一次：load_sample_space_view /
+        load_sample_atlas_view 会清空并重建图层，新建的 Labels 层是 napari 的
+        默认值（contour=0，填充），不会自己记得上次勾了什么。
+        """
+        width = 1 if getattr(self, 'cb_outline', None) and self.cb_outline.isChecked() else 0
+        for name in self.REGION_LAYER_NAMES:
+            if name in self.viewer.layers:
+                self.viewer.layers[name].contour = width
 
     def _apply_grid_layout(self, atlas_layer_name):
         # 图谱图层移到最顶层：叠加模式下轮廓要压在原图上面才看得见。
@@ -1179,7 +1204,9 @@ class MainController:
 
     def setup_ui(self):
         dock = QWidget()
-        dock.setMaximumWidth(320)
+        # 起始宽度用 set_dock_width 给，而不是 setMaximumWidth —— 上限会让面板
+        # 永远拖不宽（脑区名一长就只能看开头几个字），这正是要修的。
+        ontology_tree_ui.shrinkable(dock)
         layout = QVBoxLayout(dock)
         
         layout.addWidget(QLabel("<b>1. Workspace Mode:</b>"))
@@ -1197,6 +1224,14 @@ class MainController:
         self.cb_grid.stateChanged.connect(
             lambda state: setattr(self.viewer.grid, 'enabled', state == Qt.Checked))
         layout.addWidget(self.cb_grid)
+
+        # 填充 = 看清哪块是哪个脑区（默认）；轮廓 = 只画边界，压在高分辨率原图上
+        # 直接看边界偏了多少，判断配准精度时用。napari 自己的 Labels 控件里也有
+        # 一个 contour 数字框，这里只是把它提到常用位置、并且切视图后不丢。
+        self.cb_outline = QCheckBox("Region outline only (unchecked = filled)")
+        self.cb_outline.setChecked(False)
+        self.cb_outline.stateChanged.connect(lambda _state: self._apply_region_contour())
+        layout.addWidget(self.cb_outline)
 
         h_size = QHBoxLayout()
         h_size.addWidget(QLabel("<b>Cell Size:</b>"))
@@ -1249,7 +1284,9 @@ class MainController:
         scroll.setWidget(self.class_checkbox_container)
         
         layout.addWidget(scroll)
-        self.viewer.window.add_dock_widget(dock, area='right', name="Control Panel")
+        ontology_tree_ui.set_dock_width(
+            self.viewer.window.add_dock_widget(dock, area='right', name="Control Panel"),
+            PANEL_START_WIDTH_PX)
 
         self.setup_region_panel()
 
@@ -1262,7 +1299,7 @@ class MainController:
         滚动条。面板本身高度固定，鼠标划过不同脉络时布局不会抖。
         """
         region_dock = QWidget()
-        region_dock.setMaximumWidth(320)
+        ontology_tree_ui.shrinkable(region_dock)
         rlayout = QVBoxLayout(region_dock)
 
         rlayout.addWidget(QLabel("<b>🔍 Search Regions:</b>"))
@@ -1304,12 +1341,13 @@ class MainController:
         # add_vertical_stretch=False：napari 默认会在 dock 底部塞一个弹簧把控件
         # 顶到顶部，那样 hover 框的 stretch 就失效了。旧版本没这个参数就回退。
         try:
-            self.viewer.window.add_dock_widget(
+            added = self.viewer.window.add_dock_widget(
                 region_dock, area='right', name="Region Explorer",
                 add_vertical_stretch=False)
         except TypeError:
-            self.viewer.window.add_dock_widget(
+            added = self.viewer.window.add_dock_widget(
                 region_dock, area='right', name="Region Explorer")
+        ontology_tree_ui.set_dock_width(added, PANEL_START_WIDTH_PX)
 
     def on_point_size_change(self, val):
         for layer in self.viewer.layers:
