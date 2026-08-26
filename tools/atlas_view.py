@@ -708,6 +708,10 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
                                  pane.shift)
 
     viewer = napari.Viewer(title="Atlas viewer")
+    # napari's own layer controls stop shrinking while they still own a good
+    # part of the left column -- with the region panel sharing that column,
+    # the space cannot be traded back. See free_layer_controls_height.
+    ontology_tree_ui.free_layer_controls_height(viewer)
     main = new_pane(viewer, None, panes[0][0])
     main.column = _main_pane_column(viewer)
     first = slice_for(main)

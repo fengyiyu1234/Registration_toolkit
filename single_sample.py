@@ -1203,6 +1203,11 @@ class MainController:
                     self.perform_search("Exact")
 
     def setup_ui(self):
+        # napari 自己的 layer controls 缩到一半就不肯再缩了（QStackedWidget 的
+        # minimumSizeHint 就是最高的那一页控件表单），左侧其他面板等于被它吃掉
+        # 一大截高度还要不回来。包进滚动区并给个显式下限，拖到多矮都行，装不下
+        # 的行改成滚动而不是被裁掉。
+        ontology_tree_ui.free_layer_controls_height(self.viewer)
         dock = QWidget()
         # 起始宽度用 set_dock_width 给，而不是 setMaximumWidth —— 上限会让面板
         # 永远拖不宽（脑区名一长就只能看开头几个字），这正是要修的。

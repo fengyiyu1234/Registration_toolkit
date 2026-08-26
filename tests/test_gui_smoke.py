@@ -498,6 +498,113 @@ def test_panels_are_resizable(tmp, inputs):
     print("   OK")
 
 
+# =====================================================================================
+# the assignment panel, and how the panels are laid out
+# =====================================================================================
+def _open_guide(pm, tmp, inputs, atlas_reference, name, **overrides):
+    """Guide mode with an atlas, opened on the synthetic inputs."""
+    args = dict(
+        image_path=str(inputs.raw), output_path=str(tmp / name), existing_mask=None,
+        region_labels={}, region_ids={}, display_scale_zyx=None,
+        atlas=atlas_reference.atlas_reference_config({
+            "atlas_annotation_path": str(inputs.annotation),
+            "ontology_path": str(inputs.ontology),
+            "atlas_resolution_um": 25}))
+    args.update(overrides)
+    pm._run_guide(SimpleNamespace(**args))
+    import napari
+    return napari.current_viewer()
+
+
+def test_assignment_panel_drops_one_region(tmp, inputs):
+    print("6. paint_mask guide mode: drop ONE region off a label, and hear about an empty one...")
+    import paint_mask as pm
+    from shared import atlas_reference
+
+    # Three regions on one brush label -- the case the panel exists for: a
+    # label routinely carries a dozen, and taking one back out used to mean
+    # finding it again in the 12-deep ontology tree above.
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "assign.nii.gz",
+                         region_ids={1: [315, 1080, 822]})
+    try:
+        panel = _widget(viewer, "Ontology")
+        tree = panel.findChild(pm.QTreeWidget, "assignment_tree")
+        note = panel.findChild(pm.QLabel, "assignment_empty_note")
+        assert tree is not None and note is not None, "the assignment panel is not a tree"
+
+        head = tree.topLevelItem(0)
+        assert tree.topLevelItemCount() == 1 and head.childCount() == 3, \
+            "one brush label with its three regions listed under it"
+        assert not note.isVisible(), "nothing is empty yet"
+
+        # One region, straight off the list.
+        [child] = [head.child(i) for i in range(head.childCount())
+                   if head.child(i).data(1, pm.Qt.UserRole) == 1080]
+        child.setSelected(True)
+        _button(panel, "Remove selected").click()
+        head = tree.topLevelItem(0)
+        left = {head.child(i).data(1, pm.Qt.UserRole) for i in range(head.childCount())}
+        assert left == {315, 822}, f"only the selected region should have gone, left {left}"
+
+        # ...and the rest, which must NOT make the label disappear silently:
+        # something is probably still painted with it, and an outline with no
+        # region cannot be paired with an atlas structure downstream.
+        head.setSelected(True)
+        _button(panel, "Remove selected").click()
+        head = tree.topLevelItem(0)
+        assert head.childCount() == 0 and "NO REGION" in head.text(0), head.text(0)
+        assert note.isVisible(), "an emptied brush label must say so, not vanish"
+        assert "1" in note.text()
+
+        # Removing an already-empty label is how the reminder is dismissed.
+        head.setSelected(True)
+        _button(panel, "Remove selected").click()
+        assert not note.isVisible(), "removing an empty label again forgets it"
+    finally:
+        viewer.close()
+    print("   OK")
+
+
+def test_panels_are_tabbed_and_short(tmp, inputs):
+    print("7. paint_mask guide mode: one tab bar per side, layer controls free to shrink...")
+    import paint_mask as pm
+    from PyQt5.QtWidgets import QScrollArea
+    from shared import atlas_reference
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "tabs.nii.gz")
+    try:
+        window = viewer.window._qt_window
+        qt_viewer = viewer.window._qt_viewer
+        docks = viewer.window._dock_widgets
+
+        # Left: napari's own two docks and the ontology panel share one tab bar.
+        ontology = docks[[k for k in docks if "Ontology" in k][0]]
+        left = set(window.tabifiedDockWidgets(qt_viewer.dockLayerControls))
+        assert ontology in left and qt_viewer.dockLayerList in left, (
+            "the left panels are stacked, not tabbed -- three docks down one column arrive "
+            "as slivers")
+
+        # Right: every panel this tool adds there, in one more tab bar.
+        export = docks[[k for k in docks if "Export" in k][0]]
+        right = set(window.tabifiedDockWidgets(export))
+        for name in ("Relabel", "Erase", "Display"):
+            assert docks[name] in right, f"{name} is not tabbed with the export panel"
+
+        # And the complaint that made a stacked column unusable in the first
+        # place: the layer controls stop shrinking while they still own half
+        # the column. Wrapped in a scroll area, the floor is the explicit
+        # minimum rather than a dozen rows of controls.
+        controls = qt_viewer.dockLayerControls
+        assert isinstance(controls.widget(), QScrollArea), \
+            "layer controls must scroll, or shrinking them just clips the rows off"
+        assert controls.widget().minimumSizeHint().height() <= 80, \
+            f"the layer controls still demand {controls.widget().minimumSizeHint().height()} px"
+        assert controls.minimumHeight() <= 48, controls.minimumHeight()
+    finally:
+        viewer.close()
+    print("   OK")
+
+
 def main():
     print("=== tests/test_gui_smoke.py ===")
     if not _ensure_display():
@@ -520,6 +627,8 @@ def main():
         test_labels_mode_resume(tmp, inputs)
         test_single_sample_fill_switch()
         test_panels_are_resizable(tmp, inputs)
+        test_assignment_panel_drops_one_region(tmp, inputs)
+        test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")
     return 0
 

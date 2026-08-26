@@ -7,6 +7,13 @@ highlight it in the atlas). `scrollable` is a second, more general widget
 both panels also need for the same reason: see its own docstring, and
 `shrinkable`/`set_dock_width` for the width half of the same problem.
 
+The rest of the module is dock LAYOUT, shared by all three GUI tools for the
+same reason the widgets are: `scroll_wrap_dock` /
+`free_layer_controls_height` are the height half of what `shrinkable` does
+for width (including for napari's OWN layer-controls dock, which otherwise
+refuses to shrink past a dozen rows of controls), and `tabify` folds a
+column of docks into one tab bar.
+
 PyQt5 is imported lazily inside the functions below rather than at module
 scope, the same pattern paint_mask.py's own _import_gui() uses -- both
 callers already import PyQt5 that way before touching this module, so this
@@ -135,3 +142,104 @@ def scrollable(label, min_height):
     scroll.setWidgetResizable(True)
     scroll.setMinimumHeight(min_height)
     return scroll
+
+
+def scroll_wrap_dock(dock, min_height=48):
+    """Put a dock's existing content inside a scroll area and drop the
+    minimum height Qt derived from it, so the dock can be dragged short.
+
+    The height twin of `shrinkable`, and needed for the same reason: Qt gives
+    a dock the larger of its explicit minimum and its contents'
+    minimumSizeHint, so a panel that asks for 400 px of rows is a hard floor
+    on the splitter above it. `shrinkable` fixes that for width by setting an
+    explicit minimum -- qSmartMinSize prefers an explicit minimum over the
+    hint -- but doing only that for height would CLIP the rows that no longer
+    fit, and a clipped slider is a control you cannot reach. So the content
+    is re-parented into a QScrollArea first (whose own minimumSizeHint is a
+    couple of text lines regardless of what it holds) and the rows that fall
+    off the bottom scroll into view instead.
+
+    Idempotent: wrapping an already-wrapped dock only re-applies the minimum.
+    """
+    _import_qt()
+    from PyQt5.QtWidgets import QFrame, QScrollArea as _QScrollArea
+    inner = dock.widget() if hasattr(dock, "widget") else None
+    if inner is None:
+        return dock
+    if not isinstance(inner, _QScrollArea):
+        scroll = _QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        # Reparent BEFORE dock.setWidget: QScrollArea.setWidget takes the
+        # widget out of the dock's layout on its own, so the dock is never
+        # left holding a layout item for a widget that has moved.
+        scroll.setWidget(inner)
+        inner.show()
+        # napari paints its docks from the app stylesheet; an opaque viewport
+        # here would draw a default-grey rectangle behind them.
+        scroll.viewport().setAutoFillBackground(False)
+        dock.setWidget(scroll)
+        inner_scroll = scroll
+    else:
+        inner_scroll = inner
+    inner_scroll.setMinimumHeight(min_height)
+    dock.setMinimumHeight(min_height)
+    return dock
+
+
+def napari_layer_docks(viewer):
+    """napari's own 'layer controls' + 'layer list' docks, or [] if this
+    napari does not have them where it used to.
+
+    Reached through _qt_viewer, which is private, hence the getattr dance:
+    every caller uses this for layout polish only, so a napari that moved
+    them should cost the polish, not raise on startup.
+    """
+    qt_viewer = getattr(getattr(viewer, "window", None), "_qt_viewer", None)
+    docks = [getattr(qt_viewer, name, None)
+             for name in ("dockLayerControls", "dockLayerList")]
+    return [dock for dock in docks if dock is not None]
+
+
+def free_layer_controls_height(viewer, min_height=48):
+    """Let napari's own layer-controls/layer-list docks be dragged short.
+
+    Without this the layer controls stop shrinking well before they are out
+    of the way: the controls widget is a QStackedWidget whose minimumSizeHint
+    is the tallest per-layer control form it has built (a Labels layer's is
+    a dozen-plus rows), and napari stacks it above the layer list in the same
+    column, so that floor is subtracted from every other panel sharing the
+    left side -- with no way to trade the space back on a laptop screen.
+    """
+    docks = napari_layer_docks(viewer)
+    for dock in docks:
+        scroll_wrap_dock(dock, min_height)
+    return docks
+
+
+def tabify(viewer, docks, current=None):
+    """Stack `docks` into ONE tabbed group, in the order given.
+
+    napari's default is to stack docks down a column, which only works while
+    there are two of them: paint_mask has four on the right and three on the
+    left, and stacked they arrive as a pile of slivers that each have to be
+    dragged open before they can be used. Tabbed, one panel gets the whole
+    column and the rest are one click away.
+
+    Chained pairwise (previous, dock) rather than (first, dock) because
+    tabifyDockWidget inserts the second argument immediately after the first
+    -- tabifying everything against docks[0] would reverse the tab order.
+    """
+    _import_qt()
+    window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+    docks = [dock for dock in docks if dock is not None]
+    if window is None or not hasattr(window, "tabifyDockWidget") or len(docks) < 2:
+        return docks
+    previous = docks[0]
+    for dock in docks[1:]:
+        window.tabifyDockWidget(previous, dock)
+        previous = dock
+    front = current if current in docks else docks[0]
+    front.show()
+    front.raise_()
+    return docks

@@ -27,7 +27,8 @@ shared/                  imported, never run
   landmark_io.py           the landmark CSV format
   atlas_reference.py       GUI-free atlas loading + ontology math
   label_partition.py       brush label <-> atlas region, and refining it per region
-  ontology_tree_ui.py      the searchable Qt ontology tree
+  ontology_tree_ui.py      the searchable Qt ontology tree, + the dock layout
+                             helpers all three GUI tools share
 
 tools/                   the smaller runnable tools
   atlas_view.py

@@ -80,7 +80,18 @@ blob rather than something that needs a meaningful value on every plane.
   A large, dedicated region panel: the ontology tree lives on its own side
     of the window (left) rather than sharing a column with Relabel/Export
     (right), because it is 2-12 levels deep and a tree squeezed into a
-    fraction of a shared dock leaves most of it scrolled out of view.
+    fraction of a shared dock leaves most of it scrolled out of view. Under
+    it, behind a draggable splitter, is what has been assigned so far --
+    brush label -> its regions, as a tree whose rows are the handles: select
+    any single region there and Remove takes just that one off the label,
+    without hunting it down in the ontology again. A label whose last region
+    is removed does not disappear, it stays listed as empty with a warning,
+    because something is probably still painted with that number.
+
+  Everything is TABBED, one tab bar per side (see _tab_the_panels): five
+    panels stacked down a column arrive as five slivers, none of them usable
+    without dragging the others shut first. Drag a tab out of the bar if two
+    panels really are needed at once.
 
   A "Relabel" panel: click-to-fill a single already-painted blob into
     another label, or renumber one label across the whole volume. A bulk
@@ -170,7 +181,7 @@ from shared import ontology_tree_ui  # the shared Qt ontology tree widget
 # which only ever runs in antsreg.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
 QCheckBox = QHBoxLayout = QLineEdit = QSpinBox = QListWidget = None
-QTreeWidget = Qt = None
+QTreeWidget = QTreeWidgetItem = QSplitter = Qt = None
 
 
 def _import_gui():
@@ -179,7 +190,7 @@ def _import_gui():
     module import, which is what keeps --selftest env-independent."""
     global napari, QLabel, QPushButton, QVBoxLayout, QWidget
     global QCheckBox, QHBoxLayout, QLineEdit, QSpinBox, QListWidget
-    global QTreeWidget, Qt
+    global QTreeWidget, QTreeWidgetItem, QSplitter, Qt
     import napari as _napari
     from PyQt5.QtCore import Qt as _Qt
     from PyQt5.QtWidgets import (QCheckBox as _QCheckBox, QHBoxLayout as _QHBoxLayout,
@@ -187,13 +198,15 @@ def _import_gui():
                                  QListWidget as _QListWidget,
                                  QPushButton as _QPushButton,
                                  QSpinBox as _QSpinBox,
+                                 QSplitter as _QSplitter,
                                  QTreeWidget as _QTreeWidget,
+                                 QTreeWidgetItem as _QTreeWidgetItem,
                                  QVBoxLayout as _QVBoxLayout, QWidget as _QWidget)
     napari, QLabel, QPushButton = _napari, _QLabel, _QPushButton
     QVBoxLayout, QWidget = _QVBoxLayout, _QWidget
     QCheckBox, QHBoxLayout, QLineEdit, QSpinBox = _QCheckBox, _QHBoxLayout, _QLineEdit, _QSpinBox
     QListWidget = _QListWidget
-    QTreeWidget, Qt = _QTreeWidget, _Qt
+    QTreeWidget, QTreeWidgetItem, QSplitter, Qt = _QTreeWidget, _QTreeWidgetItem, _QSplitter, _Qt
 
 
 def _interpolate_sparse_mask():
@@ -430,18 +443,30 @@ def _launch_viewer(arr, prefill, scale=None, title="Paint guide outline",
     return viewer, paint_layer
 
 
-def format_assignment(assignment, structures):
-    """The label -> region panel text. Also the thing you check before
-    exporting, so it spells out ids as well as names."""
-    if not assignment:
-        return ("No region assigned yet.\nPick a region in the tree above, set a brush "
-                "label, then click Assign to label.")
-    lines = []
-    for label in sorted(assignment):
-        entries = assignment[label]
-        names = ", ".join(f"{structures[sid]['name']} [{sid}]" for sid in entries)
-        lines.append(f"  label {label} = {names}")
-    return "brush label -> region:\n" + "\n".join(lines)
+def assignment_rows(assignment, structures):
+    """The assignment panel's rows: [(label, [(sid, name), ...]), ...].
+
+    Split out of the widget so the one thing worth checking -- that a label
+    whose last region was removed is still REPORTED rather than silently
+    vanishing -- is testable without a window. A label maps to an empty list
+    exactly when it was assigned regions and they were all removed again;
+    see empty_assignment_labels.
+    """
+    return [(label, [(sid, structures[sid]["name"]) for sid in assignment[label]])
+            for label in sorted(assignment)]
+
+
+def empty_assignment_labels(assignment):
+    """Brush labels left with no region at all.
+
+    These are kept in `assignment` rather than deleted on the way out,
+    precisely so the panel can say so: a label that is still being painted
+    with but has lost its region exports an outline nothing downstream can
+    pair with an atlas structure (guide_export_warnings says the same thing
+    at export time, which is far too late to be the first mention of it).
+    Removing an already-empty label forgets it for good.
+    """
+    return sorted(label for label, ids in assignment.items() if not ids)
 
 
 def voxel_size_um_from_display_scale(display_scale_zyx):
@@ -501,6 +526,37 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
     return "\n".join(lines)
 
 
+def _tab_the_panels(viewer, left, right):
+    """Fold every side panel into two TAB BARS -- one per side -- instead of
+    stacking them down their columns.
+
+    napari stacks docks vertically, and stacking is only usable while there
+    are two of them. This tool adds four or five on the right and shares the
+    left with napari's own layer list and layer controls, so opening the
+    window used to mean being handed a pile of slivers, each of which had to
+    be dragged open (at the cost of the ones above it) before it could be
+    used. Tabbed, whichever panel is in front gets the whole column, and the
+    rest are one click away -- and any of them can still be dragged out of
+    the tab bar into its own dock, or floated, if two really are needed at
+    once.
+
+    The layer-controls height unclamp goes here too, because it is the same
+    complaint: that dock stops shrinking while it still fills half the column
+    (see ontology_tree_ui.free_layer_controls_height), which is precisely
+    what makes a stacked left column unusable.
+
+    Which tab starts in front: the panel this tool exists for, i.e. the
+    region panel on the left and the export/status panel on the right, since
+    that is where every message the tool prints ends up.
+    """
+    ontology_tree_ui.free_layer_controls_height(viewer)
+    left = [dock for dock in left if dock is not None]
+    right = [dock for dock in right if dock is not None]
+    ontology_tree_ui.tabify(viewer, ontology_tree_ui.napari_layer_docks(viewer) + left,
+                            current=left[0] if left else None)
+    ontology_tree_ui.tabify(viewer, right, current=right[0] if right else None)
+
+
 def _make_export_dock(viewer, status_label, on_export, button_text, panel_name):
     # Selectable because the guide export prints a ready-to-paste
     # guide_regions block into this label (guide_regions_yaml_snippet) --
@@ -515,7 +571,7 @@ def _make_export_dock(viewer, status_label, on_export, button_text, panel_name):
     layout.addWidget(ontology_tree_ui.scrollable(status_label, 120))
     layout.addWidget(export_btn)
     ontology_tree_ui.shrinkable(dock)
-    viewer.window.add_dock_widget(dock, area="right", name=panel_name)
+    return viewer.window.add_dock_widget(dock, area="right", name=panel_name)
 
 
 def _add_relabel_panel(viewer, paint_layer, on_change=None):
@@ -588,7 +644,7 @@ def _add_relabel_panel(viewer, paint_layer, on_change=None):
     layout.addWidget(all_btn)
     layout.addWidget(ontology_tree_ui.scrollable(status, 60))
     ontology_tree_ui.shrinkable(dock)
-    viewer.window.add_dock_widget(dock, area="right", name="Relabel")
+    return viewer.window.add_dock_widget(dock, area="right", name="Relabel")
 
 
 def _add_display_panel(viewer, layers):
@@ -622,8 +678,7 @@ def _add_display_panel(viewer, layers):
         "Filled shows what each region IS; outline uncovers the image under it,\n"
         "for checking a boundary against the tissue."))
     ontology_tree_ui.shrinkable(dock)
-    viewer.window.add_dock_widget(dock, area="right", name="Display")
-    return checkbox
+    return viewer.window.add_dock_widget(dock, area="right", name="Display")
 
 
 def _add_erase_panel(viewer, paint_layer):
@@ -696,7 +751,7 @@ def _add_erase_panel(viewer, paint_layer):
     layout.addWidget(brush_btn)
     layout.addWidget(ontology_tree_ui.scrollable(status, 80))
     ontology_tree_ui.shrinkable(dock)
-    viewer.window.add_dock_widget(dock, area="right", name="Erase")
+    return viewer.window.add_dock_widget(dock, area="right", name="Erase")
 
 
 # =====================================================================================
@@ -1070,9 +1125,21 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     right: the ontology sits 2-12 levels deep, so a tree squeezed into a
     fraction of a shared column leaves most of it scrolled out of view.
 
+    TWO trees, split by a draggable QSplitter. The lower one is what has been
+    assigned so far, as brush label -> its regions, and it is a TREE rather
+    than the text block it used to be for one reason: a label routinely
+    carries a dozen regions (DevCCF has no single "cortex", only 36 `layer N
+    of <area>` structures), and taking one of them back out used to mean
+    hunting that structure down in the 12-deep ontology above and pressing
+    "Remove from label" -- with nothing on screen to click even though the
+    thing to remove was right there in the list. Now the region row itself is
+    the handle. The splitter is there because a fixed-height text box that
+    folds after two labels was the other half of the same complaint.
+
     `assignment` ({label: [structure id]}) is mutated in place -- it is the
     live state the export reads, so there is no separate "apply" step to
-    forget.
+    forget. A label whose last region is removed stays in it as an EMPTY
+    entry, on purpose: see empty_assignment_labels.
     """
     # objectNames so these are addressable from outside the closure -- napari
     # contributes its own QSpinBox/QLineEdit widgets to the same window, so
@@ -1088,11 +1155,12 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     tree.setObjectName("ontology_tree")
     tree.setHeaderLabels(["Region", "Voxels", "id"])
     tree.setColumnWidth(0, 260)
-    # A floor, not a target: with the whole left side to itself (no other
-    # dock sharing this column), the tree fills the rest of the window's
-    # height regardless -- see the module docstring's "large, dedicated
-    # region panel" note for why that space was the point of this dock.
-    tree.setMinimumHeight(400)
+    # No minimum height, deliberately: the tree is the only widget in its
+    # half of the splitter carrying a stretch factor, so it already takes
+    # every pixel that half is given beyond what the search box, the status
+    # box and the buttons need -- see the module docstring's "large,
+    # dedicated region panel" note for why that space was the point of this
+    # dock. A floor would only fight the splitter handle.
     items = ontology_tree_ui.populate_ontology_tree(tree, atlas.structures, atlas.node_voxels)
 
     label_spin = QSpinBox()
@@ -1102,11 +1170,22 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     add_btn.setObjectName("ontology_assign")
     remove_btn = QPushButton("Remove from label")
     remove_btn.setObjectName("ontology_unassign")
-    # Both grow with use -- picker_status with the selected region's blurb,
-    # assign_label with one line per assigned brush label -- so both go in
-    # scroll areas for the reason ontology_tree_ui.scrollable spells out.
-    assign_label = QLabel()
     picker_status = QLabel()
+
+    # The lower half: what is assigned, one expandable row per brush label.
+    assign_tree = QTreeWidget()
+    assign_tree.setObjectName("assignment_tree")
+    assign_tree.setHeaderLabels(["Brush label / region", "id"])
+    assign_tree.setColumnWidth(0, 200)
+    assign_tree.setMinimumHeight(90)
+    assign_tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+    drop_btn = QPushButton("Remove selected region(s)")
+    drop_btn.setObjectName("assignment_remove")
+    empty_note = QLabel()
+    empty_note.setObjectName("assignment_empty_note")
+    empty_note.setWordWrap(True)
+    empty_note.setStyleSheet("color: #ffb86b;")   # a warning, not a caption
+    empty_note.setVisible(False)
 
     def selected_id():
         item = tree.currentItem()
@@ -1156,46 +1235,152 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
         sid = selected_id()
         label = label_spin.value()
         if sid is not None and sid in assignment.get(label, []):
+            # Left as an empty entry rather than deleted: the label is still
+            # what the brush is painting with, and losing it silently is the
+            # failure empty_assignment_labels exists to make visible.
             assignment[label].remove(sid)
-            if not assignment[label]:
-                del assignment[label]
         refresh_assignment()
 
+    def drop_selected():
+        """Remove whatever is selected in the LOWER tree.
+
+        A region row drops that one region. A label row drops every region
+        under it (leaving the empty-label reminder), and dropping a label row
+        that is ALREADY empty forgets the label -- so the reminder has an
+        obvious way out that is not "assign something you don't want".
+        """
+        picked = assign_tree.selectedItems()
+        if not picked:
+            picker_status.setText(
+                "Select a region (or a brush-label row) in the assignment tree below first.")
+            return
+        dropped, forgotten = 0, []
+        for item in picked:
+            label = item.data(0, Qt.UserRole)
+            sid = item.data(1, Qt.UserRole)
+            ids = assignment.get(label)
+            if label is None or ids is None:
+                continue
+            if sid is None:
+                if ids:
+                    dropped += len(ids)
+                    assignment[label] = []
+                else:
+                    del assignment[label]
+                    forgotten.append(label)
+            elif sid in ids:
+                ids.remove(sid)
+                dropped += 1
+        refresh_assignment()
+        parts = []
+        if dropped:
+            parts.append(f"removed {dropped} region(s) from the assignment")
+        if forgotten:
+            parts.append(f"forgot brush label(s) {', '.join(str(lab) for lab in forgotten)}")
+        picker_status.setText(("; ".join(parts) + ".") if parts else "Nothing to remove.")
+
+    def on_assignment_selected():
+        """Clicking a row picks that brush label, so removing a region and
+        carrying on painting with the same label needs no second control."""
+        picked = assign_tree.selectedItems()
+        label = picked[0].data(0, Qt.UserRole) if picked else None
+        if label is None:
+            return
+        label_spin.setValue(int(label))
+        paint_layer.selected_label = int(label)
+
     def refresh_assignment():
-        assign_label.setText(format_assignment(assignment, atlas.structures))
+        assign_tree.clear()
+        rows = assignment_rows(assignment, atlas.structures)
+        for label, regions in rows:
+            head = QTreeWidgetItem([f"label {label}    ({len(regions)} region(s))"
+                                    if regions else
+                                    f"label {label}    -- NO REGION LEFT", ""])
+            head.setData(0, Qt.UserRole, label)
+            head.setData(1, Qt.UserRole, None)
+            assign_tree.addTopLevelItem(head)
+            for sid, name in regions:
+                child = QTreeWidgetItem([name, str(sid)])
+                child.setData(0, Qt.UserRole, label)
+                child.setData(1, Qt.UserRole, sid)
+                head.addChild(child)
+        if not rows:
+            hint = QTreeWidgetItem(["No region assigned yet -- pick one above, set a brush "
+                                    "label, then Assign to label.", ""])
+            hint.setDisabled(True)
+            assign_tree.addTopLevelItem(hint)
+        assign_tree.expandAll()
+
+        empties = empty_assignment_labels(assignment)
+        empty_note.setVisible(bool(empties))
+        if empties:
+            empty_note.setText(
+                "! brush label(s) " + ", ".join(str(lab) for lab in empties) + ": no region left. "
+                "Painting with them exports an outline nothing can be paired with. Assign "
+                "one, or Remove the label row again to forget it.")
 
     search.textChanged.connect(lambda _t: refresh_filter())
     hide_empty.toggled.connect(lambda _c: refresh_filter())
     tree.currentItemChanged.connect(lambda _cur, _prev: on_select())
     add_btn.clicked.connect(on_add)
     remove_btn.clicked.connect(on_remove)
+    drop_btn.clicked.connect(drop_selected)
+    assign_tree.itemSelectionChanged.connect(on_assignment_selected)
 
-    dock = QWidget()
-    layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel("Atlas ontology -- selecting a node assigns it to the brush label "
-                            "below. The atlas itself is not shown here; run tools/atlas_view.py to "
-                            "look at it."))
-    layout.addWidget(search)
-    layout.addWidget(hide_empty)
-    layout.addWidget(tree)
-    layout.addWidget(ontology_tree_ui.scrollable(picker_status, 56))
+    upper = QWidget()
+    upper_layout = QVBoxLayout(upper)
+    upper_layout.setContentsMargins(0, 0, 0, 0)
+    upper_layout.addWidget(QLabel("Atlas ontology -- selecting a node assigns it to the brush "
+                                  "label below. The atlas itself is not shown here; run "
+                                  "tools/atlas_view.py to look at it."))
+    upper_layout.addWidget(search)
+    upper_layout.addWidget(hide_empty)
+    upper_layout.addWidget(tree, 1)      # the stretch: spare height is the tree's
+    # Pinned to its own height (it scrolls inside), so the blurb about the
+    # selected region cannot quietly take a hundred pixels off the tree --
+    # the panel being too small for the regions in it is the complaint this
+    # whole splitter exists to answer. A height cap only; the WIDTH stays
+    # free, which is the one set_dock_width/shrinkable insist on.
+    status_box = ontology_tree_ui.scrollable(picker_status, 56)
+    status_box.setMaximumHeight(56)
+    upper_layout.addWidget(status_box)
     row = QWidget()
     row_layout = QHBoxLayout(row)
     row_layout.addWidget(QLabel("brush label"))
     row_layout.addWidget(label_spin)
     row_layout.addWidget(add_btn)
     row_layout.addWidget(remove_btn)
-    layout.addWidget(row)
-    layout.addWidget(ontology_tree_ui.scrollable(assign_label, 80))
-    ontology_tree_ui.shrinkable(dock)
-    ontology_tree_ui.shrinkable(tree)
-    ontology_tree_ui.set_dock_width(
-        viewer.window.add_dock_widget(dock, area="left", name="Atlas / Ontology"),
-        _ONTOLOGY_PANEL_START_PX)
+    upper_layout.addWidget(row)
+
+    lower = QWidget()
+    lower_layout = QVBoxLayout(lower)
+    lower_layout.setContentsMargins(0, 0, 0, 0)
+    lower_layout.addWidget(QLabel("Assigned so far -- select any region and remove it here."))
+    lower_layout.addWidget(assign_tree, 1)
+    lower_layout.addWidget(drop_btn)
+    lower_layout.addWidget(empty_note)
+
+    # A splitter, not two stacked widgets: how much of the column the
+    # assignment is worth depends on how many labels there are (five or six
+    # is normal), and that is exactly what a fixed split cannot know.
+    splitter = QSplitter(Qt.Vertical)
+    splitter.addWidget(upper)
+    splitter.addWidget(lower)
+    splitter.setStretchFactor(0, 3)
+    splitter.setStretchFactor(1, 2)
+    splitter.setSizes([560, 320])
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(splitter)
+    for widget in (dock, tree, assign_tree, upper, lower, splitter, empty_note):
+        ontology_tree_ui.shrinkable(widget)
+    dock_widget = viewer.window.add_dock_widget(dock, area="left", name="Atlas / Ontology")
+    ontology_tree_ui.set_dock_width(dock_widget, _ONTOLOGY_PANEL_START_PX)
 
     refresh_filter()
     refresh_assignment()
-    return SimpleNamespace(refresh_assignment=refresh_assignment)
+    return SimpleNamespace(refresh_assignment=refresh_assignment, dock=dock_widget)
 
 
 def _run_guide(args):
@@ -1309,24 +1494,32 @@ def _run_guide(args):
         status_label.setText(msg)
         print(msg)
 
-    _make_export_dock(viewer, status_label, export, "Export Outline", "Guide Outline Export")
+    export_dock = _make_export_dock(viewer, status_label, export, "Export Outline",
+                                    "Guide Outline Export")
 
     # A bulk relabel has to carry the region assignment with it, or the label
     # keeps its voxels and loses its meaning -- the exact thing the ontology
     # picker exists to prevent. Merging onto a label that already has a region
     # keeps the destination's, since that is the one the user just pointed at.
+    # An EMPTY entry travels too (`is not None`, not truthiness): the reminder
+    # that a label lost its regions belongs to whichever number now carries
+    # those voxels.
     def _assignment_follows_relabel(src, dst):
         if assignment is None:
             return
         ids = assignment.pop(src, None)
-        if ids and dst not in assignment:
+        if ids is not None and dst not in assignment:
             assignment[dst] = ids
         if picker is not None:
             picker.refresh_assignment()
 
-    _add_relabel_panel(viewer, paint_layer, on_change=_assignment_follows_relabel)
-    _add_erase_panel(viewer, paint_layer)
-    _add_display_panel(viewer, [paint_layer])
+    relabel_dock = _add_relabel_panel(viewer, paint_layer,
+                                      on_change=_assignment_follows_relabel)
+    erase_dock = _add_erase_panel(viewer, paint_layer)
+    display_dock = _add_display_panel(viewer, [paint_layer])
+    _tab_the_panels(viewer,
+                    left=[picker.dock] if picker is not None else [],
+                    right=[export_dock, relabel_dock, erase_dock, display_dock])
 
 
 # =====================================================================================
@@ -1711,21 +1904,27 @@ def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels
         "Brush label -> atlas region. Expanding splits one group into its\n"
         f"ontology children; children under {min_mm3} mm3 stay with the parent,\n"
         "because a guide region that small drags the deformation the wrong way."))
-    layout.addWidget(listing)
+    # The stretch, plus a status box pinned to its own height: the group list
+    # is what this panel is FOR and a partition routinely runs to a dozen
+    # groups, so spare height belongs to it rather than to the blank half of
+    # a message box. (Height only -- the width stays draggable, see
+    # ontology_tree_ui.shrinkable.)
+    layout.addWidget(listing, 1)
     row = QWidget()
     row_layout = QHBoxLayout(row)
     row_layout.addWidget(expand_btn)
     row_layout.addWidget(merge_btn)
     layout.addWidget(row)
     layout.addWidget(isolate)
-    layout.addWidget(ontology_tree_ui.scrollable(status, 100))
+    status_box = ontology_tree_ui.scrollable(status, 100)
+    status_box.setMaximumHeight(100)
+    layout.addWidget(status_box)
     ontology_tree_ui.shrinkable(dock)
     ontology_tree_ui.shrinkable(listing)
-    ontology_tree_ui.set_dock_width(
-        viewer.window.add_dock_widget(dock, area="left", name="Partition"),
-        _ONTOLOGY_PANEL_START_PX)
+    dock_widget = viewer.window.add_dock_widget(dock, area="left", name="Partition")
+    ontology_tree_ui.set_dock_width(dock_widget, _ONTOLOGY_PANEL_START_PX)
     refresh()
-    return SimpleNamespace(refresh=refresh)
+    return SimpleNamespace(refresh=refresh, dock=dock_widget)
 
 
 def _run_labels(args):
@@ -1958,14 +2157,17 @@ def _run_labels(args):
     dock = QWidget()
     QVBoxLayout(dock).addWidget(hover_label)
     ontology_tree_ui.shrinkable(dock)
-    viewer.window.add_dock_widget(dock, area="right", name="Under cursor")
-    _make_export_dock(viewer, status_label, export, "Export Guide + Atlas",
-                      "Registration Correction Export")
-    _add_relabel_panel(viewer, paint_layer, on_change=lambda src, dst: status_label.setText(
-        f"Bulk relabel {src} -> {dst} touched every plane it appears on -- each of those is "
-        f"now a keyframe.\n" + describe()))
-    _add_erase_panel(viewer, paint_layer)
-    _add_display_panel(viewer, [paint_layer, reference])
+    hover_dock = viewer.window.add_dock_widget(dock, area="right", name="Under cursor")
+    export_dock = _make_export_dock(viewer, status_label, export, "Export Guide + Atlas",
+                                    "Registration Correction Export")
+    relabel_dock = _add_relabel_panel(
+        viewer, paint_layer, on_change=lambda src, dst: status_label.setText(
+            f"Bulk relabel {src} -> {dst} touched every plane it appears on -- each of those is "
+            f"now a keyframe.\n" + describe()))
+    erase_dock = _add_erase_panel(viewer, paint_layer)
+    display_dock = _add_display_panel(viewer, [paint_layer, reference])
+    _tab_the_panels(viewer, left=[panel.dock],
+                    right=[export_dock, hover_dock, relabel_dock, erase_dock, display_dock])
 
 
 # =====================================================================================
@@ -2429,6 +2631,25 @@ def selftest_seed_assignment():
     print("   ok")
 
 
+def selftest_assignment_rows():
+    print("20. assignment panel rows: an emptied brush label is reported, not dropped")
+    structures = _fake_ontology()
+    assignment = {1: [101, 10], 3: []}
+
+    rows = assignment_rows(assignment, structures)
+    assert [label for label, _regions in rows] == [1, 3], rows
+    assert [sid for sid, _name in rows[0][1]] == [101, 10], rows
+    assert all(name for _sid, name in rows[0][1]), "a row must carry the region's name"
+    assert rows[1][1] == [], "an emptied label still gets a row of its own"
+
+    # THE point: a label whose regions were all removed is still visible, so
+    # "I painted with 3 and it exports as nothing" is caught in the panel
+    # rather than in guide_export_warnings after the export.
+    assert empty_assignment_labels(assignment) == [3]
+    assert empty_assignment_labels({1: [101]}) == []
+    print("   ok")
+
+
 def selftest_interpolator_matches_registration_ants():
     print("11. local reference interpolator == registration_ants.mask_utils (when available)")
     try:
@@ -2660,6 +2881,7 @@ def run_selftests():
     selftest_config_normalizers()
     selftest_interpolator_matches_registration_ants()
     selftest_seed_assignment()
+    selftest_assignment_rows()
 
     # mode: labels -- painting on a registration result (see that section above)
     selftest_plane_keyframes_are_whole_planes()
