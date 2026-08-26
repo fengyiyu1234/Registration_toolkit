@@ -162,11 +162,12 @@ Add `sample_path` to the config and the same window becomes a **tilt gauge**:
 the three planes then stand for the sample's own axes (the light-sheet frame —
 the stack was cut at whatever angle the brain was lying at, and no one can aim
 a sheet to the degree), and the frame's three angles become how far the atlas
-has to be turned to meet them. Each pane draws that sample plane beside the
-atlas reslice, or superimposed on it in additive green/magenta; the Sample
-panel holds three offsets, one scale and an auto-fit to get the two brains the
-same size and in the same place first. The sample is never rotated, never
-resampled and never written — what you take away is three angles.
+has to be turned to meet them. The sample is drawn in **one** pane, as the
+plane the microscope acquired, with **its own slider that moves nothing else**;
+the atlas sits beside it, or superimposed on it in additive green/magenta. The
+Sample panel holds an in-plane offset, one scale and an auto-fit to get the two
+brains the same size and in the same place first. The sample is never rotated,
+never resampled and never written — what you take away is three angles.
 
 The sample is normally the **raw acquisition**: a multi-gigabyte, strongly
 anisotropic TIFF (`sample_resolution_um: [2.6, 2.6, 32.0]`, in the pipeline's
