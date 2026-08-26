@@ -13,9 +13,11 @@ The three panes are not restricted to the atlas's own voxel axes: they are
 three mutually orthogonal PLANES that can be tilted as a rigid frame (see
 _add_plane_panel and plane_slice), so a sample cut at an angle can be matched
 by reslicing the atlas at that angle instead of eyeballing it between two
-axis-aligned slices. Shift+drag inside any pane rotates the frame about that
-pane's own normal, which is exactly "turn the picture in this view and watch
-the other two views reslice".
+axis-aligned slices. The ATLAS ITSELF never moves: what you drag is the pair
+of coloured lines lying across a pane -- where the other two planes cut
+through it -- and those two panes reslice to the angle you aim them at. Each
+pane also carries its own slider, under its own canvas, for scrolling that
+plane along its normal.
 
 This used to be a second window paint_mask.py opened from its own ontology
 picker, kept in sync with paint_mask's brush-label assignment. It is
@@ -62,20 +64,20 @@ from shared import ontology_tree_ui  # the shared Qt ontology tree widget
 # without a display or even PyQt5 installed.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
 QAbstractItemView = QCheckBox = QLineEdit = QSplitter = QTreeWidget = Qt = None
-QDoubleSpinBox = QGridLayout = QSlider = QFontMetrics = None
+QDoubleSpinBox = QGridLayout = QSlider = QFont = QFontMetrics = QSize = None
 ViewerModel = QtViewer = None
 
 
 def _import_gui():
     global napari, QLabel, QPushButton, QVBoxLayout, QWidget
     global QAbstractItemView, QCheckBox, QLineEdit, QSplitter, QTreeWidget, Qt
-    global QDoubleSpinBox, QGridLayout, QSlider, QFontMetrics
+    global QDoubleSpinBox, QGridLayout, QSlider, QFont, QFontMetrics, QSize
     global ViewerModel, QtViewer
     import napari as _napari
     from napari.components import ViewerModel as _ViewerModel
     from napari.qt import QtViewer as _QtViewer
-    from PyQt5.QtCore import Qt as _Qt
-    from PyQt5.QtGui import QFontMetrics as _QFontMetrics
+    from PyQt5.QtCore import QSize as _QSize, Qt as _Qt
+    from PyQt5.QtGui import QFont as _QFont, QFontMetrics as _QFontMetrics
     from PyQt5.QtWidgets import (QAbstractItemView as _QAbstractItemView,
                                  QCheckBox as _QCheckBox, QDoubleSpinBox as _QDoubleSpinBox,
                                  QGridLayout as _QGridLayout, QLabel as _QLabel,
@@ -89,7 +91,7 @@ def _import_gui():
     QCheckBox, QLineEdit, QSplitter = _QCheckBox, _QLineEdit, _QSplitter
     QTreeWidget, Qt = _QTreeWidget, _Qt
     QDoubleSpinBox, QGridLayout, QSlider = _QDoubleSpinBox, _QGridLayout, _QSlider
-    QFontMetrics = _QFontMetrics
+    QFont, QFontMetrics, QSize = _QFont, _QFontMetrics, _QSize
     # ViewerModel + QtViewer are the "a napari canvas without its own window"
     # pair the extra ortho panes are built from.
     ViewerModel, QtViewer = _ViewerModel, _QtViewer
@@ -147,15 +149,27 @@ _ORTHO_DOCK_HEIGHT = 300
 _REGION_DOCK_WIDTH = 340
 _REGION_NAME_COLUMN_WIDTH = 260
 
-# The hover bar along the bottom (_add_hover_bar): its height in px, its type
-# size, and how many ontology levels it will show at most before it starts
-# folding the shallow end away.
+# The hover bar along the bottom (_add_hover_bar): its STARTING height in px
+# (draggable afterwards, like every other dock here), the type size that
+# height corresponds to, and how many ontology levels it will show at most
+# before it starts folding the shallow end away. Dragging the bar taller or
+# shorter scales the type with it, between the two limits -- a one-line bar
+# has nothing else to do with the height, and "make the text bigger" is the
+# reason to want a taller one.
 _HOVER_BAR_HEIGHT = 64
+_HOVER_BAR_MIN_HEIGHT = 26
 _HOVER_BAR_FONT_PT = 15
+_HOVER_BAR_FONT_PT_RANGE = (8, 36)
 _HOVER_BAR_MAX_LEVELS = 6
 _HOVER_BAR_PADDING_PX = 14
 _HOVER_SEPARATOR = "  \u203a  "
 _HOVER_ELLIPSIS = "\u2026"
+
+# How near a cut line a press has to land to grab it and start aiming that
+# plane instead of panning the camera (see grabbed_cut_line). Screen pixels,
+# converted through the pane's zoom, so it is the same target on screen at
+# any magnification.
+_LINE_GRAB_PX = 8
 
 # How far the mouse may travel between press and release and still count as a
 # click rather than the start of a camera pan (see _pane_mouse_callback).
@@ -226,8 +240,10 @@ def rotated_frame(frame, pane_axis, angle):
 
     The frame stays rigid: the pane you are dragging in keeps its plane
     exactly (its normal is the rotation axis, so it is fixed), and the OTHER
-    two planes swing round it. That is the whole interaction -- one pane's
-    picture turns, the other two panes reslice.
+    two planes swing round it. That is the whole interaction -- the dragged
+    pane's picture does not move at all (see plane_basis: its drawing axes do
+    not turn with the frame either), its two cut lines swing across it, and
+    the other two panes reslice to the angle those lines now describe.
     """
     rotation = rotation_about(np.asarray(frame, dtype=float)[pane_axis], angle)
     return orthonormal_frame(np.asarray(frame, dtype=float) @ rotation.T)
@@ -269,6 +285,68 @@ def euler_from_frame(frame):
         a0 = np.arctan2(rotation[1, 0], rotation[1, 1])
         a2 = 0.0
     return tuple(float(np.rad2deg(a)) for a in (a0, a1, a2))
+
+
+def axes_from_frame(frame, order):
+    """The 3x3 view matrix one pane starts from: its normal, then the axis
+    drawn down the screen and the one drawn across it, straight out of
+    `frame` in `order`.
+
+    Only the STARTING point. From here each pane carries its own two drawing
+    axes (plane_basis) instead of re-reading them off the frame, which is
+    what keeps the sample still while the planes turn.
+    """
+    frame = np.asarray(frame, dtype=float)
+    return np.array([frame[order[0]], frame[order[1]], frame[order[2]]])
+
+
+def pane_handedness(axes):
+    """+1 or -1: whether a pane's (normal, row, col) is right- or left-handed.
+
+    Pane 1 draws axes (0, 2) down and across, which with axis 1 pointing at
+    the viewer is a LEFT-handed triple, while panes 0 and 2 are right-handed.
+    Without this sign a rotation drag would turn the cut lines the wrong way
+    in exactly one of the three panes, and plane_basis would mirror its
+    picture. It is a property of the pane, fixed once at construction: a
+    rotation cannot change it.
+    """
+    axes = np.asarray(axes, dtype=float)
+    return float(np.sign(np.dot(np.cross(axes[0], axes[1]), axes[2])))
+
+
+def plane_basis(normal, row_hint, col_hint, handedness=1.0):
+    """An orthonormal (row, col) pair spanning the plane with `normal`, kept
+    as close to (row_hint, col_hint) as that plane allows.
+
+    THIS IS WHAT HOLDS THE SAMPLE STILL. A pane's picture is sampled along
+    its two drawing axes, and this viewer used to take them straight off the
+    global frame -- so turning the frame about a pane's own normal spun that
+    pane's picture on screen even though its plane had not moved at all. What
+    the user sees then is the atlas rotating under a fixed cut, i.e. exactly
+    backwards from "hold the sample still and tilt the plane".
+
+    Carrying the pane's PREVIOUS axes across instead makes its picture
+    invariant whenever its own plane is unchanged (the rotation the drag
+    applies is about this pane's normal, which leaves both hints already in
+    the plane, so they come back untouched), and moves it as little as the
+    geometry allows when the plane really does tilt.
+
+    Gram-Schmidt against the new normal, with the sign of the pair preserved
+    (`handedness`) so a picture can never mirror, plus a fallback for the one
+    degenerate case -- a plane tilted until the old row axis points along the
+    new normal, where the old COLUMN axis is still a perfectly good hint.
+    """
+    normal = np.asarray(normal, dtype=float)
+    normal = normal / np.linalg.norm(normal)
+    row = np.asarray(row_hint, dtype=float)
+    row = row - np.dot(row, normal) * normal
+    if np.linalg.norm(row) < 1e-3:
+        # cross(col, normal) is perpendicular to both, and with this sign the
+        # column axis below comes back out as col_hint itself.
+        row = handedness * np.cross(np.asarray(col_hint, dtype=float), normal)
+    row = row / np.linalg.norm(row)
+    col = handedness * np.cross(normal, row)
+    return np.array([row, col])
 
 
 def plane_bounds(shape, origin, direction):
@@ -329,12 +407,13 @@ def resample_plane(volumes, shape, point0, row_dir, col_dir, s_vals, t_vals):
     return sampled
 
 
-def plane_slice(volumes, shape, origin, frame, centre, order, stride=1):
-    """Everything one pane draws, for the current frame and crosshair.
+def plane_slice(volumes, shape, origin, axes, centre, stride=1):
+    """Everything one pane draws, for the current plane and crosshair.
 
-    `order` is one _ORTHO_PANES entry: order[0] picks the frame row that is
-    this pane's normal, order[1] the row drawn down the screen and order[2]
-    the row drawn across it. At the identity frame that reproduces the plain
+    `axes` is the pane's 3x3 view matrix (axes_from_frame / plane_basis): row
+    0 is the plane's normal, which comes from the global frame; rows 1 and 2
+    are the pane's OWN drawing axes, down the screen and across it, which do
+    not turn with the frame. At the identity frame that reproduces the plain
     axis-aligned slices this viewer used to show, voxel for voxel.
 
     In-plane coordinates (s, t) are measured from `origin`, NOT from the
@@ -348,8 +427,7 @@ def plane_slice(volumes, shape, origin, frame, centre, order, stride=1):
     the crosshair's own (s, t) -- which is where the other two planes cut
     through this one.
     """
-    frame = np.asarray(frame, dtype=float)
-    normal, row_dir, col_dir = frame[order[0]], frame[order[1]], frame[order[2]]
+    normal, row_dir, col_dir = np.asarray(axes, dtype=float)
     rel = np.asarray(centre, dtype=float) - np.asarray(origin, dtype=float)
     offset = float(np.dot(rel, normal))
 
@@ -381,13 +459,13 @@ def expand_coarse(image, rows, cols, stride):
     return image.repeat(stride, axis=0).repeat(stride, axis=1)[:rows, :cols]
 
 
-def plane_point(origin, frame, order, offset, s, t):
+def plane_point(origin, axes, offset, s, t):
     """The voxel coordinate of in-plane point (s, t) on the plane `offset`
-    away from `origin` along plane `order[0]`'s normal. Inverse of the
-    projection plane_slice reports -- what a click in a pane means in 3D."""
-    frame = np.asarray(frame, dtype=float)
-    return (np.asarray(origin, dtype=float) + offset * frame[order[0]]
-            + s * frame[order[1]] + t * frame[order[2]])
+    away from `origin` along `axes`'s normal. Inverse of the projection
+    plane_slice reports -- what a click in a pane means in 3D."""
+    normal, row_dir, col_dir = np.asarray(axes, dtype=float)
+    return (np.asarray(origin, dtype=float) + offset * normal
+            + s * row_dir + t * col_dir)
 
 
 def plane_offsets(centre, frame, origin):
@@ -407,40 +485,93 @@ def centre_from_offsets(offsets, frame, origin):
     return np.asarray(origin, dtype=float) + np.asarray(offsets, dtype=float) @ frame
 
 
-def crosshair_vectors(sl, shift=(0.0, 0.0)):
+def cut_directions(axes, frame, order):
+    """The two in-plane directions, in this pane's own (s, t) coordinates,
+    along which the other two planes cut it.
+
+    Plane k meets this pane along cross(normal, frame[k]) -- the one
+    direction perpendicular to both normals -- read off in the pane's drawing
+    axes. Returned in the order (plane order[1], plane order[2]), which is
+    what _PANE_COLOURS colours the two lines by.
+
+    While the pane's axes came straight off the frame these were always
+    (0, 1) and (1, 0), which is why the cross used to be drawn axis-aligned.
+    Now that a pane holds its own axes (plane_basis) they are what MOVES when
+    you drag: the picture stays, the lines swing.
+    """
+    normal, row_dir, col_dir = np.asarray(axes, dtype=float)
+    frame = np.asarray(frame, dtype=float)
+    directions = []
+    for k in (order[1], order[2]):
+        along = np.cross(normal, frame[k])
+        length = np.linalg.norm(along)
+        if length < 1e-12:              # a plane parallel to this one: no line
+            directions.append((0.0, 0.0))
+            continue
+        along = along / length
+        directions.append((float(np.dot(along, row_dir)), float(np.dot(along, col_dir))))
+    return directions
+
+
+def line_in_box(point, direction, lo, hi):
+    """(a, b): the range of `a*direction` over which point + a*direction stays
+    inside the box [lo, hi], or None if the line misses it.
+
+    What keeps an obliquely drawn cut line exactly as long as the picture is
+    wide. The lines are no longer parallel to the grid, so neither "the full
+    width" nor "the full height" is their length any more, and a line simply
+    made long enough to always cross would stick out past the image and drag
+    napari's reset_view zoom out with it.
+    """
+    near, far = -np.inf, np.inf
+    for value, step, low, high in zip(point, direction, lo, hi):
+        if abs(step) < 1e-12:
+            if value < low or value > high:
+                return None             # parallel to this edge, and outside it
+            continue
+        first, second = (low - value) / step, (high - value) / step
+        near = max(near, min(first, second))
+        far = min(far, max(first, second))
+    return (near, far) if far > near else None
+
+
+def crosshair_vectors(sl, directions, shift=(0.0, 0.0)):
     """napari Vectors data (2, 2, 2) for one pane: the two lines where the
-    other two planes cut through this one.
+    other two planes cut through this one, clipped to the drawn grid.
 
     Two lines, not three: the third plane is this pane's own, and it meets the
-    pane everywhere rather than along a line. Because the frame stays rigid,
-    those two cuts are always perpendicular and always run along the pane's
-    own axes -- what changes when you tilt is the picture underneath them, not
-    the cross. The line at constant s belongs to plane order[1] and the one at
-    constant t to plane order[2], which is what _PANE_COLOURS colours them by.
+    pane everywhere rather than along a line. The frame is rigid, so the two
+    are always perpendicular to each other and always cross at the crosshair
+    -- but they are no longer parallel to the pane's own axes. That is the
+    point: turning the frame about this pane's normal leaves its picture
+    exactly where it was and swings these two lines across it, so the lines
+    ARE the handle for "how are the other two planes angled".
+
+    `directions` is the pair from cut_directions, in the same order.
     """
     s_shift, t_shift = float(shift[0]), float(shift[1])
-    s_c, t_c = sl.s_centre + s_shift, sl.t_centre + t_shift
-    s_lo, t_lo = sl.s_min + s_shift, sl.t_min + t_shift
-    return np.array([[[s_c, t_lo], [0.0, float(sl.t_max - sl.t_min)]],
-                     [[s_lo, t_c], [float(sl.s_max - sl.s_min), 0.0]]], dtype=float)
+    centre = np.array([sl.s_centre + s_shift, sl.t_centre + t_shift])
+    lo = np.array([sl.s_min + s_shift, sl.t_min + t_shift])
+    hi = np.array([sl.s_max + s_shift, sl.t_max + t_shift])
 
-
-def pane_handedness(frame, order):
-    """+1 or -1: whether (normal, row, col) is right- or left-handed.
-
-    Pane 1 draws axes (0, 2) down and across, which with axis 1 pointing at
-    the viewer is a LEFT-handed triple, while panes 0 and 2 are right-handed.
-    Without this sign a rotation drag would turn the picture the wrong way in
-    exactly one of the three panes.
-    """
-    frame = np.asarray(frame, dtype=float)
-    return float(np.sign(np.dot(np.cross(frame[order[0]], frame[order[1]]), frame[order[2]])))
+    lines = []
+    for direction in directions:
+        direction = np.asarray(direction, dtype=float)
+        length = np.linalg.norm(direction)
+        span = None if length < 1e-12 else line_in_box(centre, direction / length, lo, hi)
+        if span is None:
+            lines.append([centre, np.zeros(2)])      # nothing to draw
+            continue
+        near, far = span
+        direction = direction / length
+        lines.append([centre + near * direction, (far - near) * direction])
+    return np.array(lines, dtype=float)
 
 
 # =====================================================================================
 # the window
 # =====================================================================================
-def _add_atlas_layers(model, atlas, voxel, features, order, first):
+def _add_atlas_layers(model, atlas, voxel, features, order, first, cross):
     """The atlas's four layers, added to one ViewerModel in draw order.
 
     Called once per ortho pane. Unlike the axis-aligned viewer this grew out
@@ -473,7 +604,7 @@ def _add_atlas_layers(model, atlas, voxel, features, order, first):
                                  colormap=napari.utils.DirectLabelColormap(
                                      color_dict={None: "transparent", 1: "red"}))
     highlight.editable = False              # a reference; painting here would mean nothing
-    cross = model.add_vectors(crosshair_vectors(first), name="crosshair",
+    cross = model.add_vectors(cross, name="crosshair",
                               edge_color=[_PANE_COLOURS[order[1]], _PANE_COLOURS[order[2]]],
                               edge_width=1.5, vector_style="line", opacity=0.9, scale=scale)
     return SimpleNamespace(template=template, annotation=annotation,
@@ -505,20 +636,29 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
 
     ONE CROSSHAIR over all of them, and it is now two PLANE CUTS rather than
     two lines through a voxel grid: left-clicking any pane recentres all three
-    planes on the clicked point, and Shift+left-drag turns the whole frame
-    about the dragged pane's normal, so that pane's picture follows the mouse
-    while the other two reslice live. Both go through one piece of state
-    (`state.frame`, `state.centre`), so the sliders, the angle boxes, clicks,
-    drags and "jump to region" cannot disagree about where the planes are.
+    planes on the clicked point, and dragging one of the two coloured cut
+    lines (or Shift+left-dragging anywhere in the pane) swings that cut round,
+    reslicing the other two panes live to the angle it now describes. The
+    dragged pane's OWN picture does not move while you do it -- see
+    plane_basis: each pane draws on axes it carries itself rather than on the
+    frame's other two rows, so the gesture looks like "the sample holds still
+    and the plane turns" instead of the atlas spinning under a fixed cut.
+    Both go through one piece of state (`state.frame`, `state.centre`), so the
+    sliders, the angle boxes, clicks, drags and "jump to region" cannot
+    disagree about where the planes are.
+
+    A SLIDER UNDER EVERY PANE (_add_pane_slider) scrolls that pane's plane
+    along its own normal, so the view you are looking at is the one you
+    scroll; the plane panel's three sliders hold the same three numbers.
 
     A HOVER BAR (_add_hover_bar) along the bottom, because the one structure
     a voxel is labelled with is usually a leaf ("layer 5 of primary motor
     area") and the level you are actually picking is one of its ancestors: it
     reads out the deepest few levels of that chain in large type, painted in
-    the region's own annotation colour. A
-    PLANE PANEL (_add_plane_panel) on the right holds the frame itself: one
-    position slider per plane and one angle box per data axis, for the times
-    you want an exact 12 degrees rather than a dragged one. A separate
+    the region's own annotation colour. A PLANE PANEL (_add_plane_panel) on the
+    right holds the frame itself: one position slider per plane and one angle
+    box per data axis, for the times you want an exact 12 degrees rather than
+    a dragged one (and the panes' own sliders for the times you do not). A separate
     REGION-SELECTION panel (_add_region_panel) on the left is what drives the
     tree click -> highlight path -- see that function for why it gets its own
     dedicated side.
@@ -552,13 +692,27 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         return vols
 
     def slice_for(pane):
-        return plane_slice(volumes(), shape, origin, state.frame, state.centre,
-                           pane.order, stride=state.stride)
+        return plane_slice(volumes(), shape, origin, pane.axes, state.centre,
+                           stride=state.stride)
+
+    def new_pane(model, qt, order):
+        """One pane's own state: which plane it draws, the two axes it draws
+        that plane on (its own, see plane_basis), its handedness (fixed) and
+        the screen shift that keeps its crosshair still."""
+        axes = axes_from_frame(state.frame, order)
+        return SimpleNamespace(model=model, qt=qt, order=order, shift=np.zeros(2),
+                               axes=axes, handedness=pane_handedness(axes), column=None)
+
+    def pane_cross(pane, sl):
+        return crosshair_vectors(sl, cut_directions(pane.axes, state.frame, pane.order),
+                                 pane.shift)
 
     viewer = napari.Viewer(title="Atlas viewer")
-    main = SimpleNamespace(model=viewer, qt=None, order=panes[0][0], shift=np.zeros(2))
+    main = new_pane(viewer, None, panes[0][0])
+    main.column = _main_pane_column(viewer)
+    first = slice_for(main)
     main.layers = _add_atlas_layers(viewer, atlas, voxel, features, main.order,
-                                    slice_for(main))
+                                    first, pane_cross(main, first))
     built = [main]
 
     for order, _title in panes[1:]:
@@ -569,8 +723,10 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         # Adding to an empty model routes through the same code path one layer
         # at a time, where the map is always current.
         qt = QtViewer(model)
-        pane = SimpleNamespace(model=model, qt=qt, order=order, shift=np.zeros(2))
-        pane.layers = _add_atlas_layers(model, atlas, voxel, features, order, slice_for(pane))
+        pane = new_pane(model, qt, order)
+        first = slice_for(pane)
+        pane.layers = _add_atlas_layers(model, atlas, voxel, features, order,
+                                        first, pane_cross(pane, first))
         built.append(pane)
         model.reset_view()
 
@@ -585,6 +741,7 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
             heading.setStyleSheet(f"color: {_PANE_COLOURS[order[0]]};")
             layout.addWidget(heading)
             layout.addWidget(pane.qt)
+            pane.column = layout          # the pane's own slider goes here
             # A bare QtViewer asks for 800x626 and Qt would honour both of
             # them: two side by side in a bottom dock open a ~1600px-wide
             # window whose main canvas is a letterbox. A small floor plus the
@@ -618,7 +775,7 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
                 layer = getattr(pane.layers, role)
                 layer.data = expand_coarse(image, rows, cols, state.stride)
                 layer.translate = translate
-            pane.layers.cross.data = crosshair_vectors(sl, pane.shift)
+            pane.layers.cross.data = pane_cross(pane, sl)
 
     def apply_state():
         refresh()
@@ -629,23 +786,33 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         """The crosshair's position in `pane`'s own drawn coordinates, shift
         included -- i.e. where on screen the cross is."""
         rel = state.centre - origin
-        return np.array([np.dot(rel, state.frame[pane.order[1]]) + pane.shift[0],
-                         np.dot(rel, state.frame[pane.order[2]]) + pane.shift[1]])
+        return np.array([np.dot(rel, pane.axes[1]) + pane.shift[0],
+                         np.dot(rel, pane.axes[2]) + pane.shift[1]])
 
     def set_frame(frame):
         """Turn the planes, pivoting each pane's picture on ITS CROSSHAIR.
 
         In-plane coordinates are measured from the volume's middle voxel, so
-        left alone a rotation would swing the picture about the middle of the
+        left alone a tilt would swing each reslice about the middle of the
         atlas -- away from whatever the user centred on before reaching for
         the rotation, which is invariably the thing they are trying to line
         up. Each pane keeps a `shift` that absorbs the difference, so the
-        crosshair stays put on screen and the picture turns around it, while
+        crosshair stays put on screen and the new cut appears around it, while
         clicks (which do not touch the frame) still leave the picture alone.
+
+        Each pane's DRAWING AXES are carried across here too, from its old
+        plane to its new one, rather than re-read off the frame (plane_basis).
+        A pane whose own plane did not move -- the one being dragged, whose
+        normal is the rotation axis -- therefore keeps its axes exactly, and
+        its picture does not budge: what turns is the pair of cut lines drawn
+        over it, and the other two panes' pictures.
         """
         before = [crosshair_in_pane(pane) for pane in built]
         state.frame = orthonormal_frame(frame)
         for pane, was in zip(built, before):
+            normal = state.frame[pane.order[0]]
+            pane.axes = np.array([normal, *plane_basis(normal, pane.axes[1], pane.axes[2],
+                                                       pane.handedness)])
             pane.shift += was - crosshair_in_pane(pane)
         apply_state()
 
@@ -670,6 +837,7 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         state.frame = identity_frame()
         for pane in built:
             pane.shift[:] = 0.0
+            pane.axes = axes_from_frame(state.frame, pane.order)
         apply_state()
         for pane in built:
             pane.model.reset_view()
@@ -697,8 +865,8 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         """A napari world position in `pane` -> the voxel it points at."""
         s = float(world[0]) / voxel - pane.shift[0]
         t = float(world[1]) / voxel - pane.shift[1]
-        offset = float(np.dot(state.centre - origin, state.frame[pane.order[0]]))
-        return plane_point(origin, state.frame, pane.order, offset, s, t)
+        offset = float(np.dot(state.centre - origin, pane.axes[0]))
+        return plane_point(origin, pane.axes, offset, s, t)
 
     win = SimpleNamespace(viewer=viewer, panes=built, state=state, origin=origin,
                           voxel=voxel, shape=shape,
@@ -709,6 +877,8 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
 
     for pane in built:
         pane.model.mouse_drag_callbacks.append(_pane_mouse_callback(pane, win))
+        if pane.column is not None:
+            pane.slider = _add_pane_slider(pane, win, pane.column)
     main.model.reset_view()
 
     win.hover = _add_hover_bar(viewer, atlas, built, below=ortho_dock)
@@ -718,17 +888,28 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
 
 def _pane_mouse_callback(pane, win):
     """Left-click anywhere in a pane -> crosshair there, in every pane;
-    Shift+left-drag -> turn the frame about this pane's normal.
+    left-drag ON one of the two cut lines (or Shift+left-drag anywhere) ->
+    swing those lines, i.e. tilt the other two planes.
+
+    The sample never moves. Dragging in a pane does not turn its picture --
+    that pane's plane is the rotation axis and its drawing axes are its own
+    (plane_basis) -- it turns the two coloured lines lying across it, which
+    are where the other two planes cut through. Those panes then reslice to
+    the new angle. So the gesture reads as "aim this cut", not "spin the
+    atlas".
+
+    Grabbing a line needs no modifier, because that is the natural handle and
+    a line is a small target; Shift+drag does the same thing from anywhere in
+    the pane, for when the lines are off screen or awkward to hit. Every
+    other unmodified drag is still napari's camera pan, and a press that
+    never moves is still a click that recentres -- including one that landed
+    on a line.
 
     A generator callback, which is napari's way of telling a click from the
     start of a drag: napari resumes it on every mouse_move and once more on
     release, so the decision can be made after the fact. A plain press handler
     cannot -- the same press that begins a camera pan would jump the crosshair
     on its way, and the atlas would slide out from under the pan.
-
-    Shift is what separates "turn the planes" from "pan the camera"; an
-    unmodified drag still belongs to napari, so panning and zooming are
-    untouched.
     """
     def callback(_model, event):
         if event.button != 1:
@@ -738,6 +919,11 @@ def _pane_mouse_callback(pane, win):
             return
         if event.modifiers:
             return                          # other modified drags stay napari's
+        if grabbed_cut_line(pane, win, event.position) is not None:
+            # A press on a line: a drag aims it, a click still recentres.
+            if not (yield from _rotation_drag(pane, win, event)):
+                win.centre_on(win.pane_position(pane, event.position))
+            return
         origin_px = np.asarray(event.pos, dtype=float)
         dragged = False
         yield
@@ -754,17 +940,54 @@ def _pane_mouse_callback(pane, win):
     return callback
 
 
-def _rotation_drag(pane, win, event):
-    """Shift+drag: the angle the cursor sweeps around the crosshair becomes
-    the angle the frame turns through, about this pane's normal.
+def point_line_distance(point, centre, direction):
+    """Perpendicular distance from `point` to the infinite line through
+    `centre` along `direction` (2D). Zero-length directions read as
+    infinitely far, so a pane parallel to another cannot be grabbed."""
+    direction = np.asarray(direction, dtype=float)
+    length = np.linalg.norm(direction)
+    if length < 1e-12:
+        return np.inf
+    direction = direction / length
+    rel = np.asarray(point, dtype=float) - np.asarray(centre, dtype=float)
+    return float(abs(rel[0] * direction[1] - rel[1] * direction[0]))
 
-    Measured around the crosshair because that is what set_frame pins the
-    picture to; the sign flips with the pane's handedness so that the picture
-    follows the mouse in all three panes rather than in two of them (see
-    pane_handedness).
+
+def grabbed_cut_line(pane, win, world_position, tolerance_px=None):
+    """Which cut line (0, 1 or None) a press at `world_position` grabs.
+
+    The tolerance is a screen distance, converted through the pane's zoom, so
+    a line is equally easy to grab however far in or out the view is zoomed.
+    """
+    tolerance_px = _LINE_GRAB_PX if tolerance_px is None else tolerance_px
+    zoom = float(getattr(pane.model.camera, "zoom", 1.0) or 1.0)
+    tolerance = tolerance_px / zoom / win.voxel
+    point = np.asarray(world_position, dtype=float)[:2] / win.voxel
+    centre = win.crosshair_in_pane(pane)
+    directions = cut_directions(pane.axes, win.state.frame, pane.order)
+    distances = [point_line_distance(point, centre, direction) for direction in directions]
+    nearest = int(np.argmin(distances))
+    return nearest if distances[nearest] <= tolerance else None
+
+
+def _rotation_drag(pane, win, event):
+    """The angle the cursor sweeps around the crosshair becomes the angle the
+    two cut lines swing through -- and with them the two planes they belong
+    to, about this pane's own normal.
+
+    Measured around the crosshair because that is where the lines cross and
+    what set_frame pins the picture to. The sign is the pane's handedness
+    NEGATED: rotating the frame by +a about a right-handed pane's normal
+    carries its in-plane vectors -- and so the cut lines drawn along them --
+    through -a on screen, so following the cursor means turning the frame the
+    other way. (While the drag turned the picture instead of the lines, the
+    sign was the other one, which is exactly the interaction this replaced.)
+
+    Returns True if it actually rotated anything, so the caller can treat a
+    press that never moved as a plain click.
     """
     axis = pane.order[0]
-    sign = pane_handedness(win.state.frame, pane.order)
+    sign = -pane.handedness
 
     def cursor_angle():
         rel = np.asarray(event.position, dtype=float)[:2] / win.voxel - win.crosshair_in_pane(pane)
@@ -773,6 +996,7 @@ def _rotation_drag(pane, win, event):
         return float(np.arctan2(rel[0], rel[1]))   # s down, t across: screen angle
 
     last = cursor_angle()
+    turned = False
     win.set_drag(True)
     # A left-drag is also how napari pans, and it does that from vispy rather
     # than through these callbacks -- so without muting it for the duration the
@@ -788,13 +1012,16 @@ def _rotation_drag(pane, win, event):
                 # atan2 wraps at +-pi; a drag straight through the wrap would
                 # otherwise read as a near-full turn the other way.
                 delta = float(np.arctan2(np.sin(delta), np.cos(delta)))
-                win.rotate(axis, sign * delta)
+                if delta:
+                    win.rotate(axis, sign * delta)
+                    turned = True
             if now is not None:
                 last = now
             yield
     finally:
         camera.mouse_pan = True
         win.set_drag(False)
+    return turned
 
 
 def _mirror_layer_attrs(panes):
@@ -853,6 +1080,79 @@ def _caption(text, height=52):
     bare wrapped label cannot be used -- its height would then grow every
     time the dock is narrowed, and drag the window's minimum size with it."""
     return _shrinkable(ontology_tree_ui.scrollable(QLabel(text), height))
+
+
+def _add_pane_slider(pane, win, layout):
+    """One slider per view, directly under that view's own canvas: where this
+    pane's plane sits along its own normal.
+
+    The plane panel on the right holds the same three numbers, but reaching
+    across the window to scroll the view you are looking at is precisely the
+    interaction this tool exists for -- so each pane gets its own. Both write
+    the same state (win.set_offsets) and both follow it (state.listeners), so
+    they cannot disagree about where a plane is; the slider is coloured like
+    the pane's heading and its cut lines, so which plane it scrolls is
+    readable without a label.
+
+    `layout` is the box the slider is appended to -- the wrapper around an
+    ortho pane, or the main viewer's own canvas column.
+    """
+    axis = pane.order[0]
+    slider = _shrinkable(QSlider(Qt.Horizontal))
+    slider.setToolTip(f"Scroll plane {axis} along its own normal")
+    colour = _PANE_COLOURS[axis]
+    slider.setStyleSheet(f"QSlider::handle:horizontal {{ background: {colour}; "
+                         f"border: 1px solid {colour}; width: 10px; "
+                         f"margin: -4px 0; border-radius: 3px; }}"
+                         "QSlider::groove:horizontal { height: 3px; background: #555; }")
+    busy = {"in": False}
+
+    def sync():
+        """Follow the state, whatever moved it -- a click in another pane, a
+        rotation, the panel's own slider. `busy` stops the write-back loop
+        that would otherwise start here (see the plane panel's sync)."""
+        offsets = plane_offsets(win.state.centre, win.state.frame, win.origin)
+        lo, hi = plane_bounds(win.shape, win.origin, win.state.frame[axis])
+        busy["in"] = True
+        try:
+            slider.setRange(lo, hi)
+            slider.setValue(int(round(offsets[axis])))
+        finally:
+            busy["in"] = False
+
+    def on_move(*_args):
+        if busy["in"]:
+            return
+        # Only THIS plane's offset changes; the other two keep the values the
+        # crosshair already has, so scrolling one view leaves the other two
+        # cuts where they were.
+        offsets = list(plane_offsets(win.state.centre, win.state.frame, win.origin))
+        offsets[axis] = float(slider.value())
+        win.set_offsets(offsets)
+
+    slider.valueChanged.connect(on_move)
+    slider.sliderPressed.connect(lambda: win.set_drag(True))
+    slider.sliderReleased.connect(lambda: win.set_drag(False))
+    win.state.listeners.append(sync)
+    sync()
+    layout.addWidget(slider)
+    return slider
+
+
+def _main_pane_column(viewer):
+    """The layout the main viewer's canvas lives in, so a pane slider can be
+    put under it exactly like the ortho panes' own.
+
+    napari's QtViewer is a splitter whose first widget is a column holding the
+    canvas and the dims sliders; appending to that column puts the slider
+    under the canvas. Private API, hence the guard: if a napari release moves
+    it, the main pane simply goes without its own slider (the plane panel
+    still has all three) rather than the window failing to open.
+    """
+    try:
+        return viewer.window._qt_viewer.canvas.native.parentWidget().layout()
+    except Exception:
+        return None
 
 
 def _add_plane_panel(viewer, win):
@@ -959,11 +1259,12 @@ def _add_plane_panel(viewer, win):
     dock.setMinimumWidth(1)
     layout = QVBoxLayout(dock)
     layout.addWidget(_caption(
-        "Three orthogonal planes, tiltable together. "
-        "Click a view to move all three; Shift+drag inside a view to turn the "
-        "frame about that view's own normal (its picture follows the mouse, "
-        "the other two views reslice). Coloured lines mark where each other "
-        "plane cuts through the view.", 72))
+        "Three orthogonal planes, tiltable together. The atlas itself never "
+        "moves: click a view to point all three planes at that voxel, and "
+        "drag one of the coloured lines lying across a view (or Shift+drag "
+        "anywhere in it) to swing that cut round -- the other two views "
+        "reslice to the angle you aim. Each view also has its own slider "
+        "underneath for scrolling that plane along its normal.", 96))
     layout.addWidget(QLabel("Position along each plane's normal"))
     layout.addLayout(positions)
     layout.addWidget(QLabel("Orientation (rotations about the atlas axes)"))
@@ -1035,6 +1336,23 @@ def fit_ancestry_line(labels, fits, max_levels=_HOVER_BAR_MAX_LEVELS):
     return line
 
 
+def hover_bar_font_pt(height,
+                      reference=(_HOVER_BAR_HEIGHT, _HOVER_BAR_FONT_PT),
+                      limits=_HOVER_BAR_FONT_PT_RANGE):
+    """Type size in points for a bar `height` px tall.
+
+    Straight proportion off the bar's default height/size pair, clamped: the
+    bar holds ONE line, so a taller bar is only worth anything if the line
+    grows with it, and a shorter one has to give the line back or it clips.
+    The clamp keeps a dock dragged to either extreme legible rather than
+    microscopic or absurd.
+    """
+    ref_height, ref_pt = reference
+    lo, hi = limits
+    scaled = int(round(ref_pt * float(height) / float(ref_height)))
+    return max(lo, min(hi, scaled))
+
+
 def hover_bar_colours(rgba):
     """(background, foreground) CSS colours for a bar painted in one label's
     own atlas colour.
@@ -1076,26 +1394,46 @@ def _add_hover_bar(viewer, atlas, panes, below=None):
     beneath it so it spans the whole width at the very bottom rather than
     being parked beside the ortho panes.
 
-    Returns SimpleNamespace(label=, show=) so the behaviour is testable
-    without synthesising Qt mouse events: `show` takes a compact index and is
-    the whole of what the mouse callbacks do.
+    Both the bar's width and its HEIGHT are the user's to drag, like every
+    other dock here: the width decides how many levels fit and the height
+    decides the type size (hover_bar_font_pt).
+
+    Returns SimpleNamespace(label=, show=, dock=) so the behaviour is
+    testable without synthesising Qt mouse events: `show` takes a compact
+    index and is the whole of what the mouse callbacks do.
     """
     resting = "Hover over the atlas to read the region under the cursor."
 
     class HoverBar(QLabel):
-        """A QLabel that re-fits its line whenever it is resized -- how many
-        levels fit is a function of the bar's width, so narrowing the window
-        has to fold levels away rather than clip them."""
+        """A QLabel that re-fits itself whenever it is resized: how many
+        levels fit is a function of the bar's width (so narrowing the window
+        folds levels away rather than clipping them) and the type size is a
+        function of its height (so dragging the dock taller enlarges the
+        line instead of padding it with empty colour).
+
+        It also REMEMBERS the height it was last given, and reports it as its
+        size hint. QMainWindow re-divides a dock area on every relayout --
+        every window resize, every other dock that opens -- handing each dock
+        what its contents ask for, so a one-line label whose hint is one line
+        tall gets squashed straight back to the minimum and the height the
+        user dragged the splitter to is lost. Hinting the current height
+        makes that redistribution a no-op instead.
+        """
+
+        def __init__(self, text):
+            super().__init__(text)
+            self._height = _HOVER_BAR_HEIGHT
+
+        def sizeHint(self):
+            return QSize(super().sizeHint().width(), self._height)
 
         def resizeEvent(self, event):
             super().resizeEvent(event)
+            if self.height() >= _HOVER_BAR_MIN_HEIGHT:
+                self._height = self.height()
             render()
 
     bar = HoverBar(resting)
-    font = bar.font()
-    font.setPointSize(_HOVER_BAR_FONT_PT)
-    font.setBold(True)
-    bar.setFont(font)
     bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     bar.setTextInteractionFlags(Qt.TextSelectableByMouse)
     # No word wrap and no minimum width: the line is fitted to the bar by
@@ -1103,12 +1441,37 @@ def _add_hover_bar(viewer, atlas, panes, below=None):
     # minimum height instead -- see ontology_tree_ui.scrollable.
     bar.setWordWrap(False)
     bar.setMinimumWidth(1)
-    bar.setMinimumHeight(_HOVER_BAR_HEIGHT)
-    bar.setMaximumHeight(_HOVER_BAR_HEIGHT)
+    # A floor, and no ceiling: the splitter above the bar is then draggable
+    # in both directions, which is the whole point of scaling the type with
+    # the height. The floor is explicit rather than left to the label's own
+    # minimumSizeHint so that neither the text nor the stylesheet padding can
+    # push the dock's minimum height back up, the way the panel captions used
+    # to push its width (see _shrinkable).
+    bar.setMinimumHeight(_HOVER_BAR_MIN_HEIGHT)
 
-    def paint(background, foreground):
-        bar.setStyleSheet(f"background: {background}; color: {foreground}; "
-                          f"padding: 0px {_HOVER_BAR_PADDING_PX}px;")
+    def bar_font():
+        """The font the line is drawn in: this bar's height, in points.
+
+        Built by hand rather than read back off the widget because
+        `bar.font()` is not the last word here -- napari sets a font-size on
+        every QLabel from its APPLICATION stylesheet, which in Qt beats
+        setFont() outright. The size therefore has to be written into the
+        bar's OWN stylesheet (a widget stylesheet beats the application's)
+        by paint(), and measured from a QFont assembled to match.
+        """
+        font = QFont(bar.font())
+        font.setPointSize(hover_bar_font_pt(bar.height()))
+        font.setBold(True)
+        return font
+
+    def paint(background, foreground, point_size):
+        style = (f"background: {background}; color: {foreground}; "
+                 f"padding: 0px {_HOVER_BAR_PADDING_PX}px; "
+                 f"font-size: {point_size}pt; font-weight: bold;")
+        # Re-applying an identical stylesheet still re-polishes the widget,
+        # which can resize it, which lands back here: only write on a change.
+        if style != bar.styleSheet():
+            bar.setStyleSheet(style)
 
     def colour_of(compact_index):
         """The RGBA napari paints this compact label with, straight out of
@@ -1126,21 +1489,19 @@ def _add_hover_bar(viewer, atlas, panes, below=None):
 
     def render():
         index = last["index"]
-        if index < 0:
-            paint("#20232a", "#c8ccd4")
-            bar.setText(resting)
-            return
-        if index == 0:
-            paint(*hover_bar_colours([0.0, 0.0, 0.0, 0.0]))
-            bar.setText("(background -- no region)")
+        font = bar_font()
+        if index <= 0:
+            neutral = hover_bar_colours([0.0, 0.0, 0.0, 0.0])
+            paint(*neutral, font.pointSize())
+            bar.setText(resting if index < 0 else "(background -- no region)")
             return
         sid = int(atlas.present_ids[index])
-        metrics = QFontMetrics(bar.font())
+        metrics = QFontMetrics(font)
         room = max(bar.width() - 2 * _HOVER_BAR_PADDING_PX - 4, 40)
         bar.setText(fit_ancestry_line(
             ancestry_labels(atlas.structures, sid),
             lambda text: metrics.horizontalAdvance(text) <= room))
-        paint(*hover_bar_colours(colour_of(index)))
+        paint(*hover_bar_colours(colour_of(index)), font.pointSize())
 
     def show(compact_index):
         if compact_index is None:
@@ -1170,6 +1531,9 @@ def _add_hover_bar(viewer, atlas, panes, below=None):
         # dock area left to right); splitting it off vertically is what makes
         # it a full-width strip under everything.
         qt_window.splitDockWidget(below, dock, Qt.Vertical)
+    # A starting height only: the bar is one line, but it is a draggable
+    # dock like the rest, and the line's type size follows whatever height
+    # it is dragged to.
     qt_window.resizeDocks([dock], [_HOVER_BAR_HEIGHT], Qt.Vertical)
     return SimpleNamespace(label=bar, show=show, dock=dock)
 
@@ -1331,7 +1695,7 @@ def selftest_ortho_panes_geometry():
     # The sign a rotation drag has to be corrected by is a property of the
     # pane layout, so it is worth pinning down here: pane 1 draws (0, 2),
     # which with axis 1 towards the viewer is left-handed.
-    signs = [pane_handedness(identity_frame(), order) for order in orders]
+    signs = [pane_handedness(axes_from_frame(identity_frame(), order)) for order in orders]
     assert signs == [1.0, -1.0, 1.0], signs
     print("   ok")
 
@@ -1387,7 +1751,7 @@ def selftest_identity_slices():
         for offset in (-2, 0, 3):
             centre = origin.copy()
             centre[order[0]] += offset
-            sl = plane_slice([volume], shape, origin, frame, centre, order)
+            sl = plane_slice([volume], shape, origin, axes_from_frame(frame, order), centre)
             image = sl.images[0]
             index = int(origin[order[0]]) + offset
             expected = np.take(volume, index, axis=order[0])
@@ -1411,15 +1775,16 @@ def selftest_oblique_sampling():
     frame = rotated_frame(rotated_frame(identity_frame(), 0, np.deg2rad(25)),
                           2, np.deg2rad(-15))
     order = (1, 0, 2)
+    axes = axes_from_frame(frame, order)
     centre = origin + np.array([1.0, -2.0, 0.5])
-    sl = plane_slice([volume], shape, origin, frame, centre, order)
+    sl = plane_slice([volume], shape, origin, axes, centre)
     image = sl.images[0]
 
     rng = np.random.default_rng(1)
     for _ in range(200):
         i = int(rng.integers(image.shape[0]))
         j = int(rng.integers(image.shape[1]))
-        point = plane_point(origin, frame, order, sl.offset, sl.s_min + i, sl.t_min + j)
+        point = plane_point(origin, axes, sl.offset, sl.s_min + i, sl.t_min + j)
         voxel = np.floor(point + 0.5).astype(int)
         if np.any(voxel < 0) or np.any(voxel >= np.array(shape)):
             assert image[i, j] == 0, (i, j, voxel, image[i, j])
@@ -1429,13 +1794,13 @@ def selftest_oblique_sampling():
 
     # A tilted plane still holds the point it is centred on, to well under a
     # voxel -- otherwise clicking would drift the crosshair off its own plane.
-    back = plane_point(origin, frame, order, sl.offset, sl.s_centre, sl.t_centre)
+    back = plane_point(origin, axes, sl.offset, sl.s_centre, sl.t_centre)
     assert np.allclose(back, centre, atol=1e-9), (back, centre)
 
     # Every volume handed to one call is read at the same coordinates: a mask
     # built from the volume must resample to the mask of the resampled volume.
     mask = (volume % 7 == 0).astype(np.uint8)
-    both = plane_slice([volume, mask], shape, origin, frame, centre, order)
+    both = plane_slice([volume, mask], shape, origin, axes, centre)
     inside = both.images[0] != 0
     assert np.array_equal(both.images[1][inside], (both.images[0][inside] % 7 == 0), ), "mask"
     print("   ok")
@@ -1457,24 +1822,56 @@ def selftest_offsets_roundtrip():
 
 
 def selftest_crosshair_vectors():
-    print("7. crosshair: two full-width lines crossing where the other planes cut")
+    print("7. crosshair: the cut lines cross at the crosshair and stop at the grid")
     shape = (6, 8, 10)
     volume = np.zeros(shape, dtype=np.uint8)
     origin = volume_origin(shape)
     order = (0, 1, 2)
+    frame = identity_frame()
+    axes = axes_from_frame(frame, order)
     centre = origin + np.array([0.0, 2.0, -3.0])
-    sl = plane_slice([volume], shape, origin, identity_frame(), centre, order)
-    vectors = crosshair_vectors(sl)
+    sl = plane_slice([volume], shape, origin, axes, centre)
+
+    # Un-tilted, the two cuts run along the pane's own axes, which is the
+    # plain axis-aligned cross this viewer has always drawn.
+    directions = cut_directions(axes, frame, order)
+    assert np.allclose(directions[0], (0, 1)), directions
+    assert np.allclose(np.abs(directions[1]), (1, 0)), directions
+    vectors = crosshair_vectors(sl, directions)
     assert vectors.shape == (2, 2, 2), vectors.shape
     # Line 0 is the plane-order[1] cut: constant s, spanning the full width.
-    assert np.isclose(vectors[0, 0, 0], sl.s_centre) and vectors[0, 1, 0] == 0
-    assert np.isclose(vectors[0, 1, 1], sl.t_max - sl.t_min)
+    assert np.isclose(vectors[0, 0, 0], sl.s_centre) and np.isclose(vectors[0, 1, 0], 0)
+    assert np.isclose(abs(vectors[0, 1, 1]), sl.t_max - sl.t_min)
     # Line 1 is the plane-order[2] cut: constant t, spanning the full height.
-    assert np.isclose(vectors[1, 0, 1], sl.t_centre) and vectors[1, 1, 1] == 0
-    assert np.isclose(vectors[1, 1, 0], sl.s_max - sl.s_min)
+    assert np.isclose(vectors[1, 0, 1], sl.t_centre) and np.isclose(vectors[1, 1, 1], 0)
+    assert np.isclose(abs(vectors[1, 1, 0]), sl.s_max - sl.s_min)
+
+    # Tilted, they are oblique -- still crossing at the crosshair, still
+    # perpendicular to each other, and still stopping at the grid's edge
+    # rather than running off past the picture.
+    turned = rotated_frame(frame, order[0], np.deg2rad(31))
+    oblique = cut_directions(axes, turned, order)
+    assert not np.allclose(oblique[0], (0, 1)), oblique
+    dots = np.dot(oblique[0], oblique[1])
+    assert abs(dots) < 1e-9, oblique
+    vectors = crosshair_vectors(sl, oblique)
+    lo = np.array([sl.s_min, sl.t_min])
+    hi = np.array([sl.s_max, sl.t_max])
+    for line, direction in zip(vectors, oblique):
+        start, span = line[0], line[1]
+        assert np.all(start >= lo - 1e-6) and np.all(start <= hi + 1e-6), line
+        assert np.all(start + span >= lo - 1e-6) and np.all(start + span <= hi + 1e-6), line
+        # The crosshair lies on the line, between its two ends.
+        cross = np.array([sl.s_centre, sl.t_centre])
+        along = np.dot(cross - start, span) / np.dot(span, span)
+        assert -1e-6 <= along <= 1 + 1e-6, (along, line)
+        assert np.isclose(point_line_distance(cross, start, span), 0, atol=1e-9), line
+        assert np.allclose(span / np.linalg.norm(span),
+                           np.array(direction) * np.sign(np.dot(span, direction))), line
+
     # A pane's shift moves the cross and its grid together -- it is what keeps
-    # the crosshair still on screen while a rotation turns the picture.
-    shifted = crosshair_vectors(sl, (2.5, -1.5))
+    # the crosshair still on screen while the planes turn.
+    shifted = crosshair_vectors(sl, directions, (2.5, -1.5))
     assert np.isclose(shifted[0, 0, 0], sl.s_centre + 2.5), shifted
     assert np.isclose(shifted[1, 0, 1], sl.t_centre - 1.5), shifted
     print("   ok")
@@ -1488,9 +1885,9 @@ def selftest_coarse_expansion():
     frame = frame_from_euler((13, 21, -7))
     centre = origin + np.array([1.0, 2.0, -3.0])
     for order, _title in _ORTHO_PANES:
-        full = plane_slice([volume], shape, origin, frame, centre, order)
-        coarse = plane_slice([volume], shape, origin, frame, centre, order,
-                             stride=_DRAG_STRIDE)
+        axes = axes_from_frame(frame, order)
+        full = plane_slice([volume], shape, origin, axes, centre)
+        coarse = plane_slice([volume], shape, origin, axes, centre, stride=_DRAG_STRIDE)
         rows, cols = full.s_max - full.s_min + 1, full.t_max - full.t_min + 1
         # Same grid origin, so the same `translate` places both...
         assert (coarse.s_min, coarse.t_min) == (full.s_min, full.t_min), order
@@ -1504,45 +1901,127 @@ def selftest_coarse_expansion():
 
 
 def selftest_rotation_drag():
-    print("9. rotation drags: the picture follows the mouse, the crosshair holds still")
+    print("9. drags aim the cut lines; the dragged pane's own picture holds still")
 
-    def on_screen(frame, shift, origin, order, point):
-        """Where a voxel lands in a pane's drawn (s, t), the way _refresh
+    def screen(axes, shift, origin, point):
+        """Where a voxel lands in a pane's drawn (s, t), the way refresh()
         places the image and crosshair_vectors places the cross."""
-        rel = np.asarray(point, dtype=float) - origin
-        return np.array([np.dot(rel, frame[order[1]]) + shift[0],
-                         np.dot(rel, frame[order[2]]) + shift[1]])
+        rel = np.asarray(point, dtype=float) - np.asarray(origin, dtype=float)
+        return np.array([np.dot(rel, axes[1]) + shift[0],
+                         np.dot(rel, axes[2]) + shift[1]])
+
+    def screen_angle(direction):
+        """The convention _rotation_drag measures the cursor in: s down,
+        t across."""
+        return float(np.arctan2(direction[0], direction[1]))
 
     shape = (24, 30, 36)
+    volume = _ramp_volume(shape)
     origin = volume_origin(shape)
     swept = np.deg2rad(11.0)                # the angle the cursor sweeps
-    for order, _title in _ORTHO_PANES:
+    for dragged, _title in _ORTHO_PANES:
         frame = frame_from_euler((7, -13, 21))      # start off-axis; nothing special
         centre = origin + np.array([2.0, -3.0, 1.5])
-        probe = origin + np.array([5.0, 4.0, -6.0])
-        cross_before = on_screen(frame, (0, 0), origin, order, centre)
-        rel_before = on_screen(frame, (0, 0), origin, order, probe) - cross_before
+        panes = []
+        for order, _t in _ORTHO_PANES:
+            axes = axes_from_frame(frame, order)
+            panes.append(SimpleNamespace(order=order, axes=axes, shift=np.zeros(2),
+                                         handedness=pane_handedness(axes)))
+        pane = next(p for p in panes if p.order == dragged)
 
-        # Exactly what _rotation_drag and set_frame do between two mouse moves.
-        turned = rotated_frame(frame, order[0], pane_handedness(frame, order) * swept)
-        shift = cross_before - on_screen(turned, (0, 0), origin, order, centre)
-        cross_after = on_screen(turned, shift, origin, order, centre)
-        rel_after = on_screen(turned, shift, origin, order, probe) - cross_after
+        before_image = plane_slice([volume], shape, origin, pane.axes, centre).images[0]
+        before_axes = pane.axes.copy()
+        before_lines = cut_directions(pane.axes, frame, pane.order)
+        crosses = [screen(p.axes, p.shift, origin, centre) for p in panes]
 
-        # The crosshair is the pivot: it must not move on screen at all...
-        assert np.allclose(cross_before, cross_after, atol=1e-9), (order, cross_before, cross_after)
-        # ...and everything else turns rigidly around it, by the angle swept,
-        # in the SAME direction in all three panes (the handedness correction).
-        assert np.isclose(np.linalg.norm(rel_before), np.linalg.norm(rel_after)), order
-        angle = (np.arctan2(rel_after[0], rel_after[1])
-                 - np.arctan2(rel_before[0], rel_before[1]))
-        angle = np.arctan2(np.sin(angle), np.cos(angle))
-        assert np.isclose(angle, swept), (order, np.rad2deg(angle))
+        # Exactly what _rotation_drag -> win.rotate -> set_frame do between
+        # two mouse moves, including the sign the drag applies.
+        turned = rotated_frame(frame, dragged[0], -pane.handedness * swept)
+        for p, was in zip(panes, crosses):
+            normal = turned[p.order[0]]
+            p.axes = np.array([normal, *plane_basis(normal, p.axes[1], p.axes[2],
+                                                    p.handedness)])
+            p.shift += was - screen(p.axes, p.shift, origin, centre)
+
+        # The dragged pane draws exactly the same picture as before: same
+        # plane, same axes, same pixels, no shift. THIS is "the sample does
+        # not move" -- it used to spin with the mouse.
+        assert np.allclose(pane.axes, before_axes, atol=1e-12), dragged
+        assert np.allclose(pane.shift, 0, atol=1e-12), pane.shift
+        after_image = plane_slice([volume], shape, origin, pane.axes, centre).images[0]
+        assert np.array_equal(before_image, after_image), dragged
+
+        # What DOES move is the pair of cut lines lying across it: they swing
+        # by the angle the cursor swept, the way the cursor went, in all three
+        # panes alike (that is what the handedness sign is for).
+        after_lines = cut_directions(pane.axes, turned, pane.order)
+        for was, now in zip(before_lines, after_lines):
+            delta = screen_angle(now) - screen_angle(was)
+            delta = float(np.arctan2(np.sin(delta), np.cos(delta)))
+            assert np.isclose(delta, swept, atol=1e-9), (dragged, np.rad2deg(delta))
+        # ...and they stay perpendicular to each other, i.e. still three
+        # orthogonal planes.
+        assert abs(np.dot(after_lines[0], after_lines[1])) < 1e-9, after_lines
+
+        # The other two planes really did tilt, by that same angle.
+        for p in panes:
+            if p.order is dragged:
+                continue
+            was_normal, now_normal = frame[p.order[0]], turned[p.order[0]]
+            angle = np.arccos(np.clip(np.dot(was_normal, now_normal), -1.0, 1.0))
+            assert np.isclose(angle, swept, atol=1e-9), (p.order, np.rad2deg(angle))
+
+        # And in every pane the crosshair is the pivot: it must not move on
+        # screen at all, or the picture would slide out from under the drag.
+        for p, was in zip(panes, crosses):
+            assert np.allclose(screen(p.axes, p.shift, origin, centre), was, atol=1e-9), p.order
+
+    # A press only grabs a line when it lands on one, whatever the zoom.
+    axes = axes_from_frame(identity_frame(), (0, 1, 2))
+    directions = cut_directions(axes, identity_frame(), (0, 1, 2))
+    origin2d = np.zeros(2)
+    assert point_line_distance((0.0, 5.0), origin2d, directions[0]) == 0.0
+    assert point_line_distance((3.0, 5.0), origin2d, directions[0]) == 3.0
+    assert point_line_distance((0.0, 0.0), origin2d, (0.0, 0.0)) == np.inf
+    print("   ok")
+
+
+def selftest_pane_axes():
+    print("10. pane axes: carried across a tilt, never re-read off the frame")
+    for order, _title in _ORTHO_PANES:
+        axes = axes_from_frame(identity_frame(), order)
+        handedness = pane_handedness(axes)
+        # A pane's axes stay an orthonormal, correctly handed basis of its own
+        # plane through any number of tilts, without drifting.
+        frame = identity_frame()
+        rng = np.random.default_rng(3)
+        for _ in range(200):
+            axis = int(rng.integers(3))
+            frame = rotated_frame(frame, axis, float(rng.normal(scale=0.4)))
+            normal = frame[order[0]]
+            axes = np.array([normal, *plane_basis(normal, axes[1], axes[2], handedness)])
+            assert np.allclose(axes @ axes.T, np.eye(3), atol=1e-9), (order, axes)
+            assert np.isclose(pane_handedness(axes), handedness), order
+
+            # Turning the frame about THIS pane's own normal must leave its
+            # axes alone -- that is the whole "the sample does not move".
+            held = rotated_frame(frame, order[0], float(rng.normal(scale=0.5)))
+            after = plane_basis(held[order[0]], axes[1], axes[2], handedness)
+            assert np.allclose(after, axes[1:], atol=1e-9), (order, after, axes)
+
+        # The degenerate case: a plane tilted until the old ROW axis points
+        # along the new normal. The column hint carries it instead of blowing
+        # up, and comes back unchanged.
+        normal = axes[1].copy()
+        basis = plane_basis(normal, axes[1], axes[2], handedness)
+        assert np.allclose(basis[1], axes[2], atol=1e-9), basis
+        assert np.isclose(np.dot(basis[0], normal), 0, atol=1e-9), basis
+        assert np.isclose(pane_handedness(np.array([normal, *basis])), handedness)
     print("   ok")
 
 
 def selftest_hover_bar_line():
-    print("10. hover bar: keeps the deepest levels, folds the shallow end away")
+    print("11. hover bar: keeps the deepest levels, folds the shallow end away")
     labels = ["root", "grey matter", "cerebrum", "cortex", "motor area", "layer 5"]
 
     # Room for everything: no ellipsis, ontology order preserved.
@@ -1579,6 +2058,15 @@ def selftest_hover_bar_line():
             int(round(v * 255)) for v in rgba[:3]), background
         assert foreground == expected_text, (rgba, foreground)
     assert hover_bar_colours([0.0, 0.0, 0.0, 0.0])[0] == "#20232a"
+
+    # Height is a size the user drags, not a constant: the type follows it,
+    # monotonically, and stays legible at both extremes.
+    lo, hi = _HOVER_BAR_FONT_PT_RANGE
+    assert hover_bar_font_pt(_HOVER_BAR_HEIGHT) == _HOVER_BAR_FONT_PT
+    sizes = [hover_bar_font_pt(h) for h in (10, 30, 64, 120, 400)]
+    assert sizes == sorted(sizes), sizes
+    assert sizes[0] == lo and sizes[-1] == hi, sizes
+    assert all(lo <= pt <= hi for pt in sizes), sizes
     print("   ok")
 
 
@@ -1593,6 +2081,7 @@ def run_selftests():
     selftest_crosshair_vectors()
     selftest_coarse_expansion()
     selftest_rotation_drag()
+    selftest_pane_axes()
     selftest_hover_bar_line()
     print("=== all selftests passed ===")
     print("(shared/atlas_reference.py --selftest covers atlas loading / ontology maths)")
