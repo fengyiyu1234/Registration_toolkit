@@ -2312,7 +2312,10 @@ def _run_view(atlas_cfg):
     atlas = atlas_reference.load_atlas_reference(atlas_cfg, include_template=True)
     sample = None
     if getattr(atlas_cfg, "sample", None) is not None:
-        sample = atlas_reference.load_sample_volume(atlas_cfg.sample)
+        # The atlas's own voxel size is what decides how much of the sample is
+        # worth reading when the config does not say -- see _sample_steps.
+        sample = atlas_reference.load_sample_volume(atlas_cfg.sample,
+                                                    target_um=atlas_cfg.resolution_um)
     win = _open_atlas_window(atlas, atlas_cfg.resolution_um, ortho=atlas_cfg.ortho,
                              sample=sample)
     _add_region_panel(win.viewer, atlas, win)

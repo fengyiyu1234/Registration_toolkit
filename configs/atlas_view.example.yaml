@@ -18,6 +18,11 @@ atlas_template_path:   /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_
 atlas_resolution_um:   20
 atlas_orientation:     [1, -3, 2]
 
+# 可选。跟 ../Registration_ants 的 atlas_variants.*.slicing 同一个写法：三段
+# 写在【转向之后】的 (x, y, z) 网格上，null = 该轴不切，[lo, hi] 右开。
+# 半脑样本要跟图谱比就得切，不然是整脑对半脑。
+# atlas_slicing: [[320, 536], [108, 690], [129, 482]]
+
 # 可选，>=1，只影响显示速度/精细度，不影响 ontology 本身。
 # atlas_downsample: 1
 
@@ -36,19 +41,25 @@ atlas_ortho_views: true
 # Shift+拖（或拖视图里那两条彩色线）转图谱，转好了点 Overlay 叠起来看
 # （加色显示：样本绿、图谱品红，重合的地方是白的）。
 #
-# 建议用流程输出的 <sample>_fine_<n>um.nii.gz —— 已经重采样到图谱的分辨率、
-# 也已经转成 orientation 之后的轴序，直接就能比。
-# sample_path: /data/.../TSC_ants/s12t/DeMBA_0825/tsc12t_fine_20um.nii.gz
+# 直接给原始 tif 就行（几 GB 也没关系，见下面的 sample_downsample）；
+# 流程输出的 <sample>_fine_<n>um.nii.gz 也可以，那份自带 spacing。
+# sample_path: /data/.../raw_data/s12t/registration.tif
 
-# 可选。一个数或三个数，顺序跟 ../Registration_ants 的 sample.voxel_size_um
-# 一样是 [x, y, z]（文件自己的轴序，orientation 之前）。不写就用文件里带的
-# spacing —— 流程写出来的 .nii.gz 都带，普通 tif 不带（不带又不写这一项的话
-# 会按 1 µm 算，面板上所有微米数就都没意义了，会有一行 WARNING）。
+# 一个数或三个数，顺序跟 ../Registration_ants 的 sample.voxel_size_um 一样是
+# [x, y, z]（文件自己的轴序，orientation 之前）。光片数据一般是各向异性的
+# （平面内 2.6 µm、层间 32 µm），这里必须如实写 —— 并列/叠加显示、量角度全靠它。
+# 不写就用文件里带的 spacing：流程写出来的 .nii.gz 都带，raw tif 不带（不带又
+# 不写这一项会按 1 µm 算，面板上所有微米数就都没意义了，有一行 WARNING）。
 # sample_resolution_um: [2.6, 2.6, 32.0]
 
 # 可选。样本的 ClearMap 风格轴向重排，跟 atlas_orientation 同一个写法。
-# 上面那个 _fine_20um.nii.gz 已经是转好的，不用写；直接读原始 tif 才需要。
+# 样本的轴序跟图谱（转向之后的）一致就不用写 —— s12t 这种"原始 tif 的
+# (页,行,列) 正好等于图谱的 (DV, AP, ML)"的情况不用写。
 # sample_orientation: [1, 2, 3]
 
-# 可选，>=1。原分辨率的大 tif 直接读会很占内存，这里降采样只影响显示。
-# sample_downsample: 1
+# 可选，一个数或三个数，同样是 [x, y, z] 顺序，>=1。
+# 【不写 = 自动】：按每个轴各自的体素大小降到图谱那个分辨率（向下取整，保证不会
+# 比图谱还粗），而且是【边读边降】—— 2.6 GB 的原始 tif 只有留下的那些体素进内存。
+# 比图谱还粗的轴（比如 32 µm 的层间距对 20 µm 图谱）自动不动。
+# 写 1 就是原分辨率（内存和流畅度自负）。
+# sample_downsample: [4, 4, 1]

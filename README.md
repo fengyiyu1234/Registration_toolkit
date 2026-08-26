@@ -153,6 +153,11 @@ about that pane's normal, so a sample cut at an angle can be matched by
 reslicing the atlas at that angle instead of eyeballing it between two
 axis-aligned slices.
 
+Point `atlas_annotation_path` at the raw atlas and give it the same
+`atlas_orientation` / `atlas_slicing` the pipeline uses, and the viewer shows
+the exact atlas variant that gets registered — the half brain, in the sample's
+axis order — without depending on `prepare_custom_atlas`'s cache files.
+
 Add `sample_path` to the config and the same window becomes a **tilt gauge**:
 the three planes then stand for the sample's own axes (the light-sheet frame —
 the stack was cut at whatever angle the brain was lying at, and no one can aim
@@ -162,6 +167,13 @@ atlas reslice, or superimposed on it in additive green/magenta; the Sample
 panel holds three offsets, one scale and an auto-fit to get the two brains the
 same size and in the same place first. The sample is never rotated, never
 resampled and never written — what you take away is three angles.
+
+The sample is normally the **raw acquisition**: a multi-gigabyte, strongly
+anisotropic TIFF (`sample_resolution_um: [2.6, 2.6, 32.0]`, in the pipeline's
+own `[x, y, z]` order). It is subsampled *as it is read*, per axis, down to
+about the atlas's voxel size unless `sample_downsample` says otherwise, so a
+2.6 GB stack opens in a few seconds as ~50 MB and every pane stays
+interactive.
 
 ```bash
 python tools/atlas_view.py

@@ -84,6 +84,11 @@ def atlas_reference_config(cfg):
         ontology_path=paths["ontology_path"],
         resolution_um=float(cfg.get("atlas_resolution_um") or 0) or None,
         orientation=cfg.get("atlas_orientation") or None,
+        # The same crop ../Registration_ants' atlas_variants.*.slicing takes,
+        # so a viewer can be pointed at the raw atlas and still show the half
+        # brain the pipeline actually registers against -- without depending
+        # on prepare_custom_atlas's cache files, which come and go.
+        slicing=cfg.get("atlas_slicing") or None,
         downsample=downsample,
         # Three synced canvases instead of one -- only meaningful to
         # tools/atlas_view.py's window; paint_mask.py's tree-only use ignores it.
@@ -92,14 +97,26 @@ def atlas_reference_config(cfg):
 
 
 def _read_array(path):
-    """Just the voxels, with the SimpleITK image dropped immediately.
+    """Just the voxels, in the file's own (z,y,x) order.
 
-    GetArrayFromImage copies, so the ITK buffer and the numpy array are both
-    live until the image goes out of scope -- and binding it to a throwaway
-    `_` keeps it alive for the rest of the enclosing function. That is 1.1 GB
-    of nothing for the DevCCF annotation, doubling peak memory during the
-    atlas load for a handle the atlas path never uses.
+    tifffile for TIFFs, SimpleITK for everything else -- the same split
+    single_sample.py makes, and not a matter of taste: SimpleITK reads a 3D
+    uint32 TIFF back as ALL ZEROS, silently and with the right shape and
+    dtype. A structure-id annotation is exactly the thing that gets written as
+    uint32 (CCF ids run past what uint16 holds), so the failure mode is an
+    atlas that loads, reports one label and highlights nothing, with no error
+    anywhere. ../Registration_ants reads its TIFF atlases through tifffile for
+    the same reason (atlas_utils._read_atlas_array_xyz).
+
+    For the SimpleITK half: GetArrayFromImage copies, so the ITK buffer and
+    the numpy array are both live until the image goes out of scope -- and
+    binding it to a throwaway `_` would keep it alive for the rest of the
+    enclosing function. That is 1.1 GB of nothing for the DevCCF annotation,
+    doubling peak memory during the atlas load for a handle nothing uses.
     """
+    if str(path).lower().endswith((".tif", ".tiff")):
+        import tifffile                   # only the TIFF path needs it
+        return tifffile.imread(str(path))
     return sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
 
 
@@ -127,6 +144,35 @@ def _reorient_zyx(arr_zyx, orientation, atlas_utils):
     arr_xyz = np.transpose(arr_zyx, (2, 1, 0))
     arr_xyz = atlas_utils.reorient_volume(arr_xyz, orientation)
     return np.transpose(arr_xyz, (2, 1, 0))
+
+
+def _slice_zyx(arr_zyx, slicing):
+    """Apply a pipeline-style `slicing` to a (z,y,x) array, as a view.
+
+    Three entries, written on the REORIENTED (x, y, z) grid in that order --
+    `null` for "all of this axis", `[lo, hi]` (hi exclusive, and itself
+    allowed to be null) otherwise -- which is exactly how
+    ../Registration_ants spells `atlas_variants.*.slicing`, so the same three
+    lines can be copied across without re-deriving anything.
+
+    Cosmetic here, like the orientation: nothing that reads ontology ids off
+    this atlas cares which corner of it is on screen. It matters because a
+    whole-brain atlas held up against a half-brain sample is not a comparison
+    anyone can read.
+    """
+    if not slicing:
+        return arr_zyx
+    if len(slicing) != 3:
+        raise ValueError(f"atlas_slicing needs three entries (x, y, z), got {slicing}")
+    spans = []
+    for entry in slicing:
+        if entry is None:
+            spans.append(slice(None))
+            continue
+        if len(entry) != 2:
+            raise ValueError(f"each atlas_slicing entry is null or [lo, hi], got {entry}")
+        spans.append(slice(entry[0], entry[1]))
+    return arr_zyx[spans[2], spans[1], spans[0]]
 
 
 def _reoriented_axis_order(orientation, atlas_utils):
@@ -157,11 +203,16 @@ def sample_volume_config(cfg):
 
     `sample_resolution_um` is a scalar or three numbers in the FILE's own
     (x, y, z) order -- the same order ../Registration_ants writes
-    `sample.voxel_size_um` in -- and is optional: a NIfTI written by the
-    pipeline already carries its spacing, and load_sample_volume falls back to
-    that. `sample_orientation` is the same ClearMap-style spec the atlas uses,
-    for the usual case of a sample whose axes are not stored in the order the
-    atlas's are.
+    `sample.voxel_size_um` in -- and is optional only where the file carries
+    its own spacing: a NIfTI written by the pipeline does, a raw light-sheet
+    TIFF does not. It is also normally ANISOTROPIC (2.6 um in plane, 32 um
+    between sheets is the usual shape of it here), which is why it is three
+    numbers and not one, and why nothing downstream may assume otherwise.
+
+    `sample_downsample` is likewise a scalar or three numbers in (x, y, z),
+    and left out it is CHOSEN: see _sample_steps. `sample_orientation` is the
+    same ClearMap-style spec the atlas uses, for a sample whose axes are not
+    stored in the order the atlas's are.
     """
     path = cfg.get("sample_path")
     if not path:
@@ -169,16 +220,11 @@ def sample_volume_config(cfg):
     if not Path(path).exists():
         raise FileNotFoundError(f"sample_path does not exist: {path}")
 
-    downsample = cfg.get("sample_downsample")
-    downsample = 1 if downsample is None else int(downsample)
-    if downsample < 1:
-        raise ValueError(f"sample_downsample must be >= 1, got {downsample}")
-
     return SimpleNamespace(
         path=str(path),
         resolution_um=cfg.get("sample_resolution_um"),
         orientation=cfg.get("sample_orientation") or None,
-        downsample=downsample,
+        downsample=cfg.get("sample_downsample"),
     )
 
 
@@ -206,13 +252,110 @@ def _sample_voxel_zyx(resolution_um, spacing_xyz, path):
     return tuple(reversed(values))
 
 
-def load_sample_volume(sample_cfg):
+def _volume_spacing_xyz(path):
+    """The file's own voxel size, from the header alone -- no pixels decoded.
+
+    Wanted BEFORE the read rather than after: how much to subsample by depends
+    on how big a voxel already is, and on a 2.6 GB stack the difference
+    between deciding that before and after is the difference between 40 MB and
+    2.6 GB resident.
+    """
+    if str(path).lower().endswith((".tif", ".tiff")):
+        return (1.0, 1.0, 1.0)      # a plain TIFF carries no spacing worth trusting
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(path))
+    reader.ReadImageInformation()
+    return tuple(float(s) for s in reader.GetSpacing())
+
+
+def _sample_steps(downsample, voxel_zyx, target_um):
+    """Per-axis subsampling step for the sample, in the array's (z,y,x) order.
+
+    Configured wins. With nothing configured the sample is brought down to
+    about the ATLAS's voxel size, per axis and rounded DOWN so the result is
+    never coarser than the atlas: a 2.6 um in-plane stack compared against a
+    20 um atlas is sixty times the voxels for nothing, and unlike the atlas
+    -- whose planes are resliced out of a volume that never moves -- every one
+    of the sample's is re-gathered on every mouse move. The z axis of a
+    light-sheet stack is usually already coarser than the atlas and is left
+    alone by the same rule.
+
+    Anisotropy is the whole reason this is three numbers: one step for a
+    (32, 2.6, 2.6) um volume either leaves 60x too much data in plane or
+    throws the stack away between sheets.
+    """
+    if downsample is not None:
+        steps = ([int(downsample)] * 3 if np.isscalar(downsample)
+                 else [int(v) for v in reversed(list(downsample))])   # (x,y,z) -> (z,y,x)
+        if len(steps) != 3:
+            raise ValueError("sample_downsample must be one number or three (x, y, z), "
+                             f"got {downsample}")
+        if min(steps) < 1:
+            raise ValueError(f"sample_downsample must be >= 1, got {downsample}")
+        return tuple(steps)
+    if not target_um:
+        return (1, 1, 1)
+    return tuple(max(1, int(float(target_um) / float(size))) for size in voxel_zyx)
+
+
+def _read_tiff_subsampled(path, steps):
+    """Read a TIFF stack with the subsampling applied AS IT IS READ.
+
+    memmap first: a raw registration channel is normally an uncompressed
+    stack, which needs no decoding at all, so the strided copy pulls only the
+    voxels that are kept -- through the page cache, without the file ever
+    becoming resident. Page by page otherwise, since a compressed or tiled
+    stack cannot be memmapped and decoding a plane at a time still costs one
+    plane rather than the whole volume.
+    """
+    import tifffile                       # only the sample path needs it
+    step_z, step_y, step_x = steps
+    try:
+        stack = tifffile.memmap(path, mode="r")
+    except Exception:
+        stack = None
+    if stack is not None and stack.ndim == 3:
+        kept = stack[::step_z, ::step_y, ::step_x]
+        # Native byte order while we are copying anyway: scopes do write
+        # big-endian TIFFs, and every percentile and every slice afterwards
+        # would otherwise pay for the swap.
+        return np.ascontiguousarray(kept, dtype=kept.dtype.newbyteorder("="))
+
+    with tifffile.TiffFile(path) as handle:
+        series = handle.series[0]
+        if len(series.shape) != 3:
+            raise ValueError(f"expected a 3D TIFF stack, got shape {series.shape}: {path}")
+        planes = [series.pages[index].asarray()[::step_y, ::step_x]
+                  for index in range(0, series.shape[0], step_z)]
+    stacked = np.stack(planes)
+    return np.ascontiguousarray(stacked, dtype=stacked.dtype.newbyteorder("="))
+
+
+def _read_sample_array(path, steps):
+    """The sample's voxels in the file's own (z,y,x) order, subsampled."""
+    if str(path).lower().endswith((".tif", ".tiff")):
+        return _read_tiff_subsampled(str(path), steps)
+    array = sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
+    if tuple(steps) == (1, 1, 1):
+        return array
+    step_z, step_y, step_x = steps
+    # The full array dies with this frame; only the subsampled copy escapes.
+    return np.ascontiguousarray(array[::step_z, ::step_y, ::step_x])
+
+
+def load_sample_volume(sample_cfg, target_um=None):
     """Load the sample volume the atlas is to be compared against.
 
     Returns SimpleNamespace(volume, voxel_um, path, downsample): a contiguous
     (z,y,x) array in the SAME axis order the atlas reference is loaded in
     (both go through _reorient_zyx), and its per-axis voxel size in microns,
     permuted and scaled to match that array rather than the file on disk.
+
+    `target_um` is the atlas's voxel size, and only decides how much of the
+    sample to read when the config does not say (_sample_steps). The normal
+    input here is the raw acquisition -- a multi-gigabyte, strongly
+    anisotropic TIFF -- not something already resampled onto the atlas's grid,
+    so the subsampling happens during the read rather than after it.
 
     The array is materialized rather than left as a reoriented view: unlike
     the atlas, every plane of this one is re-read on every mouse move, and a
@@ -222,29 +365,33 @@ def load_sample_volume(sample_cfg):
     atlas_utils = _atlas_helpers()
 
     print(f"[sample] volume: {sample_cfg.path}")
-    image = sitk.ReadImage(str(sample_cfg.path))
-    spacing_xyz = tuple(float(s) for s in image.GetSpacing())
-    array = sitk.GetArrayFromImage(image)
-    del image                                   # see _read_array
-
+    spacing_xyz = _volume_spacing_xyz(sample_cfg.path)
     voxel_zyx = _sample_voxel_zyx(sample_cfg.resolution_um, spacing_xyz, sample_cfg.path)
-    step = sample_cfg.downsample
-    sub = (slice(None, None, step),) * 3
+    steps = _sample_steps(sample_cfg.downsample, voxel_zyx, target_um)
+
+    array = _read_sample_array(sample_cfg.path, steps)
     volume = np.ascontiguousarray(
-        _reorient_zyx(array, sample_cfg.orientation, atlas_utils)[sub])
+        _reorient_zyx(array, sample_cfg.orientation, atlas_utils))
     del array
 
     order = _reoriented_axis_order(sample_cfg.orientation, atlas_utils)
-    voxel_um = np.array([voxel_zyx[axis] for axis in order], dtype=float) * step
+    voxel_um = np.array([voxel_zyx[axis] * steps[axis] for axis in order], dtype=float)
 
     extent = np.array(volume.shape, dtype=float) * voxel_um / 1000.0
+    kept = tuple(steps[axis] for axis in order)
     print(f"[sample] grid {volume.shape}, "
           f"voxels {tuple(round(float(v), 3) for v in voxel_um)} um, "
-          f"extent {tuple(round(float(e), 2) for e in extent)} mm"
-          + (f", downsampled {step}x" if step > 1 else ""))
+          f"extent {tuple(round(float(e), 2) for e in extent)} mm, "
+          f"{volume.nbytes / 2**20:.0f} MB"
+          + (f", read every {kept} voxel" if max(kept) > 1 else "")
+          + (" (set sample_downsample to override)"
+             if sample_cfg.downsample is None and max(kept) > 1 else ""))
+    if volume.size > 400_000_000:
+        print("WARNING: that is a lot of voxels to reslice on every mouse move; "
+              "set sample_downsample if the views feel slow.")
 
     return SimpleNamespace(volume=volume, voxel_um=voxel_um,
-                           path=sample_cfg.path, downsample=step)
+                           path=sample_cfg.path, downsample=tuple(steps))
 
 
 def _compact_annotation(annotation_zyx, chunk=64):
@@ -331,7 +478,8 @@ def load_atlas_reference(atlas_cfg, include_template=True):
     # the one SimpleITK just read; _compact_annotation reads through the view
     # a slab at a time and the 1.1 GB original is dropped immediately after.
     compact, present_ids = _compact_annotation(
-        _reorient_zyx(annotation, atlas_cfg.orientation, atlas_utils)[sub])
+        _slice_zyx(_reorient_zyx(annotation, atlas_cfg.orientation, atlas_utils),
+                   getattr(atlas_cfg, "slicing", None))[sub])
     del annotation
 
     counts = np.bincount(compact.ravel(), minlength=len(present_ids))
@@ -342,7 +490,8 @@ def load_atlas_reference(atlas_cfg, include_template=True):
         print(f"[atlas] template:   {atlas_cfg.template_path}")
         raw_template = _read_array(atlas_cfg.template_path)
         template = np.ascontiguousarray(
-            _reorient_zyx(raw_template, atlas_cfg.orientation, atlas_utils)[sub])
+            _slice_zyx(_reorient_zyx(raw_template, atlas_cfg.orientation, atlas_utils),
+                       getattr(atlas_cfg, "slicing", None))[sub])
         del raw_template
         if template.shape != compact.shape:
             print(f"WARNING: atlas template shape {template.shape} != annotation shape "
@@ -629,13 +778,47 @@ def selftest_mask_centre_index():
     print("   ok")
 
 
+def _ramp_zyx(shape):
+    """A volume whose every voxel holds its own flat index."""
+    return np.arange(int(np.prod(shape)), dtype=np.int64).reshape(shape)
+
+
 def selftest_sample_voxel_order():
-    print("7. sample: voxel sizes follow the axes through a reorientation")
+    print("7. atlas slicing / sample voxels: both follow the axes they are written on")
     # Config order is the pipeline's (x, y, z); the array is (z, y, x).
     assert _sample_voxel_zyx([2.6, 2.6, 32.0], (1.0, 1.0, 1.0), "cfg.tif") == (32.0, 2.6, 2.6)
     assert _sample_voxel_zyx(20, (1.0, 1.0, 1.0), "cfg.tif") == (20.0, 20.0, 20.0)
     # Nothing configured -> the file's own spacing, likewise reversed.
     assert _sample_voxel_zyx(None, (2.6, 2.6, 32.0), "file.nii") == (32.0, 2.6, 2.6)
+
+    # Slicing is written on the (x, y, z) grid; the array is (z, y, x).
+    probe = _ramp_zyx((7, 8, 9))
+    assert _slice_zyx(probe, None).shape == (7, 8, 9)
+    assert np.array_equal(_slice_zyx(probe, [[2, 5], None, [1, 4]]), probe[1:4, :, 2:5])
+    assert np.array_equal(_slice_zyx(probe, [[2, None], None, None]), probe[:, :, 2:])
+    for bad in ([[0, 1]], [[0, 1, 2], None, None]):
+        try:
+            _slice_zyx(probe, bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"atlas_slicing {bad} should have been refused")
+
+    # Subsampling steps: configured in (x, y, z) like the resolution, chosen
+    # per axis from the atlas's voxel size when not configured.
+    assert _sample_steps([1, 4, 4], (32.0, 2.6, 2.6), 20.0) == (4, 4, 1)
+    assert _sample_steps(2, (32.0, 2.6, 2.6), 20.0) == (2, 2, 2)
+    # Rounded down, so no axis ever ends up coarser than the atlas -- and an
+    # axis already coarser than it (32 um sheets against a 20 um atlas) is
+    # left alone rather than thrown away.
+    assert _sample_steps(None, (32.0, 2.6, 2.6), 20.0) == (1, 7, 7)
+    assert _sample_steps(None, (20.0, 20.0, 20.0), 20.0) == (1, 1, 1)
+    assert _sample_steps(None, (32.0, 2.6, 2.6), None) == (1, 1, 1)
+    for bad in ([0, 1, 1], [2, 2], 0):
+        try:
+            _sample_steps(bad, (20.0, 20.0, 20.0), 20.0)
+        except ValueError:
+            continue
+        raise AssertionError(f"sample_downsample {bad} should have been refused")
 
     try:
         atlas_utils = _atlas_helpers()
