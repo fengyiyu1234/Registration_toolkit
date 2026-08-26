@@ -9,7 +9,9 @@ ontology and annotation volume, for different reasons:
 
   tools/atlas_view.py renders the atlas as a three-pane viewer with a region
     picker of its own -- it needs the same tree, plus the grayscale
-    template and a per-region highlight mask.
+    template and a per-region highlight mask, and optionally a SAMPLE volume
+    (load_sample_volume) to hold the atlas up against, which is an ordinary
+    grayscale grid with no ontology attached to it at all.
 
 Splitting this out of paint_mask.py is what lets tools/atlas_view.py exist as an
 independent script instead of a window paint_mask.py opens, and it is also
@@ -125,6 +127,124 @@ def _reorient_zyx(arr_zyx, orientation, atlas_utils):
     arr_xyz = np.transpose(arr_zyx, (2, 1, 0))
     arr_xyz = atlas_utils.reorient_volume(arr_xyz, orientation)
     return np.transpose(arr_xyz, (2, 1, 0))
+
+
+def _reoriented_axis_order(orientation, atlas_utils):
+    """Which SOURCE axis each axis of a reoriented (z,y,x) array came from.
+
+    Only anisotropic voxels need this: a light-sheet sample is routinely 5 um
+    in plane and 25 um between sheets, so its three voxel sizes are three
+    different numbers and reorienting the array permutes them along with the
+    axes. Rather than reimplement reorient_volume's permutation here -- where
+    it could silently drift from the real one and quietly stretch a volume
+    along the wrong axis -- this runs the ACTUAL reorientation on a probe whose
+    three axis lengths are distinct, and reads the permutation back off the
+    resulting shape.
+    """
+    probe = np.zeros((2, 3, 4), dtype=np.uint8)
+    reoriented = _reorient_zyx(probe, orientation, atlas_utils).shape
+    return tuple(probe.shape.index(int(n)) for n in reoriented)
+
+
+def sample_volume_config(cfg):
+    """Resolve the optional SAMPLE volume -> SimpleNamespace, or None.
+
+    A second, ordinary grayscale volume for tools/atlas_view.py to hold the
+    atlas up against: the user's own brain, unregistered and never rotated.
+    Nothing about the ontology or the annotation depends on it, which is why
+    it is optional and why nothing else in this module reads it -- an atlas
+    browser with no sample configured behaves exactly as it did before.
+
+    `sample_resolution_um` is a scalar or three numbers in the FILE's own
+    (x, y, z) order -- the same order ../Registration_ants writes
+    `sample.voxel_size_um` in -- and is optional: a NIfTI written by the
+    pipeline already carries its spacing, and load_sample_volume falls back to
+    that. `sample_orientation` is the same ClearMap-style spec the atlas uses,
+    for the usual case of a sample whose axes are not stored in the order the
+    atlas's are.
+    """
+    path = cfg.get("sample_path")
+    if not path:
+        return None
+    if not Path(path).exists():
+        raise FileNotFoundError(f"sample_path does not exist: {path}")
+
+    downsample = cfg.get("sample_downsample")
+    downsample = 1 if downsample is None else int(downsample)
+    if downsample < 1:
+        raise ValueError(f"sample_downsample must be >= 1, got {downsample}")
+
+    return SimpleNamespace(
+        path=str(path),
+        resolution_um=cfg.get("sample_resolution_um"),
+        orientation=cfg.get("sample_orientation") or None,
+        downsample=downsample,
+    )
+
+
+def _sample_voxel_zyx(resolution_um, spacing_xyz, path):
+    """Per-axis voxel size of the sample AS STORED, in (z,y,x) order.
+
+    Config first, file second: `sample_resolution_um` is written in (x, y, z)
+    to match the pipeline's own `voxel_size_um`, and reversed here into the
+    (z,y,x) order sitk.GetArrayFromImage produces. With nothing configured the
+    file's own spacing is used -- right for anything the pipeline wrote, and
+    (1, 1, 1) for a plain TIFF, which is flagged rather than silently believed
+    because it would make every micron figure in the viewer meaningless.
+    """
+    if resolution_um is None:
+        if all(abs(s - 1.0) < 1e-9 for s in spacing_xyz):
+            print(f"WARNING: {Path(path).name} carries no voxel size and none is configured; "
+                  f"assuming 1 um. Set sample_resolution_um for the overlay to be to scale.")
+        return tuple(float(s) for s in reversed(spacing_xyz))
+
+    values = ([float(resolution_um)] * 3 if np.isscalar(resolution_um)
+              else [float(v) for v in resolution_um])
+    if len(values) != 3:
+        raise ValueError("sample_resolution_um must be one number or three (x, y, z), "
+                         f"got {resolution_um}")
+    return tuple(reversed(values))
+
+
+def load_sample_volume(sample_cfg):
+    """Load the sample volume the atlas is to be compared against.
+
+    Returns SimpleNamespace(volume, voxel_um, path, downsample): a contiguous
+    (z,y,x) array in the SAME axis order the atlas reference is loaded in
+    (both go through _reorient_zyx), and its per-axis voxel size in microns,
+    permuted and scaled to match that array rather than the file on disk.
+
+    The array is materialized rather than left as a reoriented view: unlike
+    the atlas, every plane of this one is re-read on every mouse move, and a
+    transposed view turns each of those into a strided gather over the whole
+    volume.
+    """
+    atlas_utils = _atlas_helpers()
+
+    print(f"[sample] volume: {sample_cfg.path}")
+    image = sitk.ReadImage(str(sample_cfg.path))
+    spacing_xyz = tuple(float(s) for s in image.GetSpacing())
+    array = sitk.GetArrayFromImage(image)
+    del image                                   # see _read_array
+
+    voxel_zyx = _sample_voxel_zyx(sample_cfg.resolution_um, spacing_xyz, sample_cfg.path)
+    step = sample_cfg.downsample
+    sub = (slice(None, None, step),) * 3
+    volume = np.ascontiguousarray(
+        _reorient_zyx(array, sample_cfg.orientation, atlas_utils)[sub])
+    del array
+
+    order = _reoriented_axis_order(sample_cfg.orientation, atlas_utils)
+    voxel_um = np.array([voxel_zyx[axis] for axis in order], dtype=float) * step
+
+    extent = np.array(volume.shape, dtype=float) * voxel_um / 1000.0
+    print(f"[sample] grid {volume.shape}, "
+          f"voxels {tuple(round(float(v), 3) for v in voxel_um)} um, "
+          f"extent {tuple(round(float(e), 2) for e in extent)} mm"
+          + (f", downsampled {step}x" if step > 1 else ""))
+
+    return SimpleNamespace(volume=volume, voxel_um=voxel_um,
+                           path=sample_cfg.path, downsample=step)
 
 
 def _compact_annotation(annotation_zyx, chunk=64):
@@ -509,6 +629,31 @@ def selftest_mask_centre_index():
     print("   ok")
 
 
+def selftest_sample_voxel_order():
+    print("7. sample: voxel sizes follow the axes through a reorientation")
+    # Config order is the pipeline's (x, y, z); the array is (z, y, x).
+    assert _sample_voxel_zyx([2.6, 2.6, 32.0], (1.0, 1.0, 1.0), "cfg.tif") == (32.0, 2.6, 2.6)
+    assert _sample_voxel_zyx(20, (1.0, 1.0, 1.0), "cfg.tif") == (20.0, 20.0, 20.0)
+    # Nothing configured -> the file's own spacing, likewise reversed.
+    assert _sample_voxel_zyx(None, (2.6, 2.6, 32.0), "file.nii") == (32.0, 2.6, 2.6)
+
+    try:
+        atlas_utils = _atlas_helpers()
+    except ImportError:
+        print("   ok (axis permutation skipped: registration_ants not importable)")
+        return
+    assert _reoriented_axis_order(None, atlas_utils) == (0, 1, 2)
+    # A volume whose axis sizes are all different is its own witness: reorient
+    # it, and the shape says where every axis (and so every voxel size) went.
+    for orientation in ([1, 3, 2], [1, -3, 2], [-2, 1, 3], [3, 2, 1]):
+        order = _reoriented_axis_order(orientation, atlas_utils)
+        assert sorted(order) == [0, 1, 2], (orientation, order)
+        probe = np.zeros((5, 7, 9), dtype=np.uint8)
+        shape = _reorient_zyx(probe, orientation, atlas_utils).shape
+        assert shape == tuple(probe.shape[a] for a in order), (orientation, order, shape)
+    print("   ok")
+
+
 def run_selftests():
     print("=== shared/atlas_reference.py selftests (synthetic data only, no GUI) ===")
     selftest_ontology_node_voxels()
@@ -517,6 +662,7 @@ def run_selftests():
     selftest_annotation_features()
     selftest_format_ancestry()
     selftest_mask_centre_index()
+    selftest_sample_voxel_order()
     print("=== all selftests passed ===")
     return 0
 

@@ -153,6 +153,16 @@ about that pane's normal, so a sample cut at an angle can be matched by
 reslicing the atlas at that angle instead of eyeballing it between two
 axis-aligned slices.
 
+Add `sample_path` to the config and the same window becomes a **tilt gauge**:
+the three planes then stand for the sample's own axes (the light-sheet frame —
+the stack was cut at whatever angle the brain was lying at, and no one can aim
+a sheet to the degree), and the frame's three angles become how far the atlas
+has to be turned to meet them. Each pane draws that sample plane beside the
+atlas reslice, or superimposed on it in additive green/magenta; the Sample
+panel holds three offsets, one scale and an auto-fit to get the two brains the
+same size and in the same place first. The sample is never rotated, never
+resampled and never written — what you take away is three angles.
+
 ```bash
 python tools/atlas_view.py
 python tools/atlas_view.py configs/atlas_view.devccf.yaml

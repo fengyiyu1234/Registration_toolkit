@@ -19,6 +19,17 @@ through it -- and those two panes reslice to the angle you aim them at. Each
 pane also carries its own slider, under its own canvas, for scrolling that
 plane along its normal.
 
+Point it at a SAMPLE as well (sample_path in the config, see
+_add_sample_panel) and it stops being read-only in one further sense: the
+three planes then stand for the sample's own axes -- the light-sheet frame,
+which is fixed, because the stack was cut at whatever angle the brain
+happened to be lying at -- and the frame's three angles become how far the
+ATLAS has to be turned to meet them. Each pane draws that sample plane beside
+the atlas reslice, or superimposed on it in additive green and magenta, with
+three offsets and one scale to get the two brains the same size and in the
+same place first. Nothing is registered, resampled or written: what you take
+away is three angles, read off the Planes panel.
+
 This used to be a second window paint_mask.py opened from its own ontology
 picker, kept in sync with paint_mask's brush-label assignment. It is
 standalone now: paint_mask.py's own ontology panel (for assigning tree nodes
@@ -110,7 +121,11 @@ def _load_local_config(cli_path=None):
         "atlas_view", cli_path=cli_path,
         required=("atlas_annotation_path", "ontology_path"),
         legacy_paths=_LEGACY_CONFIG_PATHS)
-    return atlas_reference.atlas_reference_config(cfg)
+    atlas_cfg = atlas_reference.atlas_reference_config(cfg)
+    # Optional, and attached rather than passed separately: the sample is one
+    # more thing this window can be pointed at, not a second configuration.
+    atlas_cfg.sample = atlas_reference.sample_volume_config(cfg)
+    return atlas_cfg
 
 
 # (axis order, pane title). order[0] is the axis the pane's plane is
@@ -134,7 +149,8 @@ _PANE_COLOURS = ("#ff6060", "#48d16a", "#5b9dff")
 # Layer attributes mirrored from the main pane onto the ortho panes. Only the
 # main pane has a layer list, so these are the knobs a user can actually reach;
 # everything else about the sub-panes is fixed at construction.
-_MIRRORED_LAYER_ATTRS = ("visible", "opacity", "contrast_limits", "gamma", "colormap")
+_MIRRORED_LAYER_ATTRS = ("visible", "opacity", "contrast_limits", "gamma", "colormap",
+                         "blending")
 
 # Starting height in px of the bottom dock holding the two reconstructed
 # views, leaving the main canvas the rest. Draggable afterwards.
@@ -569,6 +585,184 @@ def crosshair_vectors(sl, directions, shift=(0.0, 0.0)):
 
 
 # =====================================================================================
+# the sample -- a second volume, never rotated, that the atlas is aimed at
+# =====================================================================================
+# Everything above describes ONE volume and three planes cut through it. With a
+# sample loaded the reading changes: the three planes are the SAMPLE's own axes
+# (the light-sheet frame, fixed, because that is how the stack came off the
+# microscope), and the frame is how the atlas is turned to meet them. Plane k
+# is perpendicular to sample axis k; state.frame[k] is the atlas-voxel
+# direction that sample axis k corresponds to. So the same three Euler angles
+# that used to say "reslice the atlas 12 degrees off coronal" now say "this
+# sample was cut 12 degrees off the atlas's horizontal", which is the number a
+# registration needs and the one a light sheet cannot be aimed accurately
+# enough to assume is zero.
+#
+# Beside the rotation there are three offsets and one scale, because two brains
+# have to be roughly the same size and in roughly the same place before an
+# angle can be judged at all. Together: atlas voxel -> sample microns is
+#
+#     u_k = offset_um[k] + scale * atlas_voxel_um * ((p - atlas_origin) . frame[k])
+#
+# with u measured from the sample's own middle voxel along sample axis k. The
+# three functions below are that one line read forwards (which sample slice
+# does this atlas plane sit on), sideways (where does the sample slice belong
+# on screen) and backwards (what offset/scale puts the two brains on top of
+# each other).
+def sample_plane_index(offset, axis, sample_shape, sample_voxel, atlas_voxel, scale, offset_um):
+    """Which sample slice the atlas plane `axis` currently cuts through.
+
+    `offset` is that plane's own offset from the atlas's middle voxel, in
+    atlas voxels -- the number the pane sliders and plane_offsets already
+    speak in -- so scrolling a plane moves the atlas reslice and the sample
+    slice together and they stay the same anatomical cut.
+
+    Fractional on purpose: the two grids do not share a voxel size, and
+    rounding here (rather than in the caller, once) would make the sample
+    jump a whole slice at a time as the atlas plane creeps across.
+    """
+    origin = volume_origin(sample_shape)
+    reach = float(offset) * float(atlas_voxel) * float(scale) + float(offset_um[axis])
+    return float(origin[axis]) + reach / float(sample_voxel[axis])
+
+
+def sample_offset_bounds(axis, sample_shape, sample_voxel, atlas_voxel, scale, offset_um):
+    """(lo, hi): the plane-`axis` offsets at which the sample's first and last
+    slices sit -- sample_plane_index inverted, at the two ends.
+
+    What widens a pane's slider once a sample is loaded. The two grids are
+    different sizes and differently placed, so the end of the stack is as
+    often past the edge of the atlas as inside it, and a slider bounded by the
+    atlas alone would simply refuse to show the last few hundred microns of
+    the sample.
+    """
+    origin = volume_origin(sample_shape)
+    ends = [((index - origin[axis]) * float(sample_voxel[axis]) - float(offset_um[axis]))
+            / (float(atlas_voxel) * float(scale))
+            for index in (0, int(sample_shape[axis]) - 1)]
+    return min(ends), max(ends)
+
+
+def sample_plane_image(volume, order, index):
+    """(image, index, in_range): the sample's own axis-aligned slice for a pane.
+
+    A plain take() along the pane's normal, not a reslice: the sample is the
+    fixed thing here and is never turned. The pane's other two axes are always
+    ascending (see _ORTHO_PANES), so what take() leaves behind is already in
+    the pane's own (down the screen, across it) order.
+
+    An index off the end does NOT clamp to the end slice: that would draw a
+    real picture of the wrong plane and invite the user to line the atlas up
+    against it. It comes back blank instead, and the panel says so.
+    """
+    axis = int(order[0])
+    count = volume.shape[axis]
+    nearest = int(np.floor(float(index) + 0.5))
+    plane = np.take(volume, int(np.clip(nearest, 0, count - 1)), axis=axis)
+    if 0 <= nearest < count:
+        return plane, nearest, True
+    return np.zeros_like(plane), nearest, False
+
+
+def sample_placement(order, sample_shape, sample_voxel, scale, offset_um):
+    """(scale, translate) laying the sample slice into the pane's world.
+
+    A pane's world coordinates are the ATLAS's microns (every atlas layer is
+    drawn with scale=atlas voxel size), so the sample -- a different voxel
+    size on a different grid -- is placed by inverting the atlas-to-sample map
+    rather than by resampling it. Nothing about the sample image is ever
+    interpolated: it is the reference, and it is shown exactly as acquired.
+
+    Two numbers per in-plane axis, both derived from the same line: a sample
+    voxel is `sample_voxel / scale` atlas microns wide, and index 0 sits where
+    the sample's own middle voxel, offset by offset_um, says it does.
+    """
+    origin = volume_origin(sample_shape)
+    scales, translates = [], []
+    for axis in (int(order[1]), int(order[2])):
+        step = float(sample_voxel[axis]) / float(scale)
+        scales.append(step)
+        translates.append((-float(origin[axis]) * float(sample_voxel[axis])
+                           - float(offset_um[axis])) / float(scale))
+    return np.array(scales, dtype=float), np.array(translates, dtype=float)
+
+
+def coarse_step(shape, target=128):
+    """Subsampling step that gets `shape` down to about `target` voxels a side.
+
+    For the auto-fit only, which asks a question about the outline of a brain
+    -- np.argwhere over a full-resolution 800^3 volume would cost several
+    times the volume itself to answer it no better.
+    """
+    return max(1, int(max(int(n) for n in shape) // int(target)))
+
+
+def foreground_threshold(volume, step=1, fraction=0.05):
+    """A rough tissue/background level for a grayscale sample.
+
+    A twentieth of the way from the 1st to the 99th percentile. Percentiles
+    because a light-sheet stack has hot specks that would drag min/max
+    anywhere, and a low fraction because what the auto-fit wants is the
+    OUTLINE of the brain, dim edges included, not a clean segmentation --
+    on a real 20 um stack here the box stops growing somewhere below a
+    twentieth and starts swallowing background haze somewhere below a
+    fiftieth, so this sits in the middle of the flat part.
+    """
+    coarse = volume[::step, ::step, ::step]
+    lo, hi = np.percentile(coarse, (1.0, 99.0))
+    return float(lo) + float(fraction) * float(hi - lo)
+
+
+def foreground_box(volume, threshold, step=1):
+    """((centre, size) in voxels) of everything above `threshold`, or None."""
+    coarse = volume[::step, ::step, ::step]
+    found = np.argwhere(coarse > threshold)
+    if found.size == 0:
+        return None
+    lo = found.min(axis=0) * float(step)
+    hi = found.max(axis=0) * float(step)
+    return (lo + hi) / 2.0, (hi - lo + 1.0)
+
+
+def fit_sample_transform(atlas_box, sample_box, frame, atlas_origin, atlas_voxel,
+                         sample_shape, sample_voxel):
+    """(offset_um, scale) putting the atlas's brain on top of the sample's.
+
+    Centre on centre, size to size, from the two bounding boxes -- a starting
+    point for the eye, not a registration. It exists because the angle is the
+    only thing here that is genuinely hard to guess: two brains that are 30%
+    apart in size and half a brain apart in position cannot be compared at
+    all, and nudging four numbers by hand before you can start on the fifth is
+    how a tool like this gets abandoned.
+
+    ONE scale for all three axes (the geometric mean of the three ratios): the
+    per-axis ratios of two bounding boxes differ mostly because the boxes are
+    cropped differently, not because the brains are, and letting each axis
+    stretch on its own would bake that difference in as anisotropy.
+
+    The two boxes are measured axis-aligned in their own grids while the atlas
+    may be turned by a few degrees, which widens its box slightly -- true of
+    any tilt, small at the angles this tool is for, and the fit is a starting
+    point either way.
+    """
+    (atlas_centre, atlas_size), (sample_centre, sample_size) = atlas_box, sample_box
+    atlas_size_um = np.asarray(atlas_size, dtype=float) * float(atlas_voxel)
+    sample_size_um = np.asarray(sample_size, dtype=float) * np.asarray(sample_voxel, dtype=float)
+    scale = float(np.exp(np.mean(np.log(sample_size_um / atlas_size_um))))
+
+    # Where the atlas's own centre of mass sits along each plane's normal,
+    # i.e. in the same coordinates sample_plane_index reads.
+    rel = np.asarray(atlas_centre, dtype=float) - np.asarray(atlas_origin, dtype=float)
+    reach = np.array([float(np.dot(rel, np.asarray(frame, dtype=float)[k])) for k in range(3)])
+
+    sample_origin = volume_origin(sample_shape)
+    offset_um = ((np.asarray(sample_centre, dtype=float) - sample_origin)
+                 * np.asarray(sample_voxel, dtype=float)
+                 - reach * float(atlas_voxel) * scale)
+    return offset_um, scale
+
+
+# =====================================================================================
 # the window
 # =====================================================================================
 def _add_atlas_layers(model, atlas, voxel, features, order, first, cross):
@@ -604,14 +798,20 @@ def _add_atlas_layers(model, atlas, voxel, features, order, first, cross):
                                  colormap=napari.utils.DirectLabelColormap(
                                      color_dict={None: "transparent", 1: "red"}))
     highlight.editable = False              # a reference; painting here would mean nothing
-    cross = model.add_vectors(cross, name="crosshair",
-                              edge_color=[_PANE_COLOURS[order[1]], _PANE_COLOURS[order[2]]],
+    # One colour per LINE. A pane draws the crosshair twice when the sample is
+    # beside the atlas (see pane_cross), so the colours are repeated to match:
+    # napari wants exactly as many as there are vectors, and the count is fixed
+    # for the life of the layer -- which is why the second pair is drawn as
+    # zero-length vectors when there is nothing beside the atlas, rather than
+    # dropped.
+    colours = [_PANE_COLOURS[order[1]], _PANE_COLOURS[order[2]]] * (len(cross) // 2)
+    cross = model.add_vectors(cross, name="crosshair", edge_color=colours,
                               edge_width=1.5, vector_style="line", opacity=0.9, scale=scale)
     return SimpleNamespace(template=template, annotation=annotation,
                            highlight=highlight, cross=cross)
 
 
-def _open_atlas_window(atlas, resolution_um, ortho=True):
+def _open_atlas_window(atlas, resolution_um, ortho=True, sample=None):
     """The atlas window: the app's one and only napari window.
 
     THREE LAYERS, bottom to top: the grayscale template, the COMPLETE
@@ -663,10 +863,23 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
     tree click -> highlight path -- see that function for why it gets its own
     dedicated side.
 
-    The atlas grid here is INDEPENDENT of any sample grid -- nothing in this
-    window is registered to anything, it is a reference only. What the atlas's
-    own extent, orientation and downsampling affect is exactly this display,
-    nothing else.
+    A SAMPLE VOLUME (`sample`, optional -- see _add_sample_panel) turns the
+    same window into a comparison. The three planes then stand for the
+    SAMPLE's own axes, which is what a light sheet actually fixes: the stack
+    was cut at whatever angle the brain happened to be lying at, and the
+    question is what angle the atlas has to be turned through to match it.
+    Each pane gains one more layer at the bottom of its stack -- that sample
+    plane, drawn beside the atlas reslice or superimposed on it in additive
+    green and magenta -- and the panes' drawing axes
+    switch from "carried across" to "the frame's own" (see set_frame), so a
+    rotation turns the atlas under a sample that stays exactly where it is.
+    Without a sample nothing about the window changes.
+
+    The atlas grid here is INDEPENDENT of the sample grid -- nothing in this
+    window is registered to anything, and the sample-to-atlas map is only ever
+    the rigid rotation + offset + single scale the panel holds. What the
+    atlas's own extent, orientation and downsampling affect is exactly this
+    display, nothing else.
     """
     voxel = float(resolution_um) * atlas.downsample if resolution_um else 1.0
     shape = atlas.compact.shape
@@ -681,7 +894,28 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
                             centre=origin.copy(),
                             highlight=np.zeros(shape, dtype=np.uint8),
                             stride=1,
-                            listeners=[])
+                            listeners=[],
+                            # The atlas is the thing that moves as soon as
+                            # there is a sample to move it against, and the
+                            # panes' axes have to follow the frame for that to
+                            # be visible at all -- see set_frame.
+                            sample=None,
+                            lock_axes=sample is not None)
+    if sample is not None:
+        state.sample = SimpleNamespace(
+            volume=sample.volume,
+            voxel=np.asarray(sample.voxel_um, dtype=float),
+            path=sample.path,
+            contrast=_sample_contrast(sample.volume),
+            # The atlas's middle voxel, in microns from the sample's middle
+            # voxel along each SAMPLE axis, and how much bigger the atlas has
+            # to be drawn to match the sample. Both start neutral; the panel's
+            # auto-fit is what usually sets them.
+            offset_um=np.zeros(3),
+            scale=1.0,
+            side_by_side=True,
+            slices=[0, 0, 0],
+            in_range=[True, True, True])
 
     def volumes():
         """The volumes every pane resamples, in the order _add_atlas_layers
@@ -703,9 +937,101 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         return SimpleNamespace(model=model, qt=qt, order=order, shift=np.zeros(2),
                                axes=axes, handedness=pane_handedness(axes), column=None)
 
+    def pane_t_bounds(pane):
+        """(lo, hi) of this pane's atlas picture across the screen, in voxels.
+
+        The same bounds plane_slice sizes its grid from -- read separately
+        here because the sample's placement and a click's meaning both need
+        to know where the atlas picture ends, and neither has a slice in hand.
+        """
+        return plane_bounds(shape, origin, pane.axes[2])
+
+    def atlas_width(pane):
+        """How wide this pane's atlas picture is, in world microns."""
+        t_min, t_max = pane_t_bounds(pane)
+        return (t_max - t_min + 1) * voxel
+
+    def sample_gap(pane):
+        """How far to the side of the atlas reslice this pane draws the sample.
+
+        Half of each picture's width, so the two sit next to each other
+        without touching whichever of them is wider -- and zero when the mode
+        is overlay, which is the whole of what "overlay" means here: the same
+        two layers, drawn in the same place instead of beside each other.
+        """
+        smp = state.sample
+        if smp is None or not smp.side_by_side:
+            return 0.0
+        axis = int(pane.order[2])
+        sample_width = smp.volume.shape[axis] * smp.voxel[axis] / smp.scale
+        return 0.53 * (atlas_width(pane) + sample_width)
+
+    def offset_bounds(axis):
+        """How far plane `axis` can be scrolled, in its own offset units: the
+        atlas's own extent, widened to whatever the sample reaches."""
+        lo, hi = plane_bounds(shape, origin, state.frame[axis])
+        smp = state.sample
+        if smp is None:
+            return lo, hi
+        reach = sample_offset_bounds(axis, smp.volume.shape, smp.voxel, voxel,
+                                     smp.scale, smp.offset_um)
+        return int(np.floor(min(lo, reach[0]))), int(np.ceil(max(hi, reach[1])))
+
+    def sample_slice_for(pane):
+        """This pane's sample plane, for wherever the atlas planes now sit.
+
+        Records which slice that came out as (state.sample.slices), because
+        the panel reports it and "which plane of my stack am I looking at" is
+        the number the user reads back into their own notes."""
+        smp = state.sample
+        axis = int(pane.order[0])
+        offset = plane_offsets(state.centre, state.frame, origin)[axis]
+        image, index, in_range = sample_plane_image(
+            smp.volume, pane.order,
+            sample_plane_index(offset, axis, smp.volume.shape, smp.voxel,
+                               voxel, smp.scale, smp.offset_um))
+        smp.slices[axis], smp.in_range[axis] = index, in_range
+        return image
+
+    def add_sample_layer(model, pane):
+        """The sample's own layer, added BEFORE the atlas's so it sits at the
+        bottom of the stack -- in overlay mode the atlas is what is drawn over
+        the sample, not the other way round."""
+        if state.sample is None:
+            return None
+        return model.add_image(sample_slice_for(pane), name="sample (fixed, never rotated)",
+                               colormap="gray", contrast_limits=list(state.sample.contrast))
+
+    def place_sample(pane):
+        """Draw this pane's sample plane: which slice, how big, and where."""
+        smp = state.sample
+        if smp is None:
+            return
+        layer = pane.layers.sample
+        layer.data = sample_slice_for(pane)
+        scale, translate = sample_placement(pane.order, smp.volume.shape, smp.voxel,
+                                            smp.scale, smp.offset_um)
+        # Only when it actually changed: see _add_atlas_layers on why writing a
+        # layer's scale on every mouse move is worth avoiding. Here it depends
+        # on nothing but the size ratio, which a drag never touches.
+        if not np.allclose(np.asarray(layer.scale, dtype=float), scale):
+            layer.scale = scale
+        layer.translate = translate + pane.shift * voxel + np.array([0.0, sample_gap(pane)])
+
     def pane_cross(pane, sl):
-        return crosshair_vectors(sl, cut_directions(pane.axes, state.frame, pane.order),
-                                 pane.shift)
+        """The two cut lines -- twice over when the sample is drawn beside the
+        atlas, so the pair over there marks the same point in the sample as
+        the pair over here does in the atlas. (Clipped to the atlas picture's
+        width in both places: they are a position marker, not a measurement of
+        the sample's extent.)"""
+        directions = cut_directions(pane.axes, state.frame, pane.order)
+        lines = crosshair_vectors(sl, directions, pane.shift)
+        if state.sample is None:
+            return lines
+        gap = sample_gap(pane)
+        beside = (crosshair_vectors(sl, directions, (pane.shift[0], pane.shift[1] + gap / voxel))
+                  if gap else np.zeros_like(lines))
+        return np.concatenate([lines, beside])
 
     viewer = napari.Viewer(title="Atlas viewer")
     # napari's own layer controls stop shrinking while they still own a good
@@ -715,8 +1041,11 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
     main = new_pane(viewer, None, panes[0][0])
     main.column = _main_pane_column(viewer)
     first = slice_for(main)
+    sample_layer = add_sample_layer(viewer, main)
     main.layers = _add_atlas_layers(viewer, atlas, voxel, features, main.order,
                                     first, pane_cross(main, first))
+    main.layers.sample = sample_layer
+    place_sample(main)
     built = [main]
 
     for order, _title in panes[1:]:
@@ -729,8 +1058,11 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         qt = QtViewer(model)
         pane = new_pane(model, qt, order)
         first = slice_for(pane)
+        sample_layer = add_sample_layer(model, pane)
         pane.layers = _add_atlas_layers(model, atlas, voxel, features, order,
                                         first, pane_cross(pane, first))
+        pane.layers.sample = sample_layer
+        place_sample(pane)
         built.append(pane)
         model.reset_view()
 
@@ -780,6 +1112,7 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
                 layer.data = expand_coarse(image, rows, cols, state.stride)
                 layer.translate = translate
             pane.layers.cross.data = pane_cross(pane, sl)
+            place_sample(pane)
 
     def apply_state():
         refresh()
@@ -810,21 +1143,46 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         normal is the rotation axis -- therefore keeps its axes exactly, and
         its picture does not budge: what turns is the pair of cut lines drawn
         over it, and the other two panes' pictures.
+
+        UNLESS there is a sample (`state.lock_axes`), where that is exactly
+        backwards. The sample is then the thing that holds still -- it is the
+        stack as acquired, the fixed frame the panes stand for -- and the atlas
+        is what the user is turning. Carrying the axes across would hide the
+        one component of the rotation that matters most for lining two brains
+        up: the in-plane one, which would leave the dragged pane's atlas
+        picture untouched while the sample beside it stayed put too, i.e.
+        looking like nothing happened. Read off the frame instead, and the
+        atlas turns under a stationary sample in every pane.
         """
         before = [crosshair_in_pane(pane) for pane in built]
         state.frame = orthonormal_frame(frame)
         for pane, was in zip(built, before):
             normal = state.frame[pane.order[0]]
-            pane.axes = np.array([normal, *plane_basis(normal, pane.axes[1], pane.axes[2],
-                                                       pane.handedness)])
+            if state.lock_axes:
+                pane.axes = axes_from_frame(state.frame, pane.order)
+            else:
+                pane.axes = np.array([normal, *plane_basis(normal, pane.axes[1], pane.axes[2],
+                                                           pane.handedness)])
             pane.shift += was - crosshair_in_pane(pane)
         apply_state()
 
     def centre_on(index):
         """Point every plane at voxel `index` -- so the two reconstructions
-        land on it too, not just the pane that was clicked."""
-        state.centre = np.clip(np.asarray(index, dtype=float), 0,
-                               np.asarray(shape, dtype=float) - 1)
+        land on it too, not just the pane that was clicked.
+
+        Kept inside the atlas, or, once there is a sample, inside whichever of
+        the two volumes reaches furthest along each plane's normal
+        (offset_bounds). Clipping to the atlas box there would undo the whole
+        point of the widened sliders: the sample is a different size, and the
+        end of the stack is often outside the atlas.
+        """
+        index = np.asarray(index, dtype=float)
+        if state.sample is None:
+            state.centre = np.clip(index, 0, np.asarray(shape, dtype=float) - 1)
+        else:
+            offsets = [float(np.clip(offset, *offset_bounds(axis)))
+                       for axis, offset in enumerate(plane_offsets(index, state.frame, origin))]
+            state.centre = centre_from_offsets(offsets, state.frame, origin)
         apply_state()
 
     def set_offsets(offsets):
@@ -843,6 +1201,50 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
             pane.shift[:] = 0.0
             pane.axes = axes_from_frame(state.frame, pane.order)
         apply_state()
+        for pane in built:
+            pane.model.reset_view()
+
+    def set_sample(offset_um=None, scale=None, side_by_side=None):
+        """The sample-to-atlas map, from the sample panel. Rotation is not
+        here: that is the frame, and it is the same frame the panes, the
+        sliders and the drags have always shared."""
+        smp = state.sample
+        if smp is None:
+            return
+        if offset_um is not None:
+            smp.offset_um = np.asarray(offset_um, dtype=float)
+        if scale is not None:
+            smp.scale = max(float(scale), 1e-3)
+        if side_by_side is not None:
+            smp.side_by_side = bool(side_by_side)
+        apply_state()
+
+    def fit_sample():
+        """Auto-fit: put the atlas's brain on the sample's, centre and size.
+
+        The atlas's own foreground is exact and free -- it is every voxel the
+        annotation labels -- while the sample's is a threshold guess
+        (foreground_threshold), which is why this only ever seeds the two
+        numbers the user then adjusts. Returns None if either volume turns out
+        to be empty at that threshold.
+        """
+        smp = state.sample
+        if smp is None:
+            return None
+        atlas_box = foreground_box(atlas.compact, 0, coarse_step(shape))
+        step = coarse_step(smp.volume.shape)
+        sample_box = foreground_box(smp.volume, foreground_threshold(smp.volume, step), step)
+        if atlas_box is None or sample_box is None:
+            return None
+        offset_um, scale = fit_sample_transform(atlas_box, sample_box, state.frame, origin,
+                                                voxel, smp.volume.shape, smp.voxel)
+        set_sample(offset_um=offset_um, scale=scale)
+        return offset_um, scale
+
+    def reset_views():
+        """Re-fit every pane's camera to what it is now drawing -- what makes
+        switching between side by side and overlay land on the pictures
+        instead of on the empty half of where they used to be."""
         for pane in built:
             pane.model.reset_view()
 
@@ -866,9 +1268,22 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
         refresh()
 
     def pane_position(pane, world):
-        """A napari world position in `pane` -> the voxel it points at."""
+        """A napari world position in `pane` -> the voxel it points at.
+
+        A click on the SAMPLE, while the sample is drawn beside the atlas,
+        means the same as a click on the atlas at the matching point: the two
+        are one picture with a gap down the middle, so the gap comes off
+        first. Without it, clicking the very thing you are comparing against
+        would send the crosshair a brain's width outside the atlas.
+        """
         s = float(world[0]) / voxel - pane.shift[0]
         t = float(world[1]) / voxel - pane.shift[1]
+        gap = sample_gap(pane)
+        # Everything past the atlas picture's own right edge is the sample:
+        # sample_gap leaves a margin between the two, so nothing in between is
+        # ambiguous.
+        if gap and t > pane_t_bounds(pane)[1]:
+            t -= gap / voxel
         offset = float(np.dot(state.centre - origin, pane.axes[0]))
         return plane_point(origin, pane.axes, offset, s, t)
 
@@ -877,16 +1292,28 @@ def _open_atlas_window(atlas, resolution_um, ortho=True):
                           set_highlight=set_highlight, centre_on=centre_on,
                           set_offsets=set_offsets, set_euler=set_euler,
                           reset_planes=reset_planes, rotate=rotate, set_drag=set_drag,
+                          set_sample=set_sample, fit_sample=fit_sample, reset_views=reset_views,
+                          offset_bounds=offset_bounds,
                           crosshair_in_pane=crosshair_in_pane, pane_position=pane_position)
 
     for pane in built:
         pane.model.mouse_drag_callbacks.append(_pane_mouse_callback(pane, win))
         if pane.column is not None:
             pane.slider = _add_pane_slider(pane, win, pane.column)
-    main.model.reset_view()
 
     win.hover = _add_hover_bar(viewer, atlas, built, below=ortho_dock)
-    _add_plane_panel(viewer, win)
+    planes_panel = _add_plane_panel(viewer, win)
+    if state.sample is not None:
+        sample_panel = _add_sample_panel(viewer, win)
+        # Tabbed rather than stacked, and the sample panel in front: two panels
+        # sharing one column arrive as a pair of slivers otherwise, and with a
+        # sample loaded the sample panel is where the session starts.
+        ontology_tree_ui.tabify(viewer, [planes_panel.dock, sample_panel.dock],
+                                current=sample_panel.dock)
+    # After the panels, not before: the sample panel's opening auto-fit resizes
+    # the atlas, and a camera fitted to the un-fitted picture would open zoomed
+    # to nothing much.
+    reset_views()
     return win
 
 
@@ -991,7 +1418,14 @@ def _rotation_drag(pane, win, event):
     press that never moved as a plain click.
     """
     axis = pane.order[0]
-    sign = -pane.handedness
+    # Two opposite gestures, because with a sample loaded the two volumes swap
+    # roles. Atlas alone: the pane's picture is pinned (plane_basis) and what
+    # follows the cursor are the two cut lines, which turn against the frame.
+    # With a sample: the SAMPLE is what is pinned, the pane's axes are the
+    # frame's own (see set_frame), and what follows the cursor is the atlas
+    # picture itself, which turns with the frame. Same drag, same sign of
+    # rotation on screen, opposite sign on the frame.
+    sign = pane.handedness if win.state.lock_axes else -pane.handedness
 
     def cursor_angle():
         rel = np.asarray(event.position, dtype=float)[:2] / win.voxel - win.crosshair_in_pane(pane)
@@ -1039,7 +1473,7 @@ def _mirror_layer_attrs(panes):
     the template, the annotation and the selection.
     """
     main, followers = panes[0], panes[1:]
-    for role in ("template", "annotation", "highlight", "cross"):
+    for role in ("sample", "template", "annotation", "highlight", "cross"):
         source = getattr(main.layers, role)
         if source is None:
             continue
@@ -1116,7 +1550,7 @@ def _add_pane_slider(pane, win, layout):
         rotation, the panel's own slider. `busy` stops the write-back loop
         that would otherwise start here (see the plane panel's sync)."""
         offsets = plane_offsets(win.state.centre, win.state.frame, win.origin)
-        lo, hi = plane_bounds(win.shape, win.origin, win.state.frame[axis])
+        lo, hi = win.offset_bounds(axis)
         busy["in"] = True
         try:
             slider.setRange(lo, hi)
@@ -1233,7 +1667,7 @@ def _add_plane_panel(viewer, win):
         try:
             offsets = plane_offsets(state.centre, state.frame, origin)
             for axis, (slider, readout) in enumerate(zip(sliders, readouts)):
-                lo, hi = plane_bounds(win.shape, origin, state.frame[axis])
+                lo, hi = win.offset_bounds(axis)
                 slider.setRange(lo, hi)
                 slider.setValue(int(round(offsets[axis])))
                 readout.setText(f"{offsets[axis] * voxel:,.0f} um"
@@ -1259,27 +1693,231 @@ def _add_plane_panel(viewer, win):
         box.valueChanged.connect(on_angle)
     reset.clicked.connect(lambda *_a: win.reset_planes())
 
-    dock = QWidget()
-    dock.setMinimumWidth(1)
-    layout = QVBoxLayout(dock)
-    layout.addWidget(_caption(
+    atlas_only = (
         "Three orthogonal planes, tiltable together. The atlas itself never "
         "moves: click a view to point all three planes at that voxel, and "
         "drag one of the coloured lines lying across a view (or Shift+drag "
         "anywhere in it) to swing that cut round -- the other two views "
         "reslice to the angle you aim. Each view also has its own slider "
-        "underneath for scrolling that plane along its normal.", 96))
+        "underneath for scrolling that plane along its normal.")
+    with_sample = (
+        "The three planes are the SAMPLE's own axes, and these angles are how "
+        "far the atlas is turned to meet them -- what you write down as \"this "
+        "brain was cut N degrees off the atlas's horizontal\". Type an exact "
+        "angle here, or Shift+drag inside a view (or drag one of its coloured "
+        "lines) to turn the atlas about that view's own normal: the sample "
+        "stays put and the atlas swings under it. Clicking points all three "
+        "planes at a voxel; each view's own slider scrolls its plane, sample "
+        "and atlas together.")
+
+    dock = QWidget()
+    dock.setMinimumWidth(1)
+    layout = QVBoxLayout(dock)
+    layout.addWidget(_caption(with_sample if win.state.sample is not None else atlas_only, 96))
     layout.addWidget(QLabel("Position along each plane's normal"))
     layout.addLayout(positions)
     layout.addWidget(QLabel("Orientation (rotations about the atlas axes)"))
     layout.addLayout(angles)
     layout.addWidget(ontology_tree_ui.scrollable(status, 56))
     layout.addWidget(reset)
-    viewer.window.add_dock_widget(dock, area="right", name="Planes")
+    dock_widget = viewer.window.add_dock_widget(dock, area="right", name="Planes")
 
     state.listeners.append(sync)
     sync()
-    return SimpleNamespace(sync=sync, sliders=sliders, angle_boxes=angle_boxes)
+    return SimpleNamespace(sync=sync, sliders=sliders, angle_boxes=angle_boxes,
+                           dock=dock_widget)
+
+
+def _sample_contrast(volume):
+    """Contrast limits for the sample layer, from the WHOLE volume.
+
+    Same reason the atlas template takes its limits from the volume rather
+    than from one plane (see _add_atlas_layers), plus one of its own:
+    percentiles instead of min/max, because a light-sheet stack reliably
+    carries a few saturated specks and one of them is enough to leave the
+    brain looking black.
+    """
+    coarse = volume[::4, ::4, ::4]
+    lo, hi = np.percentile(coarse, (0.5, 99.5))
+    lo, hi = float(lo), float(hi)
+    return lo, (hi if hi > lo else lo + 1.0)
+
+
+def _add_sample_panel(viewer, win):
+    """The sample: beside the atlas or on top of it, and the four numbers that
+    are not the angle.
+
+    The angle is the thing this whole panel exists to let you find -- a light
+    sheet cannot be aimed to the degree, so a stack is cut at whatever angle
+    the brain was lying at, and an atlas registered as though that angle were
+    zero pulls structures across boundaries no amount of deformable
+    registration afterwards can put back. It is also the one number that is
+    hopeless to guess and easy to SEE, provided the two brains are first the
+    same size and in the same place. That is what is here: three offsets, one
+    scale, an auto-fit that sets them from the two bounding boxes, and a
+    switch between the two ways of looking.
+
+    SIDE BY SIDE is for reading the sample -- the two pictures never touch, so
+    an oblique olfactory bulb or a midbrain riding up into cortex is visible
+    as itself rather than as a colour clash. OVERLAY is for judging: the same
+    two layers drawn in the same place, in additive green and magenta, where
+    what you are looking for is white. Everything else -- the angles, the
+    plane positions -- is shared with the Planes panel and the views
+    themselves, because there is only one frame and one crosshair however
+    many widgets are pointed at them.
+
+    What the panel cannot do is register anything. Rotation, offset and a
+    single isotropic scale is the whole model; there is no shear, no per-axis
+    stretch and no deformation, on purpose -- the output is three angles to
+    reproduce a cut with, not a transform to resample with.
+    """
+    state, voxel = win.state, win.voxel
+    smp = state.sample
+    busy = {"in": False}
+
+    overlay = _shrinkable(QPushButton("Overlay the two (superimpose)"))
+    overlay.setCheckable(True)
+
+    offsets = QGridLayout()
+    offset_boxes = []
+    for axis in range(3):
+        box = QDoubleSpinBox()
+        box.setRange(-100000.0, 100000.0)
+        box.setDecimals(0)
+        box.setSingleStep(round(float(smp.voxel[axis]) * 5) or 10.0)
+        box.setSuffix(" um")
+        box.setKeyboardTracking(False)      # see the plane panel's angle boxes
+        swatch = QLabel()
+        swatch.setFixedWidth(10)
+        swatch.setStyleSheet(f"background: {_PANE_COLOURS[axis]};")
+        offsets.addWidget(swatch, axis, 0)
+        offsets.addWidget(QLabel(f"along axis {axis}"), axis, 1)
+        offsets.addWidget(box, axis, 2)
+        offset_boxes.append(box)
+
+    scale_box = QDoubleSpinBox()
+    scale_box.setRange(10.0, 1000.0)
+    scale_box.setDecimals(1)
+    scale_box.setSingleStep(0.5)
+    scale_box.setSuffix(" %")
+    scale_box.setKeyboardTracking(False)
+    scale_row = QGridLayout()
+    scale_row.addWidget(QLabel("atlas size"), 0, 0)
+    scale_row.addWidget(scale_box, 0, 1)
+
+    fit = _shrinkable(QPushButton("Auto-fit centre + size (bounding boxes)"))
+    clear = _shrinkable(QPushButton("Reset (centred, 100%)"))
+    status = QLabel()
+    summary = QLineEdit()
+    summary.setReadOnly(True)               # a line to copy into a notebook
+    _shrinkable(summary)
+
+    def apply_look(overlaid):
+        """Grayscale side by side, additive green/magenta superimposed.
+
+        Two grays drawn on top of each other is not a comparison -- whichever
+        is on top is simply the picture. Additive complementary colours make
+        agreement read as white and disagreement as a coloured fringe, which
+        is the judgement this mode is for. Both are ordinary layer settings,
+        so the layer list can override either of them afterwards.
+        """
+        for pane in win.panes:
+            for layer, colour in ((pane.layers.sample, "green"),
+                                  (pane.layers.template, "magenta")):
+                if layer is None:
+                    continue
+                layer.colormap = colour if overlaid else "gray"
+                layer.blending = "additive" if overlaid else "translucent"
+
+    def on_mode(*_args):
+        overlaid = overlay.isChecked()
+        overlay.setText("Side by side (separate)" if overlaid
+                        else "Overlay the two (superimpose)")
+        apply_look(overlaid)
+        win.set_sample(side_by_side=not overlaid)
+        # The pictures just moved half a brain sideways; the cameras follow.
+        win.reset_views()
+
+    def on_numbers(*_args):
+        if busy["in"]:
+            return
+        win.set_sample(offset_um=[box.value() for box in offset_boxes],
+                       scale=scale_box.value() / 100.0)
+
+    def on_fit(*_args):
+        fitted = win.fit_sample()
+        if fitted is None:
+            status.setText("auto-fit found no foreground in one of the two volumes")
+            return
+        offset_um, scale = fitted
+        print(f"[sample] auto-fit: offset {tuple(round(float(v)) for v in offset_um)} um, "
+              f"scale {scale * 100:.1f}%")
+        win.reset_views()
+
+    def on_clear(*_args):
+        win.set_sample(offset_um=np.zeros(3), scale=1.0)
+        win.reset_views()
+
+    def sync():
+        """Follow the state, whatever moved it -- the same busy-flag dance as
+        every other panel here (see _add_plane_panel.sync)."""
+        busy["in"] = True
+        try:
+            for box, value in zip(offset_boxes, smp.offset_um):
+                box.setValue(float(value))
+            scale_box.setValue(smp.scale * 100.0)
+            slices = ", ".join(
+                f"{index}" + ("" if ok else "!")
+                for index, ok in zip(smp.slices, smp.in_range))
+            angles = euler_from_frame(state.frame)
+            status.setText(
+                f"sample slices ({slices}) of {tuple(smp.volume.shape)}"
+                + ("" if all(smp.in_range) else "   ! = past the end of the sample")
+                + f"\nsample voxels {tuple(round(float(v), 2) for v in smp.voxel)} um, "
+                f"atlas {voxel:g} um")
+            summary.setText(
+                "angles_deg: [" + ", ".join(f"{a:.1f}" for a in angles) + "]   "
+                "offset_um: [" + ", ".join(f"{v:.0f}" for v in smp.offset_um) + "]   "
+                f"scale: {smp.scale:.3f}")
+        finally:
+            busy["in"] = False
+
+    overlay.clicked.connect(on_mode)
+    for box in offset_boxes:
+        box.valueChanged.connect(on_numbers)
+    scale_box.valueChanged.connect(on_numbers)
+    fit.clicked.connect(on_fit)
+    clear.clicked.connect(on_clear)
+
+    dock = QWidget()
+    dock.setMinimumWidth(1)
+    layout = QVBoxLayout(dock)
+    layout.addWidget(_caption(
+        "Your sample, exactly as acquired -- never rotated, never resampled. "
+        "The atlas is what moves: turn it (Planes panel, or Shift+drag in a "
+        "view) until the two agree, then superimpose them to check. Size and "
+        "position first, angle second -- two brains that are not the same "
+        "size cannot be compared for angle at all.", 96))
+    layout.addWidget(overlay)
+    layout.addWidget(QLabel("Atlas centre, relative to the sample's"))
+    layout.addLayout(offsets)
+    layout.addLayout(scale_row)
+    layout.addWidget(fit)
+    layout.addWidget(clear)
+    layout.addWidget(_shrinkable(ontology_tree_ui.scrollable(status, 56)))
+    layout.addWidget(summary)
+    dock_widget = viewer.window.add_dock_widget(dock, area="right", name="Sample")
+
+    state.listeners.append(sync)
+    apply_look(False)
+    # Opening on the neutral transform would mean opening on a half-brain
+    # sample beside a whole-brain atlas at two different sizes, i.e. on the
+    # one view of them that says nothing. The fit is a guess, and it is the
+    # first thing anyone would press.
+    on_fit()
+    sync()
+    return SimpleNamespace(sync=sync, dock=dock_widget, overlay=overlay,
+                           offset_boxes=offset_boxes, scale_box=scale_box)
 
 
 def ancestry_labels(structures, structure_id):
@@ -1672,7 +2310,11 @@ def _run_view(atlas_cfg):
     _import_gui()
     print("[atlas] loading atlas reference...")
     atlas = atlas_reference.load_atlas_reference(atlas_cfg, include_template=True)
-    win = _open_atlas_window(atlas, atlas_cfg.resolution_um, ortho=atlas_cfg.ortho)
+    sample = None
+    if getattr(atlas_cfg, "sample", None) is not None:
+        sample = atlas_reference.load_sample_volume(atlas_cfg.sample)
+    win = _open_atlas_window(atlas, atlas_cfg.resolution_um, ortho=atlas_cfg.ortho,
+                             sample=sample)
     _add_region_panel(win.viewer, atlas, win)
 
 
@@ -2074,6 +2716,141 @@ def selftest_hover_bar_line():
     print("   ok")
 
 
+def selftest_sample_mapping():
+    print("12. sample: one map, read forwards (which slice) and sideways (where on screen)")
+    shape = (40, 50, 60)
+    voxel = 20.0
+    isotropic = np.full(3, voxel)
+
+    # Neutral case: same grid, same voxel size, nothing offset or rescaled.
+    # The sample slice must then BE the atlas plane, and a sample voxel must
+    # land exactly where the atlas draws the voxel of the same index.
+    for order, _title in _ORTHO_PANES:
+        axis = order[0]
+        index = sample_plane_index(3.0, axis, shape, isotropic, voxel, 1.0, np.zeros(3))
+        assert np.isclose(index, volume_origin(shape)[axis] + 3.0), (order, index)
+        scale, translate = sample_placement(order, shape, isotropic, 1.0, np.zeros(3))
+        for dim, in_plane in enumerate((order[1], order[2])):
+            world = 7.0 * scale[dim] + translate[dim]
+            expected = (7.0 - volume_origin(shape)[in_plane]) * voxel
+            assert np.isclose(world, expected), (order, dim, world, expected)
+
+    # General case: a different grid, anisotropic voxels, an offset and a size
+    # ratio. Along the normal and across the plane are two readings of the
+    # same line, so both have to invert back to the atlas coordinate they came
+    # from -- a sign or an origin wrong in one of them would show up as a
+    # sample that slides out from under the atlas as the planes are scrolled.
+    sample_shape = (30, 44, 55)
+    sample_voxel = np.array([25.0, 10.0, 10.0])
+    sample_origin = volume_origin(sample_shape)
+    size_ratio, offset_um = 1.3, np.array([120.0, -75.0, 40.0])
+
+    for order, _title in _ORTHO_PANES:
+        axis = order[0]
+        for offset in (-11.0, 0.0, 6.5):
+            index = sample_plane_index(offset, axis, sample_shape, sample_voxel,
+                                       voxel, size_ratio, offset_um)
+            back = ((index - sample_origin[axis]) * sample_voxel[axis]
+                    - offset_um[axis]) / (voxel * size_ratio)
+            assert np.isclose(back, offset), (order, offset, back)
+
+        scale, translate = sample_placement(order, sample_shape, sample_voxel,
+                                            size_ratio, offset_um)
+        for dim, in_plane in enumerate((order[1], order[2])):
+            for s in (-9.0, 0.0, 12.0):
+                # The sample index meaning the same point as atlas coordinate
+                # s, and the world position the placement gives it.
+                index = (sample_origin[in_plane]
+                         + (s * voxel * size_ratio + offset_um[in_plane])
+                         / sample_voxel[in_plane])
+                world = index * scale[dim] + translate[dim]
+                assert np.isclose(world, s * voxel), (order, dim, s, world)
+
+    # The slider bounds are the same map inverted at the two ends: scrolled to
+    # either of them, the sample shows its first or its last slice.
+    for axis in range(3):
+        lo, hi = sample_offset_bounds(axis, sample_shape, sample_voxel, voxel,
+                                      size_ratio, offset_um)
+        assert np.isclose(sample_plane_index(lo, axis, sample_shape, sample_voxel,
+                                             voxel, size_ratio, offset_um), 0.0)
+        assert np.isclose(sample_plane_index(hi, axis, sample_shape, sample_voxel,
+                                             voxel, size_ratio, offset_um),
+                          sample_shape[axis] - 1)
+    print("   ok")
+
+
+def selftest_sample_slices():
+    print("13. sample: axis-aligned slices, blank rather than clamped past the end")
+    volume = _ramp_volume((6, 7, 8))
+    for order, _title in _ORTHO_PANES:
+        image, index, in_range = sample_plane_image(volume, order, 2.4)
+        assert in_range and index == 2, (order, index)
+        # take() leaves the remaining axes in ascending order, which for every
+        # pane is already (down the screen, across it).
+        assert np.array_equal(image, np.take(volume, 2, axis=order[0]))
+        assert image.shape == (volume.shape[order[1]], volume.shape[order[2]]), image.shape
+
+        for outside in (-1.0, volume.shape[order[0]] + 3.0):
+            blank, index, in_range = sample_plane_image(volume, order, outside)
+            assert not in_range and not blank.any(), (order, outside, index)
+            assert blank.shape == image.shape
+    print("   ok")
+
+
+def selftest_sample_autofit():
+    print("14. sample auto-fit: the two brains come out the same size, on the same spot")
+    atlas = np.zeros((60, 60, 60), dtype=np.uint8)
+    atlas[10:30, 20:40, 25:55] = 3               # a labelled blob, off centre
+    sample = np.zeros((80, 70, 90), dtype=np.uint16)
+    sample[20:60, 10:40, 30:75] = 900            # a different size, elsewhere
+    voxel, sample_voxel = 20.0, np.array([10.0, 25.0, 12.0])
+
+    atlas_box = foreground_box(atlas, 0)
+    sample_box = foreground_box(sample, foreground_threshold(sample))
+    assert np.allclose(atlas_box[1], (20, 20, 30)), atlas_box
+    assert np.allclose(sample_box[1], (40, 30, 45)), sample_box
+
+    offset_um, scale = fit_sample_transform(atlas_box, sample_box, identity_frame(),
+                                            volume_origin(atlas.shape), voxel,
+                                            sample.shape, sample_voxel)
+    # The fitted map has to carry the atlas blob's centre onto the sample
+    # blob's -- read through sample_plane_index, i.e. through the same
+    # arithmetic the panes use rather than a restatement of the fit.
+    for axis in range(3):
+        offset = atlas_box[0][axis] - volume_origin(atlas.shape)[axis]
+        index = sample_plane_index(offset, axis, sample.shape, sample_voxel,
+                                   voxel, scale, offset_um)
+        assert np.isclose(index, sample_box[0][axis]), (axis, index, sample_box[0][axis])
+
+    ratios = (np.array(sample_box[1]) * sample_voxel) / (np.array(atlas_box[1]) * voxel)
+    assert np.isclose(scale, float(np.exp(np.mean(np.log(ratios))))), scale
+    assert min(ratios) < scale < max(ratios), (scale, ratios)
+
+    assert foreground_box(np.zeros((4, 4, 4)), 0) is None
+    print("   ok")
+
+
+def selftest_locked_pane_axes():
+    print("15. sample mode: the atlas turns under the sample instead of holding still")
+    order = (0, 1, 2)
+    frame = identity_frame()
+    axes = axes_from_frame(frame, order)
+    turned = rotated_frame(frame, 0, np.deg2rad(10.0))
+
+    locked = axes_from_frame(turned, order)                 # what a sample forces
+    carried = np.array([turned[0], *plane_basis(turned[0], axes[1], axes[2],
+                                                pane_handedness(axes))])
+    # Same plane either way: the rotation was about this pane's own normal.
+    assert np.allclose(locked[0], carried[0]) and np.allclose(locked[0], axes[0])
+    # Carried: the picture is pinned and the cut lines are what move.
+    assert np.allclose(carried[1:], axes[1:])
+    # Locked: the picture turns, by exactly the angle asked for -- which is
+    # the in-plane component of the tilt, and invisible without this.
+    angle = np.rad2deg(np.arccos(np.clip(float(np.dot(locked[1], axes[1])), -1.0, 1.0)))
+    assert np.isclose(angle, 10.0), angle
+    print("   ok")
+
+
 def run_selftests():
     print("=== tools/atlas_view.py selftests (synthetic data only, no GUI) ===")
     selftest_ortho_panes_geometry()
@@ -2087,6 +2864,10 @@ def run_selftests():
     selftest_rotation_drag()
     selftest_pane_axes()
     selftest_hover_bar_line()
+    selftest_sample_mapping()
+    selftest_sample_slices()
+    selftest_sample_autofit()
+    selftest_locked_pane_axes()
     print("=== all selftests passed ===")
     print("(shared/atlas_reference.py --selftest covers atlas loading / ontology maths)")
     return 0

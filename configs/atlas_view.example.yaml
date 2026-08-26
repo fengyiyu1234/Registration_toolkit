@@ -23,3 +23,32 @@ atlas_orientation:     [1, -3, 2]
 
 # 三个正交视角同步显示；关掉的话只剩样本视角那一个。
 atlas_ortho_views: true
+
+# ---------------------------------------------------------------------------
+# 可选：把自己的样本调进来，跟图谱比角度。
+#
+# 不写这一段，这个工具就还是原来的纯图谱浏览器；写了之后，三个视角代表的是
+# 【样本自己的三个轴】（光片拍摄的平面 —— 拍的时候脑子躺成什么角度就是什么角度，
+# 没法保证正好 horizontal），Planes 面板里那三个角度就变成"图谱要转多少度才能
+# 对上这个样本"。样本永远不动、不重采样；动的是图谱。
+#
+# 用法：Sample 面板先 Auto-fit 把两个脑摆到同样大小、同一个位置，然后
+# Shift+拖（或拖视图里那两条彩色线）转图谱，转好了点 Overlay 叠起来看
+# （加色显示：样本绿、图谱品红，重合的地方是白的）。
+#
+# 建议用流程输出的 <sample>_fine_<n>um.nii.gz —— 已经重采样到图谱的分辨率、
+# 也已经转成 orientation 之后的轴序，直接就能比。
+# sample_path: /data/.../TSC_ants/s12t/DeMBA_0825/tsc12t_fine_20um.nii.gz
+
+# 可选。一个数或三个数，顺序跟 ../Registration_ants 的 sample.voxel_size_um
+# 一样是 [x, y, z]（文件自己的轴序，orientation 之前）。不写就用文件里带的
+# spacing —— 流程写出来的 .nii.gz 都带，普通 tif 不带（不带又不写这一项的话
+# 会按 1 µm 算，面板上所有微米数就都没意义了，会有一行 WARNING）。
+# sample_resolution_um: [2.6, 2.6, 32.0]
+
+# 可选。样本的 ClearMap 风格轴向重排，跟 atlas_orientation 同一个写法。
+# 上面那个 _fine_20um.nii.gz 已经是转好的，不用写；直接读原始 tif 才需要。
+# sample_orientation: [1, 2, 3]
+
+# 可选，>=1。原分辨率的大 tif 直接读会很占内存，这里降采样只影响显示。
+# sample_downsample: 1
