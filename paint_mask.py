@@ -1,7 +1,10 @@
 """Interactive tool: paint a guide outline on a 3D sample volume.
 
 TWO MODES, chosen by `mode:` in configs/paint_mask.yaml. Both export a guide
-for mask.guide_regions; they differ in what you start from.
+for mask.guide_regions; they differ in what you start from. The config is
+`mode:` plus a `common:` section and one section per mode -- only the running
+mode's section is read (flatten_config_sections), so both can stay filled in
+and switching modes is a one-line edit.
 
   mode: guide (default) -- paint on the raw sample, from blank planes.
     You trace each region by hand and say which atlas structure(s) each brush
@@ -21,11 +24,12 @@ for mask.guide_regions; they differ in what you start from.
     the measured reason a uniform ontology depth is not a usable knob.
 
     THE CANVAS IS STILL THE RAW STACK. The registration output arrives on
-    the isotropic grid registration ran on (25 um), and is regridded up onto
-    image_path's grid to be overlaid -- never the other way round. Painting
-    on the isotropic grid would mean drawing at 25 um on planes that were
-    interpolated into existence, instead of at 2.6 um on the planes that
-    were actually imaged; pipeline.py's _build_guide_regions_from_labels
+    the isotropic grid registration ran on (the pipeline's fine_target_um --
+    20 um for both atlas presets here, 25 if it is left unset), and is
+    regridded up onto image_path's grid to be overlaid -- never the other
+    way round. Painting on the isotropic grid would mean drawing at 20 um on
+    planes that were interpolated into existence, instead of at 2.6 um on
+    the planes that were actually imaged; pipeline.py's _build_guide_regions_from_labels
     says the same thing about where a painted volume has to live. So
     image_path, the exported grid, and the voxel_size_um that goes into the
     pipeline config are identical to guide mode's.
@@ -124,8 +128,10 @@ TWO FACTS THIS TOOL DELIBERATELY DOES NOT PAPER OVER
      consequence is that NOTHING downstream can learn the voxel size by
      reading either file's header; it has to be passed explicitly. The
      `.regions.json` sidecar says so in writing (voxel_size_um_note), and
-     `display_scale_zyx` in the config only affects how napari draws the
-     volume on screen, never the exported values (those are voxel indices).
+     the config's `voxel_size_um: [x, y, z]` is the ONE place it is stated:
+     napari's display aspect is that triple reversed, the pasteable pipeline
+     snippet quotes it verbatim, and `mode: labels` regrids with it. It
+     never changes the exported values (those are voxel indices).
 
   2. Axis order: images are read via SimpleITK
      (`sitk.GetArrayFromImage`), giving the natural (z,y,x) array order
@@ -140,8 +146,9 @@ Usage (needs a display; runs in the antsreg conda env, which has
 napari+PyQt5+SimpleITK alongside antspyx and the pip-installed-editable
 registration_ants package this file imports from): edit
 configs/paint_mask.yaml (gitignored -- copy it from
-configs/paint_mask.example.yaml the first time), then just run the file --
-no command-line arguments.
+configs/paint_mask.example.yaml the first time, which has every key filled in
+under common:/guide:/labels: rather than commented out), then just run the
+file -- no command-line arguments.
 
     conda activate antsreg
     python paint_mask.py
@@ -232,16 +239,56 @@ def _interpolate_sparse_label_correction():
 _LEGACY_CONFIG_PATHS = (Path(__file__).resolve().parent / "paint_mask_local.yaml",)
 
 
+MODES = ("guide", "labels")
+
+
+def flatten_config_sections(cfg, mode):
+    """`common:` plus the running mode's own section, flattened into one dict.
+
+    The config file is written as mode + common/guide/labels sections because a
+    single flat list of every key gave no way to see which of them the mode you
+    are about to run actually reads -- the mode-specific ones had to be left
+    commented out to stay out of the way, which is not a state a config file
+    should have to be in. Sections make "filled in but not used right now" the
+    normal state: the INACTIVE mode's section is dropped rather than merged, so
+    labels_path can sit there with a real path while mode: guide runs, and
+    switching modes is a one-line edit.
+
+    Top-level keys are still read (that is what every config looked like before
+    the sections existed, and a one-mode config needs no ceremony); common:
+    overrides them and the mode section overrides both, so the more specific
+    place always wins.
+    """
+    flat = {k: v for k, v in cfg.items() if k not in ("mode", "common") + MODES}
+    for name in ("common", mode):
+        block = cfg.get(name)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            raise ValueError(f"`{name}:` in the config should be a key: value mapping, "
+                             f"got {type(block).__name__}")
+        flat.update(block)
+    return flat
+
+
 def _load_local_config(cli_path=None):
     """Paths live in a gitignored configs/paint_mask.yaml instead of constants
     here, so editing them for a new sample never shows up as a git diff."""
-    cfg = local_config.load_config(
-        "paint_mask", cli_path=cli_path,
-        required=("image_path", "output_path"),
-        legacy_paths=_LEGACY_CONFIG_PATHS)
-    mode = (cfg.get("mode") or "guide").strip().lower()
-    if mode not in ("guide", "labels"):
+    raw = local_config.load_config(
+        "paint_mask", cli_path=cli_path, legacy_paths=_LEGACY_CONFIG_PATHS)
+    mode = (raw.get("mode") or "guide").strip().lower()
+    if mode not in MODES:
         raise ValueError(f"mode must be 'guide' or 'labels', got {mode!r}")
+    # After flattening, not before: image_path/output_path normally live under
+    # `common:` now, and load_config's own required= check only sees the top
+    # level. Same message it would have printed.
+    cfg = flatten_config_sections(raw, mode)
+    missing = [k for k in ("image_path", "output_path") if not cfg.get(k)]
+    if missing:
+        raise ValueError(
+            f"config is missing: {', '.join(missing)} (looked at the top level, in "
+            f"`common:` and in `{mode}:`)\n"
+            f"(what each key means: {local_config.example_path('paint_mask')})")
     return SimpleNamespace(
         mode=mode,
         image_path=cfg["image_path"],
@@ -249,19 +296,19 @@ def _load_local_config(cli_path=None):
         existing_mask_path=cfg.get("existing_mask_path") or None,
         region_labels=_normalize_region_labels(cfg.get("region_labels") or {}),
         region_ids=_normalize_region_ids(cfg.get("region_ids") or {}),
-        display_scale_zyx=_normalize_display_scale(cfg.get("display_scale_zyx")),
         atlas=atlas_reference.atlas_reference_config(cfg),
         # mode: labels only -- see the "painting on a registration result"
         # section of the module docstring.
         labels_path=cfg.get("labels_path") or None,
         atlas_output_path=cfg.get("atlas_output_path") or None,
         partition_path=cfg.get("partition_path") or None,
-        min_region_mm3=float(cfg.get("min_region_mm3", label_partition.DEFAULT_MIN_MM3)),
-        # In mode: labels this is LOAD-BEARING, not cosmetic like
-        # display_scale_zyx: the registration output has to be regridded onto
-        # the raw stack before it can be overlaid on it, and the raw stack's
-        # header does not carry a voxel size (see the module docstring).
-        voxel_size_um=list(cfg["voxel_size_um"]) if cfg.get("voxel_size_um") else None,
+        min_region_mm3=float(cfg.get("min_region_mm3") or label_partition.DEFAULT_MIN_MM3),
+        # (x,y,z) um for image_path. Optional in mode: guide (only the
+        # display aspect and the pasteable snippet want it), REQUIRED in
+        # mode: labels, where the registration output has to be regridded
+        # onto the raw stack before it can be overlaid on it and the raw
+        # stack's header does not carry a voxel size (module docstring).
+        voxel_size_um=_config_voxel_size_um(cfg),
         labels_voxel_size_um=(list(cfg["labels_voxel_size_um"])
                               if cfg.get("labels_voxel_size_um") else None),
     )
@@ -335,27 +382,52 @@ def _normalize_region_ids(raw):
     return _normalize_label_map(raw, "region_ids", int, "ontology structure id (integer)")
 
 
-def _normalize_display_scale(raw):
-    """Optional (z, y, x) display scale for the napari layers -- None if unset.
+def _normalize_voxel_size_um(raw, key="voxel_size_um"):
+    """Optional (x, y, z) micron voxel size -- None if unset.
 
-    (z,y,x) to match the array axis order SimpleITK hands back, which is the
-    REVERSE of the (x,y,z) order voxel_size_um uses elsewhere in the
-    pipeline configs. Display only: the exported mask is still in voxel
-    indices and is byte-for-byte unaffected by this.
+    (x,y,z) like every other micron triple in the pipeline configs, and the
+    REVERSE of the (z,y,x) axis order SimpleITK hands the arrays back in;
+    display_scale_from_voxel_size does that one reversal, so nobody has to
+    keep two spellings of the same voxel in the config in sync.
     """
     if raw is None or raw == "":
         return None
     try:
-        scale = [float(v) for v in raw]
+        size = [float(v) for v in raw]
     except (TypeError, ValueError):
-        raise ValueError(f"display_scale_zyx should be three numbers [z, y, x], "
-                         f"got {raw!r}") from None
-    if len(scale) != 3:
-        raise ValueError(f"display_scale_zyx needs exactly 3 numbers [z, y, x], "
-                         f"got {len(scale)}")
-    if any(v <= 0 for v in scale):
-        raise ValueError(f"display_scale_zyx must be all positive numbers, got {scale}")
-    return scale
+        raise ValueError(f"{key} should be three numbers [x, y, z], got {raw!r}") from None
+    if len(size) != 3:
+        raise ValueError(f"{key} needs exactly 3 numbers [x, y, z], got {len(size)}")
+    if any(v <= 0 for v in size):
+        raise ValueError(f"{key} must be all positive numbers, got {size}")
+    return size
+
+
+def _config_voxel_size_um(cfg):
+    """voxel_size_um from the config, accepting the retired display_scale_zyx.
+
+    display_scale_zyx was a second spelling of the same physical voxel in the
+    opposite axis order, so a config could carry both and have them disagree.
+    Only voxel_size_um survives; an old config's display_scale_zyx is still
+    read (reversed) with a note, and having both is an error rather than a
+    silent pick, because which one won would decide whether mode: labels
+    regrids against 2.6 um or 32 um planes.
+    """
+    voxel = _normalize_voxel_size_um(cfg.get("voxel_size_um"))
+    legacy = _normalize_voxel_size_um(
+        list(reversed(cfg["display_scale_zyx"]))
+        if cfg.get("display_scale_zyx") else None, key="display_scale_zyx (reversed)")
+    if legacy and voxel and legacy != voxel:
+        raise ValueError(
+            f"config has both voxel_size_um {voxel} (x,y,z) and display_scale_zyx "
+            f"{list(reversed(legacy))} (z,y,x), and they describe different voxels. "
+            f"display_scale_zyx is retired -- delete it and keep voxel_size_um.")
+    if legacy and not voxel:
+        print(f"NOTE: display_scale_zyx is retired; using it as voxel_size_um: {legacy} "
+              f"(x,y,z). Rename it in the config -- the display scale is now derived "
+              f"from voxel_size_um.")
+        return legacy
+    return voxel
 
 
 def _read_sitk_array(path):
@@ -469,18 +541,18 @@ def empty_assignment_labels(assignment):
     return sorted(label for label, ids in assignment.items() if not ids)
 
 
-def voxel_size_um_from_display_scale(display_scale_zyx):
-    """display_scale_zyx (z,y,x) -> the pipeline's voxel_size_um (x,y,z), or
-    None when no display scale was configured.
+def display_scale_from_voxel_size(voxel_size_um):
+    """voxel_size_um (x,y,z) -> the napari layer scale (z,y,x), or None when
+    no voxel size was configured.
 
-    The two configs describe the same physical voxel in OPPOSITE axis orders
-    -- display_scale_zyx matches sitk.GetArrayFromImage's (z,y,x), while
-    mask.guide_regions.voxel_size_um is (x,y,z) like every other micron
-    triple in the pipeline. Reversing it by hand is exactly the kind of step
-    that gets silently miscopied, and a reversed voxel_size_um does not
-    error: it just resamples the outline against the wrong physical size.
+    The array axes and the pipeline's micron triples run in OPPOSITE orders
+    -- sitk.GetArrayFromImage gives (z,y,x), while mask.guide_regions.
+    voxel_size_um is (x,y,z) like every other micron triple here. Doing the
+    reversal here rather than asking the config for both spellings is the
+    point: a reversed voxel_size_um does not error, it just resamples the
+    outline against the wrong physical size.
     """
-    return list(reversed(display_scale_zyx)) if display_scale_zyx else None
+    return list(reversed(voxel_size_um)) if voxel_size_um else None
 
 
 def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size_um=None,
@@ -496,7 +568,7 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
     """
     voxel = list(voxel_size_um) if voxel_size_um else ["?", "?", "?"]
     note = voxel_size_note or (
-        "# source image (x,y,z) um, reversed from display_scale_zyx -- double-check it"
+        "# source image (x,y,z) um, copied from the paint_mask config's voxel_size_um"
         if voxel_size_um else
         "# source image (x,y,z) um -- not in the tif header, fill it in by hand")
     lines = [
@@ -1409,7 +1481,8 @@ def _run_guide(args):
                   f"         Good as a tracing backdrop only; to really resume, use an export "
                   f"that still has its sidecar.")
 
-    viewer, paint_layer = _launch_viewer(arr, prefill, scale=args.display_scale_zyx)
+    viewer, paint_layer = _launch_viewer(
+        arr, prefill, scale=display_scale_from_voxel_size(args.voxel_size_um))
 
     # The atlas ontology is loaded here only to populate the region-assignment
     # tree and check which structures this annotation actually has voxels
@@ -1488,7 +1561,7 @@ def _run_guide(args):
             lines += ["", "Paste this into the pipeline config:", "",
                       guide_regions_yaml_snippet(
                           region_ids, region_labels, args.output_path,
-                          voxel_size_um=voxel_size_um_from_display_scale(args.display_scale_zyx))]
+                          voxel_size_um=args.voxel_size_um)]
 
         msg = "\n".join(lines)
         status_label.setText(msg)
@@ -1932,9 +2005,10 @@ def _run_labels(args):
     re-register with plus a dense volume to carry on from.
 
     Everything happens on the RAW stack's grid, not on the isotropic grid the
-    registration ran on. That is not a preference: the resample to 25 um
-    throws away ~8x of the in-plane detail (2.6 um pixels become 25 um ones)
-    and replaces the real imaging planes with interpolated ones, so the
+    registration ran on. That is not a preference: the resample to
+    fine_target_um throws away ~8x of the in-plane detail (2.6 um pixels
+    become 20 um ones at the fine_target_um used here) and replaces the real
+    imaging planes with interpolated ones, so the
     boundaries being corrected are no longer resolvable by eye and the plane
     being drawn on is not a plane that was ever imaged.
     pipeline.py's _build_guide_regions_from_labels already states this as the
@@ -1948,12 +2022,12 @@ def _run_labels(args):
     if not args.atlas:
         raise ValueError("mode: labels needs atlas_annotation_path + ontology_path: the "
                          "partition is expressed in that ontology's ids")
-    raw_voxel_um = args.voxel_size_um or voxel_size_um_from_display_scale(args.display_scale_zyx)
+    raw_voxel_um = args.voxel_size_um
     if not raw_voxel_um:
         raise ValueError(
             "mode: labels needs voxel_size_um: [x, y, z] for image_path -- the raw stack's "
             "header does not carry one, and it is what puts the registration output onto the "
-            "same grid. (display_scale_zyx is accepted as a fallback, reversed.)")
+            "same grid.")
 
     atlas_output_path = args.atlas_output_path or str(
         _output_stem(args.output_path).with_name(_output_stem(args.output_path).name + "_atlas.nii.gz"))
@@ -1984,7 +2058,9 @@ def _run_labels(args):
         res_um = 25.0
         print("WARNING: atlas_resolution_um is not set, assuming 25 um. Every mm3 shown in the "
               "partition panel -- and therefore which children are big enough to split out -- "
-              "scales with its cube, so set it if the atlas is not 25 um.")
+              "scales with its cube, so set it if the atlas is not 25 um. Both presets here are "
+              "20 um (off by (25/20)^3 ~ 1.95x), and a TIFF annotation like DeMBA's carries no "
+              "spacing to read it from, so it has to come from the config.")
     voxel_mm3 = (res_um / 1000.0) ** 3 * (atlas.downsample ** 3)
 
     resume = load_labels_resume(atlas_output_path, structures, sample_arr.shape)
@@ -2017,10 +2093,10 @@ def _run_labels(args):
               f"planes were re-derived from {Path(args.labels_path).name}.")
 
     viewer, paint_layer = _launch_viewer(
-        sample_arr, prefill, scale=args.display_scale_zyx,
+        sample_arr, prefill, scale=display_scale_from_voxel_size(raw_voxel_um),
         title="Correct a registration result", layer_name="regions (paint here)")
     paint_layer.opacity = 0.5
-    scale_kwargs = {"scale": args.display_scale_zyx} if args.display_scale_zyx else {}
+    scale_kwargs = {"scale": display_scale_from_voxel_size(raw_voxel_um)}
     # The untouched registration, to compare a keyframe against once
     # interpolation has overwritten the planes between two of them in the
     # dense volume. In brush space rather than raw ontology ids: that is the
@@ -2545,7 +2621,8 @@ def selftest_resume_restores_only_hand_drawn_planes(interp, tmp_dir):
 
 
 def selftest_config_normalizers():
-    print("10. config: region_labels int/str keys + multi-region values, display_scale_zyx")
+    print("10. config: region_labels int/str keys + multi-region values, voxel_size_um,\n"
+          "    mode sections")
     # A bare string and a one-element list must normalize identically -- both
     # spellings appear in real configs and reading them differently would be
     # a silent half-mapping.
@@ -2561,10 +2638,10 @@ def selftest_config_normalizers():
         {1: [15751], 2: [15623, 15666]}
     assert _normalize_region_ids(None) == {}
 
-    # (z,y,x) display scale -> (x,y,z) pipeline voxel size. Reversed, not
-    # copied: the two configs use opposite axis orders for the same voxel.
-    assert voxel_size_um_from_display_scale([32.0, 2.6, 2.6]) == [2.6, 2.6, 32.0]
-    assert voxel_size_um_from_display_scale(None) is None
+    # (x,y,z) config voxel size -> (z,y,x) napari scale. Reversed, not
+    # copied: the array axes and the config run in opposite orders.
+    assert display_scale_from_voxel_size([2.6, 2.6, 32.0]) == [32.0, 2.6, 2.6]
+    assert display_scale_from_voxel_size(None) is None
 
     def rejects(fn, value, needle):
         try:
@@ -2579,11 +2656,43 @@ def selftest_config_normalizers():
     rejects(_normalize_region_labels, {1: "cortex", "1": "cortex"}, "twice")
     rejects(_normalize_region_labels, ["cortex"], "mapping")
 
-    assert _normalize_display_scale([32.0, 2.6, 2.6]) == [32.0, 2.6, 2.6]
-    assert _normalize_display_scale(None) is None
-    rejects(_normalize_display_scale, [2.6, 2.6], "exactly 3 numbers")
-    rejects(_normalize_display_scale, [32.0, 0.0, 2.6], "positive")
-    rejects(_normalize_display_scale, "32,2.6,2.6", "three numbers")
+    assert _normalize_voxel_size_um([2.6, 2.6, 32.0]) == [2.6, 2.6, 32.0]
+    assert _normalize_voxel_size_um(None) is None
+    rejects(_normalize_voxel_size_um, [2.6, 2.6], "exactly 3 numbers")
+    rejects(_normalize_voxel_size_um, [2.6, 0.0, 32.0], "positive")
+    rejects(_normalize_voxel_size_um, "2.6,2.6,32", "three numbers")
+
+    # The retired spelling is still read, reversed -- but never alongside a
+    # voxel_size_um that contradicts it.
+    assert _config_voxel_size_um({"display_scale_zyx": [32.0, 2.6, 2.6]}) == [2.6, 2.6, 32.0]
+    assert _config_voxel_size_um({"voxel_size_um": [2.6, 2.6, 32.0],
+                                  "display_scale_zyx": [32.0, 2.6, 2.6]}) == [2.6, 2.6, 32.0]
+    assert _config_voxel_size_um({}) is None
+    rejects(lambda cfg: _config_voxel_size_um(cfg),
+            {"voxel_size_um": [2.6, 2.6, 32.0], "display_scale_zyx": [25.0, 25.0, 25.0]},
+            "retired")
+
+    # Sections: the mode you are NOT running is dropped, not merged -- that is
+    # what lets both sections stay filled in.
+    sectioned = {"mode": "guide",
+                 "common": {"image_path": "raw.tif", "voxel_size_um": [2.6, 2.6, 32.0]},
+                 "guide": {"existing_mask_path": "prev.nii.gz"},
+                 "labels": {"labels_path": "labels.nii.gz", "image_path": "WRONG.tif"}}
+    assert flatten_config_sections(sectioned, "guide") == {
+        "image_path": "raw.tif", "voxel_size_um": [2.6, 2.6, 32.0],
+        "existing_mask_path": "prev.nii.gz"}, flatten_config_sections(sectioned, "guide")
+    assert flatten_config_sections(sectioned, "labels") == {
+        "image_path": "WRONG.tif", "voxel_size_um": [2.6, 2.6, 32.0],
+        "labels_path": "labels.nii.gz"}
+    # A flat config (every config predates the sections) still reads, and the
+    # more specific place wins over the top level.
+    assert flatten_config_sections({"image_path": "raw.tif", "mode": "guide"}, "guide") == \
+        {"image_path": "raw.tif"}
+    assert flatten_config_sections(
+        {"output_path": "top.nii.gz", "common": {"output_path": "common.nii.gz"}},
+        "guide") == {"output_path": "common.nii.gz"}
+    rejects(lambda cfg: flatten_config_sections(cfg, "guide"),
+            {"common": ["image_path"]}, "mapping")
 
     # uint8 export: a brush value the output can't hold must fail loudly.
     try:
@@ -2916,7 +3025,7 @@ def main():
             image_path=cfg.image_path, output_path=cfg.output_path,
             existing_mask=cfg.existing_mask_path,
             region_labels=cfg.region_labels, region_ids=cfg.region_ids,
-            display_scale_zyx=cfg.display_scale_zyx, atlas=cfg.atlas))
+            voxel_size_um=cfg.voxel_size_um, atlas=cfg.atlas))
 
     napari.run()
     return 0

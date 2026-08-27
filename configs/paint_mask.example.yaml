@@ -3,84 +3,60 @@
 #
 #   cp configs/paint_mask.example.yaml configs/paint_mask.yaml
 #   conda activate antsreg
-#   python paint_mask.py                       # 无命令行参数
-#   python paint_mask.py configs/paint_mask.guide_s12t.yaml   # 或显式指定另一份
-
-# 要画 guide outline 的样本图像。
-image_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_fine_25um.nii.gz
-
-output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/s12t_guide_sample.nii.gz
-
-# 可选，继续画上次的结果
-existing_mask_path: /path/to/上次的_guide_sample.nii.gz
-
-# ===== 图谱 ontology 选区（只用来把脑区分配到 brush label，不显示图谱）=====
-
-atlas_annotation_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um.nii.gz
-ontology_path:         /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
-
-# 设置label，也可以在gui里设置，一个label可以对应多个脑区
-# region_labels:
-#   1: ["layer 1 of Isocortex", "layer 2 of Isocortex"]
-#   2: "cerebellar hemisphere"        # 单个的话写成字符串也行
-
-# 可选，只影响显示，不影响导出的数值（导出的一直是体素索引）。
-# 注意是 (z, y, x) 顺序 
-display_scale_zyx: [32.0, 2.6, 2.6]
-
+#   python paint_mask.py                                     # 用 configs/paint_mask.yaml
+#   python paint_mask.py configs/paint_mask.guide_s12t.yaml  # 或显式指定另一份
 
 # =====================================================================================
-# mode: labels —— 在配准结果上修改（而不是从空白平面开始画）
+# 模式开关：guide | labels
 # =====================================================================================
-# 默认 mode: guide，就是上面那套：在原图上从零画，自己指定每个 label 对应哪些脑区。
-# 下面这套是另一条路：从跑完的配准结果起手，只改画错的地方。
-#
-#   mode: labels
-#
-# 【画布仍然是原始 tif】，和 guide 模式完全一样 —— image_path 不用改。
-# 配准结果（labels_in_sample，在 25um 各向同性网格上）会被重网格到原图网格上
-# 叠在原图上给你画。反过来做（把你拖到 25um 网格上画）会丢掉面内约 8 倍的
-# 细节，而且那上面的 z 层是插值出来的、不是真正扫出来的成像平面。
-#
-# 只有 output_path 的含义变了：现在它是【稀疏 guide】—— 只有改过的层加层间
-# 插值，两端留空，拿去填 mask.guide_regions 重新配准。仍然在原图网格上，所以
-# 导出时打印的 voxel_size_um 和 guide 模式是同一个值。
-#
-# 新增字段：
+# guide  —— 在原图上从零画 guide outline，自己指定每个画笔号对应哪些脑区。
+#            output_path 就是画出来的 outline。
+# labels —— 从跑完的配准结果起手
 
-# 原图的体素尺寸 (x, y, z)，微米。mode: labels 下这一项【必填且会影响结果】
-# （不像 display_scale_zyx 只影响显示）—— 原始 tif 头里没有体素尺寸，而把
-# 配准结果搬到原图网格上正需要它。不写的话会退回用 display_scale_zyx 反序。
-# voxel_size_um: [2.6, 2.6, 32.0]
+mode: guide
 
-# 跑完配准得到的标签图。会按 partition 折成画笔号、再重网格到原图网格当底图。
-# labels_path: /data/.../s12t/DevCCF/tsc12t_labels_in_sample.nii.gz
+common:
+  # 样本图像，也是画布。两个模式都是它。
+  image_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_fine_25um.nii.gz
 
-# 可选。labels_path 的体素尺寸默认从它自己的 NIfTI 头里读：本项目自己写出来的
-# 文件 spacing 直接就是微米（读回来是 25.0），外部下载的按 NIfTI 惯例是毫米
-# （DevCCF 读回来是 0.02）—— 两种都支持，按数量级区分并打印用了哪种。
-# 两种都不对时用这一项强制指定。
-# labels_voxel_size_um: [25.0, 25.0, 25.0]
+  # 导出路径（含义见上面的模式说明，两个模式都在 image_path 的网格上）。
+  output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/s12t_guide_sample.nii.gz
 
-# 【稠密】输出：每一层都有值（改过的层照你画的，层间插值，两端保留原始配准），
-# 同样在原图网格上。下次打开就读它继续画。不写的话默认是 output_path 加
-# _atlas 后缀。
-# 注意它旁边会写一份 .keyframes.json，记着哪些层是真手画的、真正的 baseline
-# 是哪个文件、以及两个网格各自的尺寸 —— 续做时只有那几层会被读回来，其余从
-# labels_path 重新折叠重网格。不这么做的话，这一轮的插值猜测会变成下一轮的
-# "真值"，每次都漂得更远。
-# atlas_output_path: /data/.../s12t/DevCCF/tsc12t_corrected_atlas.nii.gz
+  voxel_size_um: [2.6, 2.6, 32.0]
 
-# 起始 partition（画笔号 -> 脑区 id）。指向任何一份 .regions.json 都行 ——
-# 包括 mode: guide 自己导出的那份，所以可以直接从已经画好的 guide 接着细化。
-# 不给的话就用上面 region_ids 里写的。
-# partition_path: /home/fyu7/My_project/Registration_ants/atlas/mask/s12t_DeMBAguide7.regions.json
+  atlas_annotation_path: /home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um.nii.gz
+  ontology_path:         /home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json
 
-# 展开一个分组时，小于这个体积的子结构不单独成组，留在父组里。
-# 依据是实测：小于 1mm³ 的 guide 区手圈边界误差占比太大，会主动把形变往错误
-# 方向拽，比不加引导更糟（见 Registration_ants/configs/config.example.yaml）。
-# min_region_mm3: 1.0
+  # 图谱自己的分辨率，微米。labels 模式的 partition 面板按它算每个脑区的 mm³
+  #（也就决定了哪些子结构够大、值得单独拆出来）。不写会按 25 假设并警告。
+  atlas_resolution_um: 20
 
-# 【导出耗时】在原图网格上导出是分钟级不是秒级：层间插值要为每个区域、每对
-# 相邻 keyframe 各算一次 signed-distance 场，实测 3974x2273 的平面上一次约
-# 0.5 秒。36 个 keyframe 配十来个区域大约 15-20 分钟，进度打在终端里。
+  region_labels:
+
+  region_ids:
+
+# =====================================================================================
+# guide —— 只有 mode: guide 读
+# =====================================================================================
+guide:
+  existing_mask_path:
+
+# =====================================================================================
+# labels —— 只有 mode: labels 读
+# =====================================================================================
+labels:
+  # 跑完配准得到的标签图（在 25um 各向同性网格上）
+  labels_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_labels_in_sample.nii.gz
+
+
+  labels_voxel_size_um:
+
+  #用于配准
+  atlas_output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_corrected_atlas.nii.gz
+
+  partition_path: /home/fyu7/My_project/Registration_ants/atlas/mask/s12t_DeMBAguide7.regions.json
+
+  # 展开一个分组时，小于这个体积（mm³）的子结构不单独成组，留在父组里。
+  # 依据是实测：小于 1mm³ 的 guide 区手圈边界误差占比太大，会主动把形变往错误方向拽，
+  # 比不加引导更糟（见 Registration_ants/configs/config.example.yaml）。
+  min_region_mm3: 1.0

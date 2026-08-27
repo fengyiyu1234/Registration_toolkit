@@ -196,7 +196,7 @@ def test_guide_mode_window(tmp, inputs):
     # atlas=None quietly skips it.
     pm._run_guide(SimpleNamespace(
         image_path=str(inputs.raw), output_path=str(out), existing_mask=None,
-        region_labels={1: ["Isocortex"]}, region_ids={}, display_scale_zyx=None,
+        region_labels={1: ["Isocortex"]}, region_ids={}, voxel_size_um=None,
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
             "ontology_path": str(inputs.ontology),
@@ -247,7 +247,7 @@ def test_labels_mode_window(tmp, inputs):
         labels_path=str(inputs.labels), atlas_output_path=None,
         partition_path=str(inputs.partition), min_region_mm3=0.0,
         voxel_size_um=RAW_VOXEL_UM, labels_voxel_size_um=None,
-        region_labels={}, region_ids={}, display_scale_zyx=None,
+        region_labels={}, region_ids={},
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
             "ontology_path": str(inputs.ontology),
@@ -339,7 +339,7 @@ def test_labels_mode_resume(tmp, inputs):
         labels_path=str(inputs.labels), atlas_output_path=None,
         partition_path=str(inputs.partition), min_region_mm3=0.0,
         voxel_size_um=RAW_VOXEL_UM, labels_voxel_size_um=None,
-        region_labels={}, region_ids={}, display_scale_zyx=None,
+        region_labels={}, region_ids={},
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
             "ontology_path": str(inputs.ontology),
@@ -452,7 +452,7 @@ def test_panels_are_resizable(tmp, inputs):
     # tree included -- it is the deepest widget here and the easiest to pin.
     pm._run_guide(SimpleNamespace(
         image_path=str(inputs.raw), output_path=str(tmp / "widths_guide.nii.gz"),
-        existing_mask=None, region_labels={}, region_ids={}, display_scale_zyx=None,
+        existing_mask=None, region_labels={}, region_ids={}, voxel_size_um=None,
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
             "ontology_path": str(inputs.ontology),
@@ -471,7 +471,7 @@ def test_panels_are_resizable(tmp, inputs):
         labels_path=str(inputs.labels), atlas_output_path=None,
         partition_path=str(inputs.partition), min_region_mm3=0.0,
         voxel_size_um=RAW_VOXEL_UM, labels_voxel_size_um=None,
-        region_labels={}, region_ids={}, display_scale_zyx=None,
+        region_labels={}, region_ids={},
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
             "ontology_path": str(inputs.ontology),
@@ -505,7 +505,7 @@ def _open_guide(pm, tmp, inputs, atlas_reference, name, **overrides):
     """Guide mode with an atlas, opened on the synthetic inputs."""
     args = dict(
         image_path=str(inputs.raw), output_path=str(tmp / name), existing_mask=None,
-        region_labels={}, region_ids={}, display_scale_zyx=None,
+        region_labels={}, region_ids={}, voxel_size_um=None,
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
             "ontology_path": str(inputs.ontology),
