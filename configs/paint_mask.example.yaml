@@ -51,8 +51,22 @@ labels:
 
   labels_voxel_size_um:
 
-  #用于配准
-  atlas_output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_corrected_atlas.nii.gz
+  # 稠密的“工作文件”写到哪儿：每个平面都有值（手画的关键帧 + 关键帧之间的插值 +
+  # 其余平面照抄配准结果）。它不是给 pipeline 用的——喂给配准的是 output_path 那份
+  # 稀疏 guide。留空则默认 <output_path 去扩展名>_atlas.nii.gz。
+  # 旧名 atlas_output_path 仍然可用（里面的 “atlas” 从来不是指 atlas 空间，
+  # 这个文件和 output_path 一样在原始 stack 的网格上）。
+  dense_output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF/tsc12t_corrected_atlas.nii.gz
+
+  # 接着上次画：从哪个稠密工作文件恢复（连同它的 .keyframes.json）。
+  # 留空 = 从 dense_output_path 读，也就是“存档存回同一个文件”。
+  # 想让每一轮各留一份快照，就把它指向上一轮的稠密文件，dense_output_path 换新名字：
+  #   resume_from:        .../tsc12t_corrected_atlas.nii.gz
+  #   dense_output_path:  .../tsc12t_corrected_atlas2.nii.gz
+  #   output_path:        .../tsc12t_guide2.nii.gz
+  # 恢复回来的只有记录在案的手画平面；中间的插值平面每次都从 labels_path 重算，
+  # 所以 labels_path 永远指向最初的配准输出，绝不要改成这里的稠密文件。
+  resume_from:
 
   partition_path: /home/fyu7/My_project/Registration_ants/atlas/mask/s12t_DeMBAguide7.regions.json
 

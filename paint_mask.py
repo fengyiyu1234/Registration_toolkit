@@ -88,8 +88,8 @@ blob rather than something that needs a meaningful value on every plane.
     crosses over.
 
   A large, dedicated region panel: the ontology tree lives on its own side
-    of the window (left) rather than sharing a column with Relabel/Export
-    (right), because it is 2-12 levels deep and a tree squeezed into a
+    of the window (right) rather than sharing a column with Relabel/Export
+    (left), because it is 2-12 levels deep and a tree squeezed into a
     fraction of a shared dock leaves most of it scrolled out of view. Under
     it, behind a draggable splitter, is what has been assigned so far --
     brush label -> its regions, as a tree whose rows are the handles: select
@@ -98,13 +98,14 @@ blob rather than something that needs a meaningful value on every plane.
     is removed does not disappear, it stays listed as empty with a warning,
     because something is probably still painted with that number.
 
-  ONE panel on the right (_add_tools_panel), holding Export / Relabel /
-    Erase / Display as sections one under the next. They were four tabbed
-    docks; each is a handful of controls, so tabs meant one small panel on
-    screen and three hidden behind labels that had to be remembered. The
-    left side is still a TAB BAR (see _tab_the_panels), shared with napari's
-    own layer list and controls: the region panel there is a 12-deep tree
-    and genuinely wants the whole column.
+  THE REGION PANEL OWNS THE RIGHT COLUMN, alone. Export / Relabel / Erase /
+    Display are one panel on the LEFT (_add_tools_panel), each a foldable
+    section: click a header to open it, and it stays open while you use it.
+    They were four tabbed docks; each is a handful of controls, so tabs meant
+    one small panel on screen and three hidden behind labels that had to be
+    remembered. The left side is also where napari's own layer list and layer
+    controls live, and it is a TAB BAR (see _tab_the_panels) so those do not
+    stack into slivers.
 
   A "Relabel" section: click-to-fill a single already-painted blob into
     another label, or renumber one label across the whole volume. A bulk
@@ -312,7 +313,18 @@ def _load_local_config(cli_path=None):
         # mode: labels only -- see the "painting on a registration result"
         # section of the module docstring.
         labels_path=cfg.get("labels_path") or None,
-        atlas_output_path=cfg.get("atlas_output_path") or None,
+        # Where the dense working file is WRITTEN, and -- separately -- which
+        # one is read back to carry on from. They used to be one key, which
+        # meant a key named "..._output_path" was also the tool's main input:
+        # continuing from last session's file while writing this session's
+        # under a new name was impossible without copying files by hand.
+        # `resume_from` defaults to the write path, i.e. the old behaviour.
+        # atlas_output_path is that old name, still accepted -- it was never
+        # in atlas SPACE either (the dense volume is on the raw stack's grid,
+        # like everything else this tool writes); "dense" is what it is.
+        dense_output_path=(cfg.get("dense_output_path")
+                           or cfg.get("atlas_output_path") or None),
+        resume_from=cfg.get("resume_from") or None,
         partition_path=cfg.get("partition_path") or None,
         min_region_mm3=float(cfg.get("min_region_mm3") or label_partition.DEFAULT_MIN_MM3),
         # (x,y,z) um for image_path. Optional in mode: guide (only the
@@ -623,17 +635,17 @@ def _tab_the_panels(viewer, left, right):
     of them can still be dragged out of the tab bar into its own dock, or
     floated, if two really are needed at once.
 
-    The right side is a single dock now (_add_tools_panel), so `right` is
-    normally one entry and this leaves it alone; it stays a list because
-    tabify is exactly what a second panel there would need.
+    The right side is the region panel alone, so `right` is normally one
+    entry and this leaves it alone; it stays a list because tabify is exactly
+    what a second panel there would need.
 
     The layer-controls height unclamp goes here too, because it is the same
     complaint: that dock stops shrinking while it still fills half the column
     (see ontology_tree_ui.free_layer_controls_height), which is precisely
     what makes a stacked left column unusable.
 
-    Which tab starts in front: the panel this tool exists for, i.e. the
-    region panel on the left.
+    Which tab starts in front: this tool's own panel rather than napari's
+    layer list, i.e. the tools panel on the left.
     """
     ontology_tree_ui.free_layer_controls_height(viewer)
     left = [dock for dock in left if dock is not None]
@@ -663,23 +675,33 @@ def _export_controls(on_export, button_text):
     return section
 
 
-def _add_tools_panel(viewer, sections, name="Export & tools"):
-    """Export, Relabel, Erase and Display as SECTIONS OF ONE DOCK, headed and
-    ruled off from each other, rather than four tab pages.
+def _add_tools_panel(viewer, sections, name="Export & tools", area="left", open_first=True):
+    """Export, Relabel, Erase and Display as COLLAPSIBLE SECTIONS of one dock,
+    on the LEFT, rather than four tab pages on the right.
 
-    Tabs were the previous answer to "four panels stacked down one column
-    arrive as four slivers" (see _tab_the_panels), and they solved the height
-    but cost discoverability: every one of these is a handful of controls, so
-    a tab page shows one small panel and hides three others behind labels
-    that have to be remembered. Stacked in one dock they all fit at once --
-    once the export report stopped being a scrolling text box, which is what
-    made the column too tall to share in the first place -- and finding
-    "Relabel the whole label" is scrolling, not recalling which tab it was
-    on.
+    Two changes, one after the other, and both for the same reason -- these
+    four are a handful of controls each, and the panel that matters is the
+    region panel:
 
-    `sections` is [(title, widget), ...], drawn in order. The dock is
-    scroll-wrapped so it can still be dragged short on a laptop screen (the
-    same helper napari's own layer controls get, and for the same reason).
+      tabs -> sections: a tab page shows one small panel and hides three
+        others behind labels that have to be remembered. (What made a single
+        column possible at all was the export report moving to the terminal;
+        as a scrolling text box it was the tallest thing in the window.)
+
+      right -> left, folded: the region panel (ontology tree, 12 levels deep,
+        plus the group list) is what this tool is FOR and now gets the right
+        column to itself. These fold up next to napari's own layer list, and
+        the one you are using stays open while the others take a header's
+        worth of height each.
+
+    `sections` is [(title, widget), ...], drawn in order; the first opens,
+    the rest start folded (open_first=False folds them all). Clicking a
+    header toggles it -- several can be open at once, since they are
+    independent controls rather than pages of one thing.
+
+    The dock is scroll-wrapped so it can still be dragged short on a laptop
+    screen (the same helper napari's own layer controls get, for the same
+    reason).
     """
     dock = QWidget()
     layout = QVBoxLayout(dock)
@@ -692,14 +714,28 @@ def _add_tools_panel(viewer, sections, name="Export & tools"):
             rule.setFixedHeight(1)
             rule.setStyleSheet("background: rgba(255, 255, 255, 40);")
             layout.addWidget(rule)
-        head = QLabel(title.upper())
-        head.setStyleSheet("font-weight: bold; letter-spacing: 1px;")
+        # A checkable button, not a QLabel with a mouse handler: it carries
+        # the open/closed state itself, and Qt gives it keyboard focus and a
+        # hover cue for free, so a header reads as something to click.
+        head = QPushButton()
+        head.setCheckable(True)
+        head.setFlat(True)
+        head.setStyleSheet("text-align: left; font-weight: bold; letter-spacing: 1px;"
+                           "padding: 4px 0px; border: none;")
+
+        def fold(open_, title=title, head=head, widget=widget):
+            head.setText(("\u25be  " if open_ else "\u25b8  ") + title.upper())
+            widget.setVisible(open_)
+
+        head.toggled.connect(fold)
         layout.addWidget(head)
         layout.addWidget(widget)
         ontology_tree_ui.shrinkable(widget)
+        head.setChecked(open_first and index == 0)
+        fold(head.isChecked())          # toggled does not fire when the state did not change
     layout.addStretch(1)
     ontology_tree_ui.shrinkable(dock)
-    dock_widget = viewer.window.add_dock_widget(dock, area="right", name=name)
+    dock_widget = viewer.window.add_dock_widget(dock, area=area, name=name)
     ontology_tree_ui.scroll_wrap_dock(dock_widget)
     return dock_widget
 
@@ -1256,7 +1292,7 @@ def _seed_assignment(region_labels, region_ids, structures):
 
 def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     """The ontology tree + label-assignment panel, as its own DEDICATED dock
-    on the SAMPLE viewer's LEFT side.
+    on the SAMPLE viewer's RIGHT side.
 
     Selecting a node assigns it (and everything under it) to a brush label;
     nothing here is displayed anywhere. To actually SEE the atlas -- a
@@ -1267,9 +1303,11 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     highlight_mask / _open_atlas_window, both now in tools/atlas_view.py /
     shared/atlas_reference.py); it just assigns now.
 
-    A dedicated left-side dock, not squeezed in with Relabel/Export on the
-    right: the ontology sits 2-12 levels deep, so a tree squeezed into a
-    fraction of a shared column leaves most of it scrolled out of view.
+    A dedicated dock of its own, not squeezed in with Relabel/Export: the
+    ontology sits 2-12 levels deep, so a tree squeezed into a fraction of a
+    shared column leaves most of it scrolled out of view. It has the right
+    column to itself; the tool sections fold up on the left (see
+    _add_tools_panel).
 
     TWO trees, split by a draggable QSplitter. The lower one is what has been
     assigned so far, as brush label -> its regions, and it is a TREE rather
@@ -1521,7 +1559,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     layout.addWidget(splitter)
     for widget in (dock, tree, assign_tree, upper, lower, splitter, empty_note):
         ontology_tree_ui.shrinkable(widget)
-    dock_widget = viewer.window.add_dock_widget(dock, area="left", name="Atlas / Ontology")
+    dock_widget = viewer.window.add_dock_widget(dock, area="right", name="Atlas / Ontology")
     ontology_tree_ui.set_dock_width(dock_widget, _ONTOLOGY_PANEL_START_PX)
 
     refresh_filter()
@@ -1662,10 +1700,9 @@ def _run_guide(args):
                                       on_change=_assignment_follows_relabel)),
         ("Erase", _erase_controls(viewer, paint_layer)),
         ("Display", _display_controls([paint_layer])),
-    ], name="Guide Outline Export & tools")
-    _tab_the_panels(viewer,
-                    left=[picker.dock] if picker is not None else [],
-                    right=[tools_dock])
+    ], name="Export & tools")
+    _tab_the_panels(viewer, left=[tools_dock],
+                    right=[picker.dock] if picker is not None else [])
 
 
 # =====================================================================================
@@ -1694,15 +1731,26 @@ def _run_guide(args):
 #      contest.
 #
 #   3. Two volumes come out, not one:
-#        <output_path>        sparse guide, empty outside the keyframe span, for
-#                             mask.guide_regions -- i.e. for re-registering.
-#        <atlas_output_path>  dense, every plane filled, for re-opening and
-#                             drawing more. Same keyframes, baseline swapped from
-#                             zeros to the full collapse.
+#        <output_path>         sparse guide, empty outside the keyframe span, for
+#                              mask.guide_regions -- i.e. for re-registering.
+#        <dense_output_path>   dense, every plane filled, for re-opening and
+#                              drawing more. Same keyframes, baseline swapped from
+#                              zeros to the full collapse. Defaults to
+#                              <output_path>_atlas.nii.gz; `atlas_output_path` is
+#                              the key's old name and still read.
 #      The dense one must never be used as the baseline for its own next export,
 #      or each session interpolates on top of the last one's guess; the
 #      .keyframes.json sidecar records which planes were real and where the true
 #      baseline lives, and load_labels_resume enforces it.
+#
+#      CARRYING ON NEXT SESSION is `resume_from:` -- the dense file to reopen,
+#      defaulting to dense_output_path, i.e. "save over the same working file"
+#      unless told otherwise. The two are separate keys because they answer
+#      different questions: point resume_from at last session's dense file and
+#      dense_output_path at a new name to keep every round as its own snapshot,
+#      leave resume_from empty for one archive that keeps growing. What must
+#      NEVER move is labels_path: it stays the registration's own output, the
+#      true baseline every session re-derives from.
 #
 # FIVE LAYERS, bottom to top, and only one of them is editable:
 #
@@ -1835,12 +1883,12 @@ def labels_export_warnings(result, partition, structures, own_voxels, total_z,
     return warnings
 
 
-def _labels_sidecar_path(atlas_output_path):
-    return _output_stem(atlas_output_path).with_name(
-        _output_stem(atlas_output_path).name + ".keyframes.json")
+def _labels_sidecar_path(dense_path):
+    return _output_stem(dense_path).with_name(
+        _output_stem(dense_path).name + ".keyframes.json")
 
 
-def write_labels_sidecar(atlas_output_path, guide_output_path, labels_path, result,
+def write_labels_sidecar(dense_output_path, guide_output_path, labels_path, result,
                          partition, structures, total_z, grids=None):
     """<atlas_output>.keyframes.json -- what makes the dense volume safely
     re-openable.
@@ -1855,12 +1903,15 @@ def write_labels_sidecar(atlas_output_path, guide_output_path, labels_path, resu
     be merged back after a resume -- the nesting is what atlas_exclude_ids is derived
     from, and losing it would silently drop those subtractions.
     """
-    path = _labels_sidecar_path(atlas_output_path)
+    path = _labels_sidecar_path(dense_output_path)
     path.write_text(json.dumps({
         "hand_drawn_slices": result.hand_drawn_slices,
         "baseline_labels_path": str(Path(labels_path).resolve()),
         "guide_path": str(guide_output_path),
-        "atlas_path": str(atlas_output_path),
+        # "atlas_path" rather than "dense_path": the key is what already-written
+        # sidecars carry, and it is informational -- load_labels_resume takes
+        # the path it was asked to open, never one out of the file.
+        "atlas_path": str(dense_output_path),
         "total_z": int(total_z),
         "region_ids": {str(g.label): list(g.ids) for g in partition},
         "region_names": {str(g.label): g.name for g in partition},
@@ -1874,7 +1925,7 @@ def write_labels_sidecar(atlas_output_path, guide_output_path, labels_path, resu
     return path
 
 
-def load_labels_resume(atlas_output_path, structures, expected_shape):
+def load_labels_resume(dense_path, structures, expected_shape):
     """Restore a previous mode-labels export, or None if there is nothing to
     resume. Returns SimpleNamespace(partition, hand_drawn_slices, planes,
     baseline_labels_path, sidecar) where `planes` is {z: 2D uint8}.
@@ -1884,13 +1935,13 @@ def load_labels_resume(atlas_output_path, structures, expected_shape):
     _load_prior_hand_drawn, for the same reason: everything else in that file
     is this tool's own interpolation.
     """
-    atlas_output_path = Path(atlas_output_path)
-    sidecar = _labels_sidecar_path(atlas_output_path)
-    if not (atlas_output_path.exists() and sidecar.exists()):
+    dense_path = Path(dense_path)
+    sidecar = _labels_sidecar_path(dense_path)
+    if not (dense_path.exists() and sidecar.exists()):
         return None
 
     meta = json.loads(sidecar.read_text(encoding="utf-8"))
-    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(atlas_output_path)))
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(dense_path)))
     if arr.shape != expected_shape:
         print(f"WARNING: resume file shape {arr.shape} != labels shape {expected_shape}, "
               f"not resuming.")
@@ -2266,7 +2317,7 @@ def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels
     QVBoxLayout(dock).addWidget(splitter)
     for widget in (dock, tree, listing, upper, lower, splitter):
         ontology_tree_ui.shrinkable(widget)
-    dock_widget = viewer.window.add_dock_widget(dock, area="left", name="Partition")
+    dock_widget = viewer.window.add_dock_widget(dock, area="right", name="Partition")
     ontology_tree_ui.set_dock_width(dock_widget, _ONTOLOGY_PANEL_START_PX)
     refresh_filter()
     refresh()
@@ -2302,8 +2353,12 @@ def _run_labels(args):
             "header does not carry one, and it is what puts the registration output onto the "
             "same grid.")
 
-    atlas_output_path = args.atlas_output_path or str(
+    # The default keeps the _atlas suffix it has always had, even though the
+    # key is called dense_output_path now: changing it would send every
+    # existing session's resume looking for a file that is not there.
+    dense_output_path = args.dense_output_path or str(
         _output_stem(args.output_path).with_name(_output_stem(args.output_path).name + "_atlas.nii.gz"))
+    resume_path = args.resume_from or dense_output_path
 
     raw_sitk, sample_arr = _read_sitk_array(args.image_path)
     labels_sitk, fine_labels = _read_sitk_array(args.labels_path)
@@ -2336,7 +2391,11 @@ def _run_labels(args):
               "spacing to read it from, so it has to come from the config.")
     voxel_mm3 = (res_um / 1000.0) ** 3 * (atlas.downsample ** 3)
 
-    resume = load_labels_resume(atlas_output_path, structures, sample_arr.shape)
+    resume = load_labels_resume(resume_path, structures, sample_arr.shape)
+    if resume is not None and Path(resume_path).resolve() != Path(dense_output_path).resolve():
+        print(f"[resume] reading {resume_path}\n"
+              f"[resume] this session's dense file will be written to {dense_output_path}, "
+              f"leaving that one untouched.")
     partition, seed_note = _seed_partition(args, structures, resume)
     if resume is not None and resume.baseline_labels_path and \
             Path(resume.baseline_labels_path).resolve() != Path(args.labels_path).resolve():
@@ -2564,7 +2623,7 @@ def _run_labels(args):
         region_ids = partition.region_ids()
         region_names = partition.region_names(structures)
         painted = set(result.slices_by_label)
-        for volume, path in ((result.guide, args.output_path), (result.atlas, atlas_output_path)):
+        for volume, path in ((result.guide, args.output_path), (result.atlas, dense_output_path)):
             out = sitk.GetImageFromArray(volume)
             out.CopyInformation(raw_sitk)   # the raw stack's own (1,1,1) -- see the module docstring
             sitk.WriteImage(out, str(path))
@@ -2582,7 +2641,7 @@ def _run_labels(args):
             region_ids={lab: ids for lab, ids in region_ids.items() if lab in painted},
             atlas_info=atlas_info)
         keyframes_path = write_labels_sidecar(
-            atlas_output_path, args.output_path, args.labels_path, result, partition,
+            dense_output_path, args.output_path, args.labels_path, result, partition,
             structures, sample_arr.shape[0],
             grids={"raw_shape_zyx": list(sample_arr.shape),
                    "raw_voxel_size_um_xyz": list(raw_voxel_um),
@@ -2590,7 +2649,7 @@ def _run_labels(args):
                    "labels_voxel_size_um_xyz": list(fine_voxel_um)})
 
         lines = [f"Wrote {args.output_path}          (sparse guide -- re-register with this)",
-                 f"Wrote {atlas_output_path}   (dense -- re-open this to keep drawing)",
+                 f"Wrote {dense_output_path}   (dense -- re-open this to keep drawing)",
                  f"Wrote {regions_path}", f"Wrote {slices_path}", f"Wrote {keyframes_path}", "",
                  f"Keyframe planes ({len(result.hand_drawn_slices)}): {result.hand_drawn_slices}"]
         for label in sorted(result.slices_by_label):
@@ -2627,12 +2686,12 @@ def _run_labels(args):
                 f"those is now a keyframe.\n" + describe()))),
         ("Erase", _erase_controls(viewer, paint_layer)),
         ("Display", _display_controls([paint_layer, reference, atlas_regions])),
-    ], name="Registration Correction Export & tools")
+    ], name="Export & tools")
     # The brush layer selected, not whichever was added last: napari hands the
     # keyboard and the paint tools to the ACTIVE layer, and this window opens
     # with five of them.
     viewer.layers.selection = {paint_layer}
-    _tab_the_panels(viewer, left=[panel.dock], right=[tools_dock])
+    _tab_the_panels(viewer, left=[tools_dock], right=[panel.dock])
 
 
 # =====================================================================================

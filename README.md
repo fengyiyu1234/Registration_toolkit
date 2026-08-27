@@ -96,8 +96,13 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
     2.6 µm on planes that were actually imaged rather than at 25 µm on
     interpolated ones. A plane that differs from the registration anywhere
     becomes a whole-plane keyframe (every region on it, not just the edit),
-    and two volumes come out: a sparse guide to re-register with, and a dense
-    one to re-open and carry on from. The
+    and two volumes come out: `output_path`, a sparse guide to re-register
+    with, and `dense_output_path` (old name: `atlas_output_path`), the dense
+    working file to re-open and carry on from — `resume_from:` says which
+    dense file to *read*, defaulting to the one being written, so pointing it
+    at last round's file keeps every round as its own snapshot. `labels_path`
+    never moves: it stays the registration's own output, the true baseline
+    every session re-derives the untouched planes from. The
     partition is refined one region at a time, from an ontology tree: pick any
     node at any depth and it lights up on the sample where the registration
     put it, then give it its own brush label — `Field CA1` in one click,

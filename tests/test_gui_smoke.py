@@ -229,7 +229,9 @@ def test_guide_mode_window(tmp, inputs):
         # Regions are FILLED by default in both modes -- napari's own default,
         # never overridden here, and the thing single_sample.py was changed to
         # agree with.
-        checkbox = _widget(viewer, "Display").findChildren(pm.QCheckBox)[0]
+        tools = _widget(viewer, "Export & tools")
+        checkbox = [b for b in tools.findChildren(pm.QCheckBox)
+                    if "outline only" in b.text()][0]
         assert paint.contour == 0, "a region layer must start filled, not as an outline"
         checkbox.setChecked(True)
         assert paint.contour == 1, "the outline switch did not reach the paint layer"
@@ -239,7 +241,7 @@ def test_guide_mode_window(tmp, inputs):
         paint.data[2, 40:120, 40:120] = 1
         paint.data[6, 60:140, 60:140] = 1
         paint.refresh()
-        _button(_widget(viewer, "Guide Outline Export"), "Export").click()
+        _button(_widget(viewer, "Export & tools"), "Export Outline").click()
 
         assert out.exists(), "Export Outline wrote no volume"
         sidecar = json.loads((tmp / "guide.regions.json").read_text())
@@ -262,7 +264,7 @@ def test_labels_mode_window(tmp, inputs):
     out = tmp / "corrected_guide.nii.gz"
     pm._run_labels(SimpleNamespace(
         mode="labels", image_path=str(inputs.raw), output_path=str(out),
-        labels_path=str(inputs.labels), atlas_output_path=None,
+        labels_path=str(inputs.labels), dense_output_path=None, resume_from=None,
         partition_path=str(inputs.partition), min_region_mm3=0.0,
         voxel_size_um=RAW_VOXEL_UM, labels_voxel_size_um=None,
         region_labels={}, region_ids={},
@@ -399,7 +401,7 @@ def test_labels_mode_window(tmp, inputs):
         on_move(viewer, SimpleNamespace(position=tuple(c * s for c, s in zip(zyx, scale))))
         assert "REPAINTED" in bar.text(), bar.text()
 
-        _button(_widget(viewer, "Correction Export"), "Export").click()
+        _button(_widget(viewer, "Export & tools"), "Export Guide + Atlas").click()
 
         atlas_out = tmp / "corrected_guide_atlas.nii.gz"
         for path in (out, atlas_out, tmp / "corrected_guide.regions.json",
@@ -436,7 +438,7 @@ def test_labels_mode_resume(tmp, inputs):
     out = tmp / "corrected_guide.nii.gz"
     pm._run_labels(SimpleNamespace(
         mode="labels", image_path=str(inputs.raw), output_path=str(out),
-        labels_path=str(inputs.labels), atlas_output_path=None,
+        labels_path=str(inputs.labels), dense_output_path=None, resume_from=None,
         partition_path=str(inputs.partition), min_region_mm3=0.0,
         voxel_size_um=RAW_VOXEL_UM, labels_voxel_size_um=None,
         region_labels={}, region_ids={},
@@ -464,8 +466,60 @@ def test_labels_mode_resume(tmp, inputs):
 # =====================================================================================
 # single_sample.py
 # =====================================================================================
+def test_labels_mode_resume_from(tmp, inputs):
+    print("4. paint_mask mode: labels -- resume_from reads one archive, writes another...")
+    import napari
+    import paint_mask as pm
+    from shared import atlas_reference
+
+    # Round 1's archive, written by tests 2/3. Resuming from it while exporting
+    # under new names must leave it exactly as it was -- that is the whole
+    # point of splitting the read path off the write path.
+    round1 = tmp / "corrected_guide_atlas.nii.gz"
+    round1_sidecar = tmp / "corrected_guide_atlas.keyframes.json"
+    before = (round1.read_bytes(), round1_sidecar.read_bytes())
+
+    out2 = tmp / "round2.nii.gz"
+    dense2 = tmp / "round2_atlas.nii.gz"
+    pm._run_labels(SimpleNamespace(
+        mode="labels", image_path=str(inputs.raw), output_path=str(out2),
+        labels_path=str(inputs.labels), dense_output_path=str(dense2),
+        resume_from=str(round1),
+        partition_path=str(inputs.partition), min_region_mm3=0.0,
+        voxel_size_um=RAW_VOXEL_UM, labels_voxel_size_um=None,
+        region_labels={}, region_ids={},
+        atlas=atlas_reference.atlas_reference_config({
+            "atlas_annotation_path": str(inputs.annotation),
+            "ontology_path": str(inputs.ontology),
+            "atlas_resolution_um": 25})))
+    viewer = napari.current_viewer()
+    try:
+        paint = viewer.layers["regions (paint here)"]
+        baseline = viewer.layers["registration as-is (read-only)"].data
+        assert sorted(pm.plane_keyframes(paint.data, baseline)) == [2, 6], \
+            "resume_from must restore round 1's keyframes"
+        assert _widget(viewer, "Partition").findChildren(pm.QListWidget)[0].count() > 2, \
+            "resume_from must restore round 1's partition too"
+
+        _button(_widget(viewer, "Export & tools"), "Export Guide + Atlas").click()
+        for path in (out2, dense2, tmp / "round2_atlas.keyframes.json",
+                     tmp / "round2.regions.json"):
+            assert path.exists(), f"Export wrote no {path.name}"
+        # The archive that was READ is untouched, byte for byte.
+        assert (round1.read_bytes(), round1_sidecar.read_bytes()) == before, \
+            "resume_from must not write back to the file it resumed from"
+        # ...and the new one still points at the registration as its baseline,
+        # never at the dense file it was resumed from.
+        meta = json.loads((tmp / "round2_atlas.keyframes.json").read_text())
+        assert meta["baseline_labels_path"].endswith("sample_labels_in_sample.nii.gz"), meta
+        assert meta["hand_drawn_slices"] == [2, 6], meta["hand_drawn_slices"]
+    finally:
+        viewer.close()
+    print("   OK")
+
+
 def test_single_sample_fill_switch():
-    print("4. single_sample: regions filled by default, outline one click away...")
+    print("5. single_sample: regions filled by default, outline one click away...")
     import napari
     import single_sample
 
@@ -527,7 +581,7 @@ def _assert_resizable(widget, what):
 
 
 def test_panels_are_resizable(tmp, inputs):
-    print("5. both tools: every side panel can be dragged to any width...")
+    print("6. both tools: every side panel can be dragged to any width...")
     import napari
     import paint_mask as pm
     from shared import atlas_reference, ontology_tree_ui
@@ -568,7 +622,7 @@ def test_panels_are_resizable(tmp, inputs):
 
     pm._run_labels(SimpleNamespace(
         mode="labels", image_path=str(inputs.raw), output_path=str(tmp / "widths.nii.gz"),
-        labels_path=str(inputs.labels), atlas_output_path=None,
+        labels_path=str(inputs.labels), dense_output_path=None, resume_from=None,
         partition_path=str(inputs.partition), min_region_mm3=0.0,
         voxel_size_um=RAW_VOXEL_UM, labels_voxel_size_um=None,
         region_labels={}, region_ids={},
@@ -617,7 +671,7 @@ def _open_guide(pm, tmp, inputs, atlas_reference, name, **overrides):
 
 
 def test_assignment_panel_drops_one_region(tmp, inputs):
-    print("6. paint_mask guide mode: drop ONE region off a label, and hear about an empty one...")
+    print("7. paint_mask guide mode: drop ONE region off a label, and hear about an empty one...")
     import paint_mask as pm
     from shared import atlas_reference
 
@@ -666,7 +720,7 @@ def test_assignment_panel_drops_one_region(tmp, inputs):
 
 
 def test_panels_are_tabbed_and_short(tmp, inputs):
-    print("7. paint_mask guide mode: one tab bar per side, layer controls free to shrink...")
+    print("8. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
     import paint_mask as pm
     from PyQt5.QtWidgets import QScrollArea
     from shared import atlas_reference
@@ -677,18 +731,34 @@ def test_panels_are_tabbed_and_short(tmp, inputs):
         qt_viewer = viewer.window._qt_viewer
         docks = viewer.window._dock_widgets
 
-        # Left: napari's own two docks and the ontology panel share one tab bar.
+        # Left: napari's own two docks and this tool's tools panel share one
+        # tab bar.
         ontology = docks[[k for k in docks if "Ontology" in k][0]]
         left = set(window.tabifiedDockWidgets(qt_viewer.dockLayerControls))
-        assert ontology in left and qt_viewer.dockLayerList in left, (
+        assert docks["Export & tools"] in left and qt_viewer.dockLayerList in left, (
             "the left panels are stacked, not tabbed -- three docks down one column arrive "
             "as slivers")
 
-        # Right: every panel this tool adds there, in one more tab bar.
-        export = docks[[k for k in docks if "Export" in k][0]]
-        right = set(window.tabifiedDockWidgets(export))
-        for name in ("Relabel", "Erase", "Display"):
-            assert docks[name] in right, f"{name} is not tabbed with the export panel"
+        # ...and the region panel is NOT one of them: it owns the right column
+        # on its own, which is what the left/right swap was for.
+        assert ontology not in left, "the region panel must have a column to itself"
+        assert not window.tabifiedDockWidgets(ontology), \
+            "nothing should share the region panel's column"
+
+        # The tools are ONE dock of foldable sections -- tabs hid three panels
+        # behind labels that had to be remembered, and each is only a handful
+        # of controls. The first section opens, the rest start folded.
+        tools = docks["Export & tools"]
+        headers = {b.text().strip("\u25be\u25b8 "): b
+                   for b in tools.widget().findChildren(pm.QPushButton) if b.isCheckable()}
+        for title in ("EXPORT", "RELABEL", "ERASE", "DISPLAY"):
+            assert title in headers, f"{title} is not a section of the tools panel"
+        assert headers["EXPORT"].isChecked(), "the export section should start open"
+        assert not headers["ERASE"].isChecked(), "the rest should start folded"
+        erase_btn = _button(tools.widget(), "Polygon erase")
+        assert not erase_btn.isVisible(), "a folded section must not show its controls"
+        headers["ERASE"].setChecked(True)
+        assert erase_btn.isVisible(), "clicking a header must open its section"
 
         # And the complaint that made a stacked column unusable in the first
         # place: the layer controls stop shrinking while they still own half
@@ -725,6 +795,7 @@ def main():
         test_guide_mode_window(tmp, inputs)
         test_labels_mode_window(tmp, inputs)
         test_labels_mode_resume(tmp, inputs)
+        test_labels_mode_resume_from(tmp, inputs)
         test_single_sample_fill_switch()
         test_panels_are_resizable(tmp, inputs)
         test_assignment_panel_drops_one_region(tmp, inputs)

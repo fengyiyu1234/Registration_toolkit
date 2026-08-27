@@ -234,6 +234,12 @@ def tabify(viewer, docks, current=None):
     window = getattr(getattr(viewer, "window", None), "_qt_window", None)
     docks = [dock for dock in docks if dock is not None]
     if window is None or not hasattr(window, "tabifyDockWidget") or len(docks) < 2:
+        # A side with one dock has no tab bar to build, but it still has to
+        # end up SHOWN: a dock added to a window whose event loop has not run
+        # yet is not visible until something shows it, which for every other
+        # side is the raise_() below.
+        for dock in docks:
+            dock.show()
         return docks
     previous = docks[0]
     for dock in docks[1:]:
