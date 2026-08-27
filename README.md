@@ -96,8 +96,10 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
     becomes a whole-plane keyframe (every region on it, not just the edit),
     and two volumes come out: a sparse guide to re-register with, and a dense
     one to re-open and carry on from. The
-    partition is refined one region at a time — expand `Hippocampal
-    formation` into CA/DG without changing how coarsely the cerebellum is
+    partition is refined one region at a time, from an ontology tree: pick any
+    node at any depth and it lights up on the sample where the registration
+    put it, then give it its own brush label — `Field CA1` in one click,
+    without changing how coarsely the cerebellum is
     described — and the atlas-side subtraction that nesting requires
     (`atlas_exclude_ids`) is derived rather than maintained by hand. See
     `shared/label_partition.py` for the measured reason a uniform ontology
@@ -303,8 +305,8 @@ Manual-assert style, no pytest, matching `../Registration_ants/tests/`. Everythi
 except the last one is headless by design and runs over ssh unchanged.
 
 `test_gui_smoke.py` is the exception: it opens the actual windows, because that is
-the only way to cover the parts the `--selftest`s cannot reach — whether clicking
-**Expand** really recollapses the paint layer, whether **Export** writes its five
+the only way to cover the parts the `--selftest`s cannot reach — whether picking a
+region in the ontology tree really recollapses the paint layer, whether **Export** writes its five
 files, whether the fill/outline checkbox reaches the layers it names. It needs no
 display of its own: on Linux it re-execs itself under `xvfb-run` (preferred even
 when `$DISPLAY` is set, since a forwarded X11 display advertises GL 1.4 and

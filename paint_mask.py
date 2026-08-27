@@ -18,7 +18,9 @@ and switching modes is a one-line edit.
     what came out wrong, on a handful of planes. Exports two volumes: a
     sparse guide to re-register with, and a dense one to re-open and carry
     on from. The partition is refined per region rather than at a fixed
-    ontology depth -- expand Hippocampal formation into CA/DG without
+    ontology depth: pick ANY node in the ontology tree -- at any depth --
+    and it lights up on the sample where the registration put it; split it
+    out and it gets its own brush label to be corrected under, without
     touching how coarsely the cerebellum is described. See the
     "mode: labels" section further down, and shared/label_partition.py for
     the measured reason a uniform ontology depth is not a usable knob.
@@ -1650,15 +1652,16 @@ def recollapse_keeping_edits(paint, old_baseline, new_baseline):
     """Re-derive the paint layer after the partition changed, keeping the
     hand edits and refreshing everything else.
 
-    Expanding a group renumbers most of the volume, so the layer has to be
-    rebuilt -- but a voxel the user actually repainted must survive verbatim,
-    or expanding would quietly discard the correction that motivated it. A
-    voxel counts as edited exactly when it disagreed with the OLD baseline.
+    Splitting a region out (or merging it back) renumbers most of the
+    volume, so the layer has to be rebuilt -- but a voxel the user actually
+    repainted must survive verbatim, or refining would quietly discard the
+    correction that motivated it. A voxel counts as edited exactly when it
+    disagreed with the OLD baseline.
 
     The useful consequence: the parts of a keyframe plane you never touched
-    are refined to the new partition automatically, so expanding
-    Hippocampal formation gives you CA/DG boundaries on planes you had
-    already corrected at the coarse level, without redrawing them.
+    are refined to the new partition automatically, so splitting out
+    Hippocampal formation gives you its boundary on planes you had already
+    corrected at the coarse level, without redrawing them.
     """
     edited = paint != old_baseline
     return np.where(edited, paint, new_baseline).astype(np.uint8)
@@ -1753,8 +1756,8 @@ def write_labels_sidecar(atlas_output_path, guide_output_path, labels_path, resu
     compound every round. load_labels_resume reads the baseline back from
     here and overlays only these planes.
 
-    The partition is stored with its parent links so an expand can be merged
-    back after a resume -- the nesting is what atlas_exclude_ids is derived
+    The partition is stored with its parent links so a split-out region can
+    be merged back after a resume -- the nesting is what atlas_exclude_ids is derived
     from, and losing it would silently drop those subtractions.
     """
     path = _labels_sidecar_path(atlas_output_path)
@@ -1886,69 +1889,199 @@ def _seed_partition(args, structures, resume):
 
 
 def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels,
-                         own_voxels, voxel_mm3, min_mm3, on_partition_changed):
-    """The panel that replaces guide mode's ontology tree.
+                         own_voxels, voxel_mm3, min_mm3, on_partition_changed,
+                         on_highlight=None):
+    """The partition panel: the ontology tree on top, the brush labels below.
 
-    Guide mode picks a region and assigns it to a free brush number -- a flat
-    mapping, built by hand. Here the mapping already exists (it came from the
-    registration) and what you do to it is REFINE it, one node at a time, so
-    the control that matters is expand/merge on the selected group rather
-    than a 12-deep tree to hunt through. Depth is per-group on purpose: see
-    label_partition's docstring for the measured reason a uniform ontology
-    depth is not usable on CCFv3.
+    Guide mode's tree ASSIGNS a region to a free brush number. This one
+    REFINES a mapping that already exists (it came from the registration):
+    picking a node splits exactly that node out into its own brush label,
+    leaving the group it came out of as the residual. Depth is per-group on
+    purpose -- see label_partition's docstring for the measured reason a
+    uniform ontology depth is not usable on CCFv3.
+
+    Why a tree rather than the "Expand one level" button this replaces:
+    expanding is only the operation you want when the level you want is the
+    NEXT one. It never is. `Field CA1` sits five levels under Cerebral
+    cortex, so reaching it meant four rounds of expanding, ~40 groups nobody
+    asked for -- each of which recollapses the whole paint layer and has to
+    be merged back one at a time -- and no way at all to say "just this one
+    region". The tree says it in one click, at any depth, and can also pick
+    a region the seed partition never covered.
+
+    Selecting a node HIGHLIGHTS it in the viewer before anything is changed
+    (on_highlight is handed the ids and answers with how many voxels of them
+    the registration result actually holds), because "which region is that,
+    and did the registration even put it in this sample" is the question you
+    have before deciding to split it out -- and the atlas node names alone
+    do not answer it.
+
+    The two halves stay in sync both ways: picking a node selects the group
+    that currently owns it (and sets the brush to it), picking a group
+    scrolls the tree to its root and highlights it.
     """
     status = QLabel("")
     status.setWordWrap(True)
     status.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
+    search = QLineEdit()
+    search.setObjectName("partition_search")
+    search.setPlaceholderText("Filter regions by name/acronym...")
+    hide_empty = QCheckBox("Only regions with voxels in this annotation")
+    hide_empty.setObjectName("partition_hide_empty")
+    hide_empty.setChecked(True)
+
+    tree = QTreeWidget()
+    tree.setObjectName("partition_tree")
+    # A fourth column the shared widget does not fill: which brush label a
+    # node is the root of. Without it the tree and the group list below are
+    # two unrelated lists of names, and "have I already split this out" is
+    # only answerable by reading the other one.
+    tree.setHeaderLabels(["Region", "Voxels", "id", "brush"])
+    tree.setColumnWidth(0, 260)
+    items = ontology_tree_ui.populate_ontology_tree(tree, structures, node_voxels)
+    split_btn = QPushButton("Give this region its own brush label")
+    split_btn.setObjectName("partition_split")
+
     listing = QListWidget()
+    listing.setObjectName("partition_listing")
+    merge_btn = QPushButton("Merge children back")
+    drop_btn = QPushButton("Remove this label")
+    isolate = QCheckBox("Show only the selected group")
+    isolate.toggled.connect(lambda checked: setattr(paint_layer, "show_selected_label", checked))
+
+    # The two halves drive each other, so each guards against re-entering the
+    # other's signal handler -- otherwise selecting a group scrolls the tree,
+    # which selects the group, which scrolls the tree.
+    sync = {"busy": False}
+
+    def selected_id():
+        item = tree.currentItem()
+        return None if item is None else item.data(0, Qt.UserRole)
 
     def selected_label():
         row = listing.currentRow()
         return listing._labels[row] if 0 <= row < len(getattr(listing, "_labels", [])) else None
 
+    def highlight_note(ids):
+        """Light the region up in the viewer, and say what that showed."""
+        if on_highlight is None:
+            return ""
+        voxels = on_highlight(list(ids))
+        if voxels is None:
+            return ""
+        if not voxels:
+            return ("\nNOTHING HIGHLIGHTED: the registration result has no voxels of this "
+                    "region at all -- it is outside the sample, or the registration lost it.")
+        return f"\nHighlighted in the viewer: {voxels:,} voxels of it in the registration result."
+
+    def mm3_of(ids):
+        return sum(node_voxels.get(int(i), 0) for i in ids) * voxel_mm3
+
+    def small_note(mm3):
+        return (f"\nOnly ~{mm3:.2f} mm3 in the atlas, under the {min_mm3} mm3 floor: a guide "
+                f"region that small usually drags the deformation the wrong way.")
+
     def refresh(message=""):
         keep = selected_label()
-        listing.clear()
-        listing._labels = []
-        for group in partition:
-            mm3 = sum(node_voxels.get(i, 0) for i in group.ids) * voxel_mm3
-            kids = partition.children_of(group.label)
-            note = f"  [residual, {len(kids)} split out]" if kids else ""
-            listing.addItem(f"{group.label:>3}  {group.name}   ~{mm3:.1f} mm3{note}")
-            listing._labels.append(group.label)
-        if keep in listing._labels:
-            listing.setCurrentRow(listing._labels.index(keep))
+        sync["busy"] = True
+        try:
+            listing.clear()
+            listing._labels = []
+            for group in partition:
+                mm3 = mm3_of(group.ids)
+                kids = partition.children_of(group.label)
+                note = f"  [residual, {len(kids)} split out]" if kids else ""
+                listing.addItem(f"{group.label:>3}  {group.name}   ~{mm3:.1f} mm3{note}")
+                listing._labels.append(group.label)
+            if keep in listing._labels:
+                listing.setCurrentRow(listing._labels.index(keep))
+        finally:
+            sync["busy"] = False
+        roots = partition.root_to_label()
+        for sid, item in items.items():
+            item.setText(3, f"label {roots[sid]}" if sid in roots else "")
         empty = partition.empty_atlas_side(structures, own_voxels)
         tail = (f"\nResidual labels with an EMPTY atlas side (fine unless still painted): "
                 f"{empty}" if empty else "")
-        status.setText((message or "Pick a group; the brush switches to its label.") + tail)
+        status.setText((message or "Pick a region above to highlight it, or a group below to "
+                                   "paint with it.") + tail)
+
+    def refresh_filter():
+        visible = atlas_reference.visible_tree_ids(
+            structures, node_voxels, search.text(), hide_empty.isChecked())
+        for sid, item in items.items():
+            item.setHidden(sid not in visible)
+        if search.text().strip():
+            tree.expandAll()
+
+    def on_tree_select():
+        sid = selected_id()
+        if sid is None or sync["busy"]:
+            return
+        owner = partition.owner_of(sid, structures)
+        if owner is not None:
+            # The brush follows the selection: correcting a region you just
+            # looked up starts by painting with whatever number covers it.
+            paint_layer.selected_label = owner.label
+            sync["busy"] = True
+            try:
+                if owner.label in listing._labels:
+                    listing.setCurrentRow(listing._labels.index(owner.label))
+            finally:
+                sync["busy"] = False
+        mm3 = mm3_of([sid])
+        where = (f"painted as label {owner.label} ({owner.name})" if owner is not None else
+                 "NOT covered by any brush label -- splitting it out is what makes it paintable")
+        status.setText(f"{structures[sid]['name']} [{sid}], ~{mm3:.1f} mm3 in the atlas; "
+                       f"currently {where}." + highlight_note([sid])
+                       + (small_note(mm3) if mm3 < min_mm3 else ""))
 
     def on_row_changed(_row):
         label = selected_label()
-        if label is not None:
-            paint_layer.selected_label = label
+        if label is None or sync["busy"]:
+            return
+        paint_layer.selected_label = label
+        group = partition.groups.get(label)
+        if group is None:
+            return
+        sync["busy"] = True
+        try:
+            first = next((int(i) for i in group.ids if int(i) in items), None)
+            if first is not None:
+                tree.setCurrentItem(items[first])
+                tree.scrollToItem(items[first])
+        finally:
+            sync["busy"] = False
+        status.setText(f"Brush is now label {group.label} = {group.name} "
+                       f"(~{mm3_of(group.ids):.1f} mm3)." + highlight_note(group.ids))
 
-    def expand():
-        label = selected_label()
-        if label is None:
+    def split_out():
+        sid = selected_id()
+        if sid is None:
+            refresh("Pick a region in the tree above first.")
+            return
+        if not node_voxels.get(sid):
+            refresh(f"{structures[sid]['name']} has no voxels in this atlas annotation -- "
+                    f"refusing to split it out, the pipeline aborts on a guide region it "
+                    f"cannot match on the atlas side.")
             return
         try:
-            kept, skipped = partition.expand(label, structures, node_voxels, voxel_mm3, min_mm3)
+            group = partition.split_out(sid, structures)
         except ValueError as exc:
-            refresh(f"Cannot expand: {exc}")
-            return
-        if not kept:
-            refresh(f"label {label} has no child region big enough to split out "
-                    f"(skipped: {[n for _i, n, _m in skipped]}).")
+            refresh(f"Cannot split that out: {exc}")
             return
         on_partition_changed()
-        msg = (f"Expanded label {label} -> " +
-               ", ".join(f"{n} ({m:.1f} mm3)" for _i, n, m in kept))
-        if skipped:
-            msg += ("\nLeft with the parent (under "
-                    f"{min_mm3} mm3): " + ", ".join(f"{n} ({m:.2f})" for _i, n, m in skipped))
-        refresh(msg)
+        paint_layer.selected_label = group.label
+        refresh()                      # rebuilds listing._labels for the row below
+        if group.label in listing._labels:
+            listing.setCurrentRow(listing._labels.index(group.label))
+        came_from = (f"out of label {group.parent.label} ({group.parent.name}), which keeps "
+                     f"everything it does not cover" if group.parent is not None else
+                     "out of the background -- no group covered it before")
+        mm3 = mm3_of(group.ids)
+        refresh(f"label {group.label} = {group.name}, split {came_from}. Paint with it to "
+                f"correct it on its own." + (small_note(mm3) if mm3 < min_mm3 else ""))
 
     def merge():
         label = selected_label()
@@ -1956,46 +2089,84 @@ def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels
             return
         removed = partition.merge_back(label)
         if not removed:
-            refresh(f"label {label} has nothing split out of it.")
+            refresh(f"label {label} has nothing split out of it. To remove the label itself, "
+                    f"use Remove this label.")
             return
         on_partition_changed()
         refresh(f"Merged {len(removed)} group(s) back into label {label}: "
                 + ", ".join(g.name for g in removed))
 
+    def drop_group():
+        label = selected_label()
+        if label is None:
+            return
+        group = partition.groups[label]
+        falls_to = (f"back to label {group.parent.label} ({group.parent.name})"
+                    if group.parent is not None else "to background")
+        removed = partition.drop(label)
+        on_partition_changed()
+        under = f" and the {len(removed) - 1} group(s) split out of it" if len(removed) > 1 else ""
+        refresh(f"Removed label {label} ({group.name}){under}; its voxels go {falls_to}. "
+                f"Anything you already PAINTED with {label} keeps that number and now names "
+                f"no region -- relabel it before exporting.")
+
+    search.textChanged.connect(lambda _t: refresh_filter())
+    hide_empty.toggled.connect(lambda _c: refresh_filter())
+    tree.currentItemChanged.connect(lambda _cur, _prev: on_tree_select())
+    split_btn.clicked.connect(split_out)
     listing.currentRowChanged.connect(on_row_changed)
-    expand_btn = QPushButton("Expand one level")
-    expand_btn.clicked.connect(expand)
-    merge_btn = QPushButton("Merge children back")
     merge_btn.clicked.connect(merge)
+    drop_btn.clicked.connect(drop_group)
 
-    isolate = QCheckBox("Show only the selected group")
-    isolate.toggled.connect(lambda checked: setattr(paint_layer, "show_selected_label", checked))
+    upper = QWidget()
+    upper_layout = QVBoxLayout(upper)
+    upper_layout.setContentsMargins(0, 0, 0, 0)
+    upper_layout.addWidget(QLabel(
+        "Atlas ontology -- selecting a region highlights it on the sample, where\n"
+        "the registration put it. Split one out to correct it under its own brush\n"
+        "label; the group it came out of keeps everything else."))
+    upper_layout.addWidget(search)
+    upper_layout.addWidget(hide_empty)
+    upper_layout.addWidget(tree, 1)      # the stretch: spare height is the tree's
+    upper_layout.addWidget(split_btn)
 
-    dock = QWidget()
-    layout = QVBoxLayout(dock)
-    layout.addWidget(QLabel(
-        "Brush label -> atlas region. Expanding splits one group into its\n"
-        f"ontology children; children under {min_mm3} mm3 stay with the parent,\n"
-        "because a guide region that small drags the deformation the wrong way."))
+    lower = QWidget()
+    lower_layout = QVBoxLayout(lower)
+    lower_layout.setContentsMargins(0, 0, 0, 0)
+    lower_layout.addWidget(QLabel("Brush label -> atlas region. Selecting one sets the brush."))
     # The stretch, plus a status box pinned to its own height: the group list
-    # is what this panel is FOR and a partition routinely runs to a dozen
+    # is what this half is FOR and a partition routinely runs to a dozen
     # groups, so spare height belongs to it rather than to the blank half of
     # a message box. (Height only -- the width stays draggable, see
     # ontology_tree_ui.shrinkable.)
-    layout.addWidget(listing, 1)
+    lower_layout.addWidget(listing, 1)
     row = QWidget()
     row_layout = QHBoxLayout(row)
-    row_layout.addWidget(expand_btn)
     row_layout.addWidget(merge_btn)
-    layout.addWidget(row)
-    layout.addWidget(isolate)
+    row_layout.addWidget(drop_btn)
+    lower_layout.addWidget(row)
+    lower_layout.addWidget(isolate)
     status_box = ontology_tree_ui.scrollable(status, 100)
     status_box.setMaximumHeight(100)
-    layout.addWidget(status_box)
-    ontology_tree_ui.shrinkable(dock)
-    ontology_tree_ui.shrinkable(listing)
+    lower_layout.addWidget(status_box)
+
+    # A splitter, not two stacked widgets, for the same reason guide mode's
+    # picker has one: how much of the column the group list is worth depends
+    # on how many groups there are, which a fixed split cannot know.
+    splitter = QSplitter(Qt.Vertical)
+    splitter.addWidget(upper)
+    splitter.addWidget(lower)
+    splitter.setStretchFactor(0, 3)
+    splitter.setStretchFactor(1, 2)
+    splitter.setSizes([560, 320])
+
+    dock = QWidget()
+    QVBoxLayout(dock).addWidget(splitter)
+    for widget in (dock, tree, listing, upper, lower, splitter):
+        ontology_tree_ui.shrinkable(widget)
     dock_widget = viewer.window.add_dock_widget(dock, area="left", name="Partition")
     ontology_tree_ui.set_dock_width(dock_widget, _ONTOLOGY_PANEL_START_PX)
+    refresh_filter()
     refresh()
     return SimpleNamespace(refresh=refresh, dock=dock_widget)
 
@@ -2106,6 +2277,49 @@ def _run_labels(args):
                                   visible=False, opacity=0.4, **scale_kwargs)
     reference.editable = False
 
+    # What a region PICKED IN THE TREE looks like on this sample, before
+    # anything is split out or painted. Drawn from the registration output on
+    # the registration's OWN grid, with its own scale, rather than regridded
+    # onto the raw stack like the baseline: napari places layers in world
+    # coordinates and both grids share physical origin 0 and an identity
+    # direction (the invariant regrid_nearest relies on), so a 20 um volume
+    # lands exactly on top of the 2.6 um one -- and each click then costs one
+    # array the size of the registration output (~20M voxels) instead of one
+    # the size of the raw stack (~1.4e9). An Image layer in additive red, not
+    # a Labels one, so the highlight reads as a highlight over whatever the
+    # paint layer is showing rather than as another region to confuse it with.
+    fine_ids = np.unique(fine_labels)
+    highlight = viewer.add_image(
+        np.zeros(fine_labels.shape, dtype=np.uint8), name="selected region (atlas pick)",
+        colormap="red", blending="additive", opacity=0.8, visible=False,
+        contrast_limits=(0, 1), scale=fine_spacing_zyx)
+
+    def highlight_region(ids):
+        """Light up the picked node(s) INCLUDING every descendant, and answer
+        with how many voxels of them the registration result holds.
+
+        Subtree, not the id itself, for the same reason atlas_ids expands:
+        the annotation's own labels sit at ontology depths 2-12, so a node
+        anywhere above them owns no voxels under its own id and would light
+        up nothing. The count is the part the atlas panel cannot say by
+        itself -- a region can be perfectly real in the atlas and simply
+        absent from this sample (a half brain, a cut-off cerebellum), and
+        that is what decides whether splitting it out is worth a brush label.
+        """
+        wanted = set()
+        for root in ids:
+            wanted |= label_partition.subtree_ids(int(root), structures)
+        # Mapped through the ids actually PRESENT (np.unique of the volume)
+        # rather than np.isin over the volume itself: the same reason
+        # Partition.collapse does it, one gather instead of a membership test
+        # per voxel against a few hundred ids.
+        mapped = np.isin(fine_ids, sorted(wanted)).astype(np.uint8)
+        mask = mapped[np.searchsorted(fine_ids, fine_labels)]
+        voxels = int(np.count_nonzero(mask))
+        highlight.data = mask
+        highlight.visible = bool(voxels)
+        return voxels
+
     status_label = QLabel("")
     status_label.setWordWrap(True)
     hover_label = QLabel("Under cursor: -")
@@ -2118,7 +2332,8 @@ def _run_labels(args):
         reference.data = new_baseline
 
     panel = _add_partition_panel(viewer, paint_layer, partition, structures, atlas.node_voxels,
-                                 own_voxels, voxel_mm3, args.min_region_mm3, on_partition_changed)
+                                 own_voxels, voxel_mm3, args.min_region_mm3, on_partition_changed,
+                                 on_highlight=highlight_region)
 
     def on_mouse_move(_layer, event):
         data = paint_layer.data

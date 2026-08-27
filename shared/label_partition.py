@@ -30,6 +30,13 @@ hand-curated set of groups, refined one node at a time:
          + expand 8 -> Isocortex (315), Olfactory areas (698),
                        Hippocampal formation (1089), ...
 
+Two ways to refine, and the GUI drives the second one: expand() takes a
+group one level down (every child at once), while split_out() gives ONE
+node picked in an ontology tree its own label, at whatever depth it sits.
+Expanding to reach `Field CA1` means four levels of children nobody asked
+for; picking it splits exactly it. Both leave the parent as the residual,
+so everything below applies unchanged either way.
+
 NESTING IS THE POINT, not an edge case. Expanding keeps the parent group
 alive as a *residual*: its roots are unchanged, and the deepest-matching
 rule below sends every voxel that a child now covers to that child, leaving
@@ -232,6 +239,75 @@ class Partition:
             self.groups[new_label] = Group(new_label, [child], name, parent=group)
         return kept, skipped
 
+    def owner_of(self, structure_id, structures):
+        """The Group whose voxels currently include `structure_id`, or None
+        when nothing in the partition covers it."""
+        return self.groups.get(self.label_of_id(structure_id, structures))
+
+    def split_out(self, structure_id, structures):
+        """Give ONE ontology node, picked at any depth, its own brush label.
+
+        The tree-picker counterpart of expand(), and the reason the GUI no
+        longer offers "expand one level": the level you want is almost never
+        the next one down. CCFv3 puts `Field CA1` five levels under
+        `Cerebral cortex`, so reaching it by expanding means four rounds and
+        ~40 groups nobody asked for, each of which then has to be merged
+        back one at a time. Picking the node splits exactly it.
+
+        Nothing else about the partition changes: the deepest-match rule
+        (label_of_id) takes the node's voxels out of whichever group held
+        them and leaves that group as the residual, exactly as expand()
+        does -- so atlas_exclude_ids and merge_back keep working unchanged.
+
+        A node NOT covered by any group is allowed too, and is how a region
+        the seed partition never mentioned (the registration collapsed it to
+        background) gets painted at all: the new group simply has no parent.
+
+        Returns the new Group. Raises ValueError if the node is unknown to
+        the ontology or is already some group's root -- both are "your click
+        did nothing" cases the panel has to be able to say out loud.
+        """
+        sid = int(structure_id)
+        if sid not in structures:
+            raise ValueError(f"id {sid} is not in this ontology")
+        roots = self.root_to_label()
+        if sid in roots:
+            raise ValueError(f"{structures[sid]['name']} is already brush label {roots[sid]}")
+        parent = self.groups.get(self.label_of_id(sid, structures, roots))
+        new_label = self.next_free_label()
+        group = Group(new_label, [sid], structures[sid]["name"], parent=parent)
+        self.groups[new_label] = group
+
+        # Re-parent the groups that are now nested INSIDE the new one. Split
+        # Isocortex first and Cortical plate second and the ontology nesting
+        # is plate -> iso while the parent links would still say both were
+        # split out of Cerebral cortex -- merge_back(cortex) would then drop
+        # iso without dropping what it was split out of. The links have to
+        # follow the ids, not the order they were clicked in.
+        for other in self.ordered():
+            if other.label == new_label or other.parent is not parent:
+                continue
+            if all(sid in structures.get(int(i), {}).get("structure_id_path", [])[:-1]
+                   for i in other.ids):
+                other.parent = group
+        return group
+
+    def drop(self, label):
+        """Remove one group and everything split out of it. Returns the
+        removed groups.
+
+        merge_back() is the same operation on a group's CHILDREN; this one
+        includes the group itself, which is what undoes a split_out. The
+        voxels fall back to whatever still claims them -- the parent group,
+        or background when the group had no parent.
+        """
+        label = int(label)
+        if label not in self.groups:
+            return []
+        removed = self.merge_back(label)
+        removed.append(self.groups.pop(label))
+        return removed
+
     def children_of(self, label):
         """The groups split out of `label` by a previous expand()."""
         parent = self.groups.get(int(label))
@@ -302,9 +378,9 @@ class Partition:
         for group in self.ordered():
             kept = set()
             for root in group.ids:
-                kept |= _subtree_ids(root, structures)
+                kept |= subtree_ids(root, structures)
             for dropped in exclude.get(group.label, []):
-                kept -= _subtree_ids(dropped, structures)
+                kept -= subtree_ids(dropped, structures)
             if not sum(own_voxels.get(sid, 0) for sid in kept):
                 out.append(group.label)
         return out
@@ -336,9 +412,10 @@ def _maximal(ids, structures):
             if not (ids & set(structures.get(i, {}).get("structure_id_path", [])[:-1]))}
 
 
-def _subtree_ids(root, structures):
+def subtree_ids(root, structures):
     """`root` plus every descendant of it -- the id set atlas_ids/
-    atlas_exclude_ids each expand to."""
+    atlas_exclude_ids each expand to, and the one a picked tree node has to
+    light up (a node at depth 3 owns no voxels under its own id)."""
     root = int(root)
     return {sid for sid, info in structures.items() if root in info["structure_id_path"]}
 
@@ -456,8 +533,46 @@ def selftest_merge_back_is_recursive():
     print("   ok")
 
 
+def selftest_split_out_picks_any_depth():
+    print("5. split_out() gives any node its own label, at any depth...")
+    s = _fake_ontology()
+    p = Partition.from_region_ids({1: [10]}, s)
+
+    # Two levels down in one click -- what expand() would need two rounds
+    # (and a group for subplate nobody asked for) to reach.
+    iso = p.split_out(1000, s)
+    assert iso.parent is p.groups[1], iso.parent
+    assert len(p) == 2 and p.label_of_id(1000, s) == iso.label
+    assert p.label_of_id(1001, s) == 1, "the rest of the subtree stays with the residual"
+
+    # Splitting an ANCESTOR of an existing group afterwards has to re-parent
+    # it, or merge_back(1) would drop iso without dropping plate.
+    plate = p.split_out(100, s)
+    assert iso.parent is plate, "iso sits under plate, whatever order they were clicked in"
+    assert p.label_of_id(1001, s) == plate.label
+    assert len(p.merge_back(1)) == 2 and len(p) == 1
+
+    # A node no group covers is allowed: that is how a region the seed
+    # partition never mentioned becomes paintable at all.
+    orphan = p.split_out(200, s)
+    assert orphan.parent is None and p.label_of_id(200, s) == orphan.label
+
+    # ...and drop() undoes exactly that, where merge_back only takes children.
+    assert [g.label for g in p.drop(orphan.label)] == [orphan.label]
+    assert p.label_of_id(200, s) == 0
+
+    for bad in (999999, 10):
+        try:
+            p.split_out(bad, s)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"split_out({bad}) must refuse, not add a duplicate group")
+    print("   ok")
+
+
 def selftest_atlas_exclude_ids():
-    print("5. atlas_exclude_ids() mirrors the nesting onto the atlas side...")
+    print("6. atlas_exclude_ids() mirrors the nesting onto the atlas side...")
     s = _fake_ontology()
     p = Partition.from_region_ids({1: [10], 2: [20]}, s)
     assert p.atlas_exclude_ids(s) == {}, "no nesting yet, nothing to subtract"
@@ -498,7 +613,7 @@ def selftest_atlas_exclude_ids():
 
 
 def selftest_label_budget():
-    print("6. the uint8 brush-label budget is enforced, not silently wrapped...")
+    print("7. the uint8 brush-label budget is enforced, not silently wrapped...")
     s = _fake_ontology()
     p = Partition.from_region_ids({1: [10]}, s)
     for lab in range(2, MAX_LABEL + 1):
@@ -524,6 +639,7 @@ def run_selftests():
     selftest_collapse_volume()
     selftest_expand_skips_small_and_absent()
     selftest_merge_back_is_recursive()
+    selftest_split_out_picks_any_depth()
     selftest_atlas_exclude_ids()
     selftest_label_budget()
     print("\nall label_partition selftests passed")

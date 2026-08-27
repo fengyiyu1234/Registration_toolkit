@@ -2,8 +2,9 @@
 
 Everything else in tests/ (and every `--selftest` in this repo) is deliberately
 headless: pure numpy in, pure numpy out. That covers the export maths well and
-the panels not at all -- whether clicking Expand actually recollapses the paint
-layer, whether the Export button writes its five files, whether the fill/outline
+the panels not at all -- whether picking a region in the ontology tree actually
+highlights it and recollapses the paint layer, whether the Export button writes
+its five files, whether the fill/outline
 checkbox reaches the layers it is supposed to. Those are exactly the parts that
 break when napari changes, so they get a test that really builds the windows.
 
@@ -180,6 +181,23 @@ def _button(widget, text_fragment):
     return matches[0]
 
 
+def _tree_item(tree, structure_id):
+    """The ontology tree's row for one structure id.
+
+    By id, not by name: the row text carries the acronym and the voxel count
+    too, and matching on a name substring is exactly the ambiguity the whole
+    ids-not-names convention exists to avoid.
+    """
+    import paint_mask as pm
+    stack = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+    while stack:
+        item = stack.pop()
+        if item.data(0, pm.Qt.UserRole) == structure_id:
+            return item
+        stack += [item.child(i) for i in range(item.childCount())]
+    raise AssertionError(f"no tree row for structure {structure_id}")
+
+
 # =====================================================================================
 # paint_mask.py -- mode: guide
 # =====================================================================================
@@ -267,32 +285,65 @@ def test_labels_mode_window(tmp, inputs):
         listing = panel.findChildren(pm.QListWidget)[0]
         assert listing.count() == 2, "the seed partition has two groups"
 
+        tree = panel.findChild(pm.QTreeWidget, "partition_tree")
         listing.setCurrentRow(0)
         assert paint.selected_label == 1, "selecting a group must set the brush to its label"
+        assert tree.currentItem().data(0, pm.Qt.UserRole) == 688, \
+            "selecting a group must take the tree to the region it stands for"
 
-        # Expand Cerebral cortex, then Cortical plate: per-region refinement,
-        # with the parent kept as the residual each time.
-        _button(panel, "Expand").click()
-        rows = [listing.item(i).text() for i in range(listing.count())]
-        assert any("Cortical plate" in r for r in rows), rows
-        assert any("residual" in r for r in rows), "the expanded parent must stay as residual"
-        listing.setCurrentRow([i for i, r in enumerate(rows) if "Cortical plate" in r][0])
-        _button(panel, "Expand").click()
-        assert any("Isocortex" in listing.item(i).text() for i in range(listing.count()))
-        expanded = listing.count()
+        def rows():
+            return [listing.item(i).text() for i in range(listing.count())]
 
-        # ...and merging puts it back, recursively.
+        def label_of(name):
+            return [int(r.split()[0]) for r in rows() if name in r][0]
+
+        def pick(structure_id):
+            tree.setCurrentItem(_tree_item(tree, structure_id))
+
+        # Picking a region: three levels below the seed partition's Cerebral
+        # cortex, i.e. where expanding could only get in three rounds. It
+        # highlights on the sample and says which label owns it today,
+        # WITHOUT touching the partition.
+        highlight = viewer.layers["selected region (atlas pick)"]
+        pick(315)                                        # Isocortex
+        assert highlight.visible and int(highlight.data.sum()) > 0, \
+            "picking a region must light it up where the registration put it"
+        assert highlight.data.shape == LABELS_SHAPE, \
+            "the highlight belongs on the registration's own grid, not the raw stack's"
+        assert listing.count() == 2, "picking a region must not change the partition"
+        assert paint.selected_label == 1, "...but it does set the brush to the label that owns it"
+
+        # Splitting it out is the one click that does: its own label, the
+        # parent kept as the residual, the paint layer recollapsed under it.
+        _button(panel, "own brush label").click()
+        assert any("Isocortex" in r for r in rows()), rows()
+        assert any("residual" in r for r in rows()), "the parent must stay as the residual"
+        iso_label = label_of("Isocortex")
+        assert (paint.data == iso_label).any(), "the split must recollapse the paint layer"
+
+        # A second, deeper pick under the same parent -- then Merge drops the
+        # whole subtree that came out of label 1, not one level of it.
+        pick(1080)                                       # Hippocampal region
+        _button(panel, "own brush label").click()
+        assert listing.count() == 4, rows()
         listing.setCurrentRow(0)
         _button(panel, "Merge").click()
-        assert listing.count() == 2, "Merge must drop the whole subtree, not one level"
-        _button(panel, "Expand").click()
-        listing.setCurrentRow([i for i in range(listing.count())
-                               if "Cortical plate" in listing.item(i).text()][0])
-        _button(panel, "Expand").click()
-        assert listing.count() == expanded
+        assert listing.count() == 2, "Merge must drop everything split out of the label"
+        assert not (paint.data == iso_label).any(), "merging must recollapse the paint layer too"
 
-        iso_label = [int(listing.item(i).text().split()[0]) for i in range(listing.count())
-                     if "Isocortex" in listing.item(i).text()][0]
+        # Remove: split_out's own undo, for a group with nothing under it.
+        pick(315)
+        _button(panel, "own brush label").click()
+        dropped = label_of("Isocortex")
+        listing.setCurrentRow([i for i, r in enumerate(rows()) if "Isocortex" in r][0])
+        _button(panel, "Remove this label").click()
+        assert listing.count() == 2, rows()
+        assert not (paint.data == dropped).any(), \
+            "removing a label must give its voxels back to the group above it"
+
+        pick(315)
+        _button(panel, "own brush label").click()
+        iso_label = label_of("Isocortex")
         for z in (2, 6):
             plane = paint.data[z]
             ys, xs = np.nonzero(plane != 0)
