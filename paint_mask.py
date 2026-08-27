@@ -98,17 +98,20 @@ blob rather than something that needs a meaningful value on every plane.
     is removed does not disappear, it stays listed as empty with a warning,
     because something is probably still painted with that number.
 
-  Everything is TABBED, one tab bar per side (see _tab_the_panels): five
-    panels stacked down a column arrive as five slivers, none of them usable
-    without dragging the others shut first. Drag a tab out of the bar if two
-    panels really are needed at once.
+  ONE panel on the right (_add_tools_panel), holding Export / Relabel /
+    Erase / Display as sections one under the next. They were four tabbed
+    docks; each is a handful of controls, so tabs meant one small panel on
+    screen and three hidden behind labels that had to be remembered. The
+    left side is still a TAB BAR (see _tab_the_panels), shared with napari's
+    own layer list and controls: the region panel there is a 12-deep tree
+    and genuinely wants the whole column.
 
-  A "Relabel" panel: click-to-fill a single already-painted blob into
+  A "Relabel" section: click-to-fill a single already-painted blob into
     another label, or renumber one label across the whole volume. A bulk
     renumber carries that label's ontology assignment with it, so the number
     keeps meaning the same region.
 
-  An "Erase" panel: lasso a polygon around a mistake and everything inside
+  An "Erase" section: lasso a polygon around a mistake and everything inside
     it is erased on that plane, whatever label it carried -- rubbing a whole
     wrong blob out with the eraser brush is the slow way to do the same
     thing. The brush/eraser size slider is also widened past napari's own
@@ -195,7 +198,7 @@ from shared import hover_bar         # the shared bottom 'region under cursor' b
 # which only ever runs in antsreg.
 napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
 QCheckBox = QHBoxLayout = QLineEdit = QSpinBox = QListWidget = None
-QTreeWidget = QTreeWidgetItem = QSplitter = Qt = None
+QTreeWidget = QTreeWidgetItem = QSplitter = QFrame = Qt = None
 
 
 def _import_gui():
@@ -204,10 +207,11 @@ def _import_gui():
     module import, which is what keeps --selftest env-independent."""
     global napari, QLabel, QPushButton, QVBoxLayout, QWidget
     global QCheckBox, QHBoxLayout, QLineEdit, QSpinBox, QListWidget
-    global QTreeWidget, QTreeWidgetItem, QSplitter, Qt
+    global QTreeWidget, QTreeWidgetItem, QSplitter, QFrame, Qt
     import napari as _napari
     from PyQt5.QtCore import Qt as _Qt
-    from PyQt5.QtWidgets import (QCheckBox as _QCheckBox, QHBoxLayout as _QHBoxLayout,
+    from PyQt5.QtWidgets import (QCheckBox as _QCheckBox, QFrame as _QFrame,
+                                 QHBoxLayout as _QHBoxLayout,
                                  QLabel as _QLabel, QLineEdit as _QLineEdit,
                                  QListWidget as _QListWidget,
                                  QPushButton as _QPushButton,
@@ -221,6 +225,7 @@ def _import_gui():
     QCheckBox, QHBoxLayout, QLineEdit, QSpinBox = _QCheckBox, _QHBoxLayout, _QLineEdit, _QSpinBox
     QListWidget = _QListWidget
     QTreeWidget, QTreeWidgetItem, QSplitter, Qt = _QTreeWidget, _QTreeWidgetItem, _QSplitter, _Qt
+    QFrame = _QFrame
 
 
 def _interpolate_sparse_mask():
@@ -606,18 +611,21 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
 
 
 def _tab_the_panels(viewer, left, right):
-    """Fold every side panel into two TAB BARS -- one per side -- instead of
-    stacking them down their columns.
+    """Fold each side's docks into ONE TAB BAR instead of stacking them down
+    the column.
 
     napari stacks docks vertically, and stacking is only usable while there
-    are two of them. This tool adds four or five on the right and shares the
-    left with napari's own layer list and layer controls, so opening the
-    window used to mean being handed a pile of slivers, each of which had to
-    be dragged open (at the cost of the ones above it) before it could be
-    used. Tabbed, whichever panel is in front gets the whole column, and the
-    rest are one click away -- and any of them can still be dragged out of
-    the tab bar into its own dock, or floated, if two really are needed at
-    once.
+    are two of them. The left side shares a column with napari's own layer
+    list and layer controls, so opening the window used to mean being handed
+    a pile of slivers, each of which had to be dragged open (at the cost of
+    the ones above it) before it could be used. Tabbed, whichever panel is in
+    front gets the whole column, and the rest are one click away -- and any
+    of them can still be dragged out of the tab bar into its own dock, or
+    floated, if two really are needed at once.
+
+    The right side is a single dock now (_add_tools_panel), so `right` is
+    normally one entry and this leaves it alone; it stays a list because
+    tabify is exactly what a second panel there would need.
 
     The layer-controls height unclamp goes here too, because it is the same
     complaint: that dock stops shrinking while it still fills half the column
@@ -625,8 +633,7 @@ def _tab_the_panels(viewer, left, right):
     what makes a stacked left column unusable.
 
     Which tab starts in front: the panel this tool exists for, i.e. the
-    region panel on the left and the export/status panel on the right, since
-    that is where every message the tool prints ends up.
+    region panel on the left.
     """
     ontology_tree_ui.free_layer_controls_height(viewer)
     left = [dock for dock in left if dock is not None]
@@ -636,25 +643,70 @@ def _tab_the_panels(viewer, left, right):
     ontology_tree_ui.tabify(viewer, right, current=right[0] if right else None)
 
 
-def _make_export_dock(viewer, status_label, on_export, button_text, panel_name):
-    # Selectable because the guide export prints a ready-to-paste
-    # guide_regions block into this label (guide_regions_yaml_snippet) --
-    # retyping it out of the terminal is exactly the corruption those ids
-    # exist to prevent.
-    status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+def _export_controls(on_export, button_text):
+    """The Export section: the button, and nothing else.
+
+    It used to carry a scrolling report -- what was written, the warnings,
+    and the ready-to-paste guide_regions block -- which made the export panel
+    by far the tallest thing on the right and pushed everything else out of
+    reach. All of it still goes to the TERMINAL (every caller prints the same
+    string it used to show), where it can be scrolled back to and copied from
+    after the fact instead of being trimmed to fit a dock.
+    """
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
     export_btn = QPushButton(button_text)
     export_btn.clicked.connect(on_export)
+    layout.addWidget(export_btn)
+    layout.addWidget(QLabel("Report, warnings and the pasteable config\nblock go to the terminal."))
+    return section
 
+
+def _add_tools_panel(viewer, sections, name="Export & tools"):
+    """Export, Relabel, Erase and Display as SECTIONS OF ONE DOCK, headed and
+    ruled off from each other, rather than four tab pages.
+
+    Tabs were the previous answer to "four panels stacked down one column
+    arrive as four slivers" (see _tab_the_panels), and they solved the height
+    but cost discoverability: every one of these is a handful of controls, so
+    a tab page shows one small panel and hides three others behind labels
+    that have to be remembered. Stacked in one dock they all fit at once --
+    once the export report stopped being a scrolling text box, which is what
+    made the column too tall to share in the first place -- and finding
+    "Relabel the whole label" is scrolling, not recalling which tab it was
+    on.
+
+    `sections` is [(title, widget), ...], drawn in order. The dock is
+    scroll-wrapped so it can still be dragged short on a laptop screen (the
+    same helper napari's own layer controls get, and for the same reason).
+    """
     dock = QWidget()
     layout = QVBoxLayout(dock)
-    layout.addWidget(ontology_tree_ui.scrollable(status_label, 120))
-    layout.addWidget(export_btn)
+    for index, (title, widget) in enumerate(sections):
+        if index:
+            # Painted rather than a sunken QFrame line: napari's dark theme
+            # draws that as one nearly invisible dark-on-dark pixel row.
+            rule = QFrame()
+            rule.setFrameShape(QFrame.NoFrame)
+            rule.setFixedHeight(1)
+            rule.setStyleSheet("background: rgba(255, 255, 255, 40);")
+            layout.addWidget(rule)
+        head = QLabel(title.upper())
+        head.setStyleSheet("font-weight: bold; letter-spacing: 1px;")
+        layout.addWidget(head)
+        layout.addWidget(widget)
+        ontology_tree_ui.shrinkable(widget)
+    layout.addStretch(1)
     ontology_tree_ui.shrinkable(dock)
-    return viewer.window.add_dock_widget(dock, area="right", name=panel_name)
+    dock_widget = viewer.window.add_dock_widget(dock, area="right", name=name)
+    ontology_tree_ui.scroll_wrap_dock(dock_widget)
+    return dock_widget
 
 
-def _add_relabel_panel(viewer, paint_layer, on_change=None):
-    """A "change what an already-painted region is labelled" panel.
+def _relabel_controls(viewer, paint_layer, on_change=None):
+    """The Relabel section: "change what an already-painted region is
+    labelled".
 
     Two operations, because "the label of this blob is wrong" splits into
     two different jobs and only one of them is a bulk edit:
@@ -682,26 +734,35 @@ def _add_relabel_panel(viewer, paint_layer, on_change=None):
     note = QLabel("Change the label of an already-painted region")
     status = QLabel("")
     status.setWordWrap(True)
+    # Hidden until it has something to say: four sections share one column
+    # now, so a message box that reserves its height while empty costs every
+    # section below it (see _add_tools_panel).
+    status_box = ontology_tree_ui.scrollable(status, 60)
+    status_box.setVisible(False)
+
+    def say(text):
+        status.setText(text)
+        status_box.setVisible(bool(text))
 
     def start_fill():
         # selected_label is what FILL paints with, so set it from `to`.
         paint_layer.n_edit_dimensions = 1
         paint_layer.selected_label = int(to_spin.value())
         paint_layer.mode = "fill"
-        status.setText(f"Fill mode: click any blob and it becomes label {int(to_spin.value())}. "
-                       "(switch back to the paint brush before drawing again)")
+        say(f"Fill mode: click any blob and it becomes label {int(to_spin.value())}. "
+            "(switch back to the paint brush before drawing again)")
 
     def relabel_all():
         src, dst = int(from_spin.value()), int(to_spin.value())
         if src == dst:
-            status.setText("from and to are the same -- nothing to change.")
+            say("from and to are the same -- nothing to change.")
             return
         n = relabel_volume(paint_layer.data, src, dst)
         paint_layer.refresh()
         if on_change is not None:
             on_change(src, dst)
-        status.setText(f"label {src} -> {dst}: {n} voxels changed."
-                       + ("" if n else " (nothing was ever painted with that label)"))
+        say(f"label {src} -> {dst}: {n} voxels changed."
+            + ("" if n else " (nothing was ever painted with that label)"))
 
     fill_btn = QPushButton("Click-to-fill one blob")
     fill_btn.clicked.connect(start_fill)
@@ -715,19 +776,19 @@ def _add_relabel_panel(viewer, paint_layer, on_change=None):
     row_layout.addWidget(QLabel("to"))
     row_layout.addWidget(to_spin)
 
-    dock = QWidget()
-    layout = QVBoxLayout(dock)
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
     layout.addWidget(note)
     layout.addWidget(row)
     layout.addWidget(fill_btn)
     layout.addWidget(all_btn)
-    layout.addWidget(ontology_tree_ui.scrollable(status, 60))
-    ontology_tree_ui.shrinkable(dock)
-    return viewer.window.add_dock_widget(dock, area="right", name="Relabel")
+    layout.addWidget(status_box)
+    return section
 
 
-def _add_display_panel(viewer, layers):
-    """A fill/outline switch for the region layers.
+def _display_controls(layers):
+    """The Display section: a fill/outline switch for the region layers.
 
     napari's Labels layers are FILLED by default (contour = 0) and this tool
     has never changed that -- filled is what shows which region a blob
@@ -750,19 +811,19 @@ def _add_display_panel(viewer, layers):
     checkbox.setChecked(False)
     checkbox.toggled.connect(on_toggled)
 
-    dock = QWidget()
-    layout = QVBoxLayout(dock)
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
     layout.addWidget(checkbox)
     layout.addWidget(QLabel(
         "Filled shows what each region IS; outline uncovers the image under it,\n"
         "for checking a boundary against the tissue."))
-    ontology_tree_ui.shrinkable(dock)
-    return viewer.window.add_dock_widget(dock, area="right", name="Display")
+    return section
 
 
-def _add_erase_panel(viewer, paint_layer):
-    """An "erase what the brush is clumsy at" panel: lasso a polygon and
-    everything inside it, on the plane you are looking at, is erased.
+def _erase_controls(viewer, paint_layer):
+    """The Erase section: lasso a polygon and everything inside it, on the
+    plane you are looking at, is erased.
 
     napari's own eraser is the brush painting label 0 -- fine for nudging an
     edge, painful for taking out a whole wrong blob, which is exactly what a
@@ -792,6 +853,12 @@ def _add_erase_panel(viewer, paint_layer):
 
     status = QLabel("")
     status.setWordWrap(True)
+    status_box = ontology_tree_ui.scrollable(status, 80)
+    status_box.setVisible(False)          # same as Relabel's: no blank strip
+
+    def say(text):
+        status.setText(text)
+        status_box.setVisible(bool(text))
 
     def start_polygon_erase():
         if paint_layer.selected_label:
@@ -800,7 +867,7 @@ def _add_erase_panel(viewer, paint_layer):
         paint_layer.n_edit_dimensions = 2
         paint_layer.selected_label = 0            # 0 = background = erase
         paint_layer.mode = "polygon"
-        status.setText(
+        say(
             "Polygon erase on this plane: left-click each corner, then double-click "
             "(or press Enter) to close it -- everything inside is erased, whatever "
             "label it had. Right-click drops the last corner, Esc drops the whole "
@@ -814,23 +881,23 @@ def _add_erase_panel(viewer, paint_layer):
         paint_layer.n_edit_dimensions = 2
         paint_layer.selected_label = last_label["value"]
         paint_layer.mode = "paint"
-        status.setText(f"Back to the brush, painting label {last_label['value']}.")
+        say(f"Back to the brush, painting label {last_label['value']}.")
 
     polygon_btn = QPushButton("Polygon erase")
     polygon_btn.clicked.connect(start_polygon_erase)
     brush_btn = QPushButton("Back to brush")
     brush_btn.clicked.connect(back_to_brush)
 
-    dock = QWidget()
-    layout = QVBoxLayout(dock)
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
     layout.addWidget(QLabel(
         "Erase a mistake with a polygon instead of scrubbing it out with the\n"
         f"eraser brush. The brush/eraser size slider goes up to {MAX_BRUSH_SIZE}."))
     layout.addWidget(polygon_btn)
     layout.addWidget(brush_btn)
-    layout.addWidget(ontology_tree_ui.scrollable(status, 80))
-    ontology_tree_ui.shrinkable(dock)
-    return viewer.window.add_dock_widget(dock, area="right", name="Erase")
+    layout.addWidget(status_box)
+    return section
 
 
 # =====================================================================================
@@ -1516,21 +1583,22 @@ def _run_guide(args):
     header = ("Pick a region in the ontology tree on the left, set a brush label, click\n"
               "Assign to label, then paint the sample with that brush number.\n"
               if atlas else _region_legend(args.region_labels))
-    status_label = QLabel(
-        header +
-        "Paint a rough outline on a few planes per region (start, end, and\n"
-        "any plane where the shape changes a lot; at least 2 planes each),\n"
-        "then click Export.\n" + guess_note)
+    # Printed, not shown in a panel: the export report lives in the terminal
+    # now (see _export_controls), and the instructions belong with it rather
+    # than in a text box that would be the tallest thing in the window.
+    print(header +
+          "Paint a rough outline on a few planes per region (start, end, and\n"
+          "any plane where the shape changes a lot; at least 2 planes each),\n"
+          "then click Export.\n" + guess_note)
 
     def export():
         keyframes = sparse_keyframes_by_label(paint_layer.data)
         if not keyframes:
-            status_label.setText("No planes painted yet -- nothing to export.")
+            print("No planes painted yet -- nothing to export.")
             return
 
         n_planes = sum(len(planes) for planes in keyframes.values())
-        status_label.setText(
-            f"Exporting... ({len(keyframes)} labels, {n_planes} painted planes)")
+        print(f"Exporting... ({len(keyframes)} labels, {n_planes} painted planes)")
         result = interpolate_labels_separately(keyframes, arr.shape)
 
         # The GUI assignment is authoritative when an atlas is loaded (it is
@@ -1570,12 +1638,7 @@ def _run_guide(args):
                           region_ids, region_labels, args.output_path,
                           voxel_size_um=args.voxel_size_um)]
 
-        msg = "\n".join(lines)
-        status_label.setText(msg)
-        print(msg)
-
-    export_dock = _make_export_dock(viewer, status_label, export, "Export Outline",
-                                    "Guide Outline Export")
+        print("\n".join(lines))
 
     # A bulk relabel has to carry the region assignment with it, or the label
     # keeps its voxels and loses its meaning -- the exact thing the ontology
@@ -1593,13 +1656,16 @@ def _run_guide(args):
         if picker is not None:
             picker.refresh_assignment()
 
-    relabel_dock = _add_relabel_panel(viewer, paint_layer,
-                                      on_change=_assignment_follows_relabel)
-    erase_dock = _add_erase_panel(viewer, paint_layer)
-    display_dock = _add_display_panel(viewer, [paint_layer])
+    tools_dock = _add_tools_panel(viewer, [
+        ("Export", _export_controls(export, "Export Outline")),
+        ("Relabel", _relabel_controls(viewer, paint_layer,
+                                      on_change=_assignment_follows_relabel)),
+        ("Erase", _erase_controls(viewer, paint_layer)),
+        ("Display", _display_controls([paint_layer])),
+    ], name="Guide Outline Export & tools")
     _tab_the_panels(viewer,
                     left=[picker.dock] if picker is not None else [],
-                    right=[export_dock, relabel_dock, erase_dock, display_dock])
+                    right=[tools_dock])
 
 
 # =====================================================================================
@@ -2150,10 +2216,17 @@ def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels
     upper = QWidget()
     upper_layout = QVBoxLayout(upper)
     upper_layout.setContentsMargins(0, 0, 0, 0)
+    # Short lines on purpose: a QLabel does not wrap (wrapping one would drive
+    # the whole window's minimum height -- see ontology_tree_ui.scrollable),
+    # so a line longer than the dock is CLIPPED, and a clipped sentence reads
+    # as a typo rather than as a narrow panel.
     upper_layout.addWidget(QLabel(
-        "Atlas ontology -- selecting a region highlights it on the sample, where\n"
-        "the registration put it. Split one out to correct it under its own brush\n"
-        "label; the group it came out of keeps everything else."))
+        "Atlas ontology. Selecting a region\n"
+        "highlights it on the sample, where\n"
+        "the registration put it. Split one\n"
+        "out to correct it under its own\n"
+        "brush label; the group it came out\n"
+        "of keeps everything else."))
     upper_layout.addWidget(search)
     upper_layout.addWidget(hide_empty)
     upper_layout.addWidget(tree, 1)      # the stretch: spare height is the tree's
@@ -2162,7 +2235,7 @@ def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels
     lower = QWidget()
     lower_layout = QVBoxLayout(lower)
     lower_layout.setContentsMargins(0, 0, 0, 0)
-    lower_layout.addWidget(QLabel("Brush label -> atlas region. Selecting one sets the brush."))
+    lower_layout.addWidget(QLabel("Brush label -> atlas region.\nSelecting one sets the brush."))
     # The stretch, plus a status box pinned to its own height: the group list
     # is what this half is FOR and a partition routinely runs to a dozen
     # groups, so spare height belongs to it rather than to the blank half of
@@ -2401,8 +2474,6 @@ def _run_labels(args):
         viewer, structures, region_colour,
         resting="Hover over the sample to read the atlas region the registration put there.")
 
-    status_label = QLabel("")
-    status_label.setWordWrap(True)
 
     def on_partition_changed():
         new_baseline = baseline_for(partition)
@@ -2474,22 +2545,20 @@ def _run_labels(args):
                 "ancestors; tick 'atlas regions (all, read-only)' in the layer list to see\n"
                 "every region the registration produced, not just the brush labels.")
 
-    status_label.setText(describe())
+    print(describe())
 
     def export():
         planes = sorted(plane_keyframes(paint_layer.data, state["baseline"]))
         if not planes:
-            status_label.setText("Nothing differs from the registration yet -- nothing to "
-                                 "export.\n" + describe())
+            print("Nothing differs from the registration yet -- nothing to export.\n"
+                  + describe())
             return
         # Said out loud because on the raw grid this is minutes, not seconds:
         # the interpolation runs a signed-distance transform per region per
         # pair of neighbouring keyframes, on planes of several megapixels.
-        note = (f"Exporting {len(planes)} keyframe planes at {sample_arr.shape[1]}x"
-                f"{sample_arr.shape[2]}. On the raw grid this takes a while (one distance "
-                f"transform per region per keyframe gap) -- watch the terminal.")
-        status_label.setText(note)
-        print(note)
+        print(f"Exporting {len(planes)} keyframe planes at {sample_arr.shape[1]}x"
+              f"{sample_arr.shape[2]}. On the raw grid this takes a while (one distance "
+              f"transform per region per keyframe gap).")
 
         result = labels_export(paint_layer.data, state["baseline"])
         region_ids = partition.region_ids()
@@ -2547,25 +2616,23 @@ def _run_labels(args):
                       atlas_exclude_ids=exclude,
                       voxel_size_note="# the raw stack's own (x,y,z) um, same grid as mode: guide")]
 
-        msg = "\n".join(lines)
-        status_label.setText(msg)
-        print(msg)
+        print("\n".join(lines))
         panel.refresh()
 
-    export_dock = _make_export_dock(viewer, status_label, export, "Export Guide + Atlas",
-                                    "Registration Correction Export")
-    relabel_dock = _add_relabel_panel(
-        viewer, paint_layer, on_change=lambda src, dst: status_label.setText(
-            f"Bulk relabel {src} -> {dst} touched every plane it appears on -- each of those is "
-            f"now a keyframe.\n" + describe()))
-    erase_dock = _add_erase_panel(viewer, paint_layer)
-    display_dock = _add_display_panel(viewer, [paint_layer, reference, atlas_regions])
+    tools_dock = _add_tools_panel(viewer, [
+        ("Export", _export_controls(export, "Export Guide + Atlas")),
+        ("Relabel", _relabel_controls(
+            viewer, paint_layer, on_change=lambda src, dst: print(
+                f"Bulk relabel {src} -> {dst} touched every plane it appears on -- each of "
+                f"those is now a keyframe.\n" + describe()))),
+        ("Erase", _erase_controls(viewer, paint_layer)),
+        ("Display", _display_controls([paint_layer, reference, atlas_regions])),
+    ], name="Registration Correction Export & tools")
     # The brush layer selected, not whichever was added last: napari hands the
     # keyboard and the paint tools to the ACTIVE layer, and this window opens
     # with five of them.
     viewer.layers.selection = {paint_layer}
-    _tab_the_panels(viewer, left=[panel.dock],
-                    right=[export_dock, relabel_dock, erase_dock, display_dock])
+    _tab_the_panels(viewer, left=[panel.dock], right=[tools_dock])
 
 
 # =====================================================================================
