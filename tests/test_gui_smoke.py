@@ -383,6 +383,18 @@ def test_labels_mode_window(tmp, inputs):
         rgba = regions.colormap.map(np.array([atlas_ref.index_of_id[315]]))[0]
         assert hover_bar.colours(rgba)[0] in bar.styleSheet(), \
             "the strip must be painted the region's own colour"
+        # The id rides along so it can be pasted straight back into the
+        # search box below -- which is the other half of this:
+        assert "[315]" in text, text
+        search = panel.findChild(pm.QLineEdit, "partition_search")
+        search.setText("315")
+        assert not _tree_item(tree, 315).isHidden(), "searching an id must find its region"
+        assert _tree_item(tree, 1080).isHidden(), "...and hide the ones it does not match"
+        search.setText("isocortex 315")      # terms are ANDed, in any order
+        assert not _tree_item(tree, 315).isHidden(), "name + id together must still match"
+        search.setText("315 nonesuch")
+        assert _tree_item(tree, 315).isHidden(), "every term has to match, not just one"
+        search.setText("")
 
         # Off the volume: the bar says so instead of holding the last region.
         on_move(viewer, SimpleNamespace(position=(1e6, 1e6, 1e6)))

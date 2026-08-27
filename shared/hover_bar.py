@@ -57,8 +57,15 @@ def ancestry_labels(structures, structure_id):
 
     The same chain atlas_reference.format_ancestry renders as an indented
     block, flattened for a one-line bar: no indent, no markers, just the
-    names (with acronyms, which are what stays recognisable when a name is
-    long) in ontology order, shallowest first.
+    names in ontology order, shallowest first, each with its acronym (what
+    stays recognisable when a name is long) and its ID.
+
+    The id is there to be typed straight back into a region search box --
+    ids are what the sidecars, the export report and the pipeline config all
+    speak, so the bar quoting one makes the region findable again without
+    retyping a name that has to match exactly. It costs width, and width is
+    what decides how many levels fit (fit_ancestry_line), which is the trade
+    accepted here: the deep end survives, and that is the end you looked at.
     """
     info = structures.get(structure_id)
     if info is None:
@@ -70,7 +77,8 @@ def ancestry_labels(structures, structure_id):
             labels.append(f"[{sid}] ?")
             continue
         acronym = node.get("acronym")
-        labels.append(f"{node['name']} ({acronym})" if acronym else node["name"])
+        name = f"{node['name']} ({acronym})" if acronym else node["name"]
+        labels.append(f"{name} [{sid}]")
     return labels
 
 
@@ -349,7 +357,8 @@ def selftest_ancestry_labels():
         100: {"name": "no acronym here", "structure_id_path": [1, 10, 100]},
     }
     assert ancestry_labels(structures, 100) == [
-        "root (root)", "cortex (CTX)", "no acronym here"]
+        "root (root) [1]", "cortex (CTX) [10]", "no acronym here [100]"], \
+        ancestry_labels(structures, 100)
     assert ancestry_labels(structures, 999) == ["id 999 (not in the ontology)"]
 
 
@@ -357,7 +366,7 @@ def run_selftests():
     print("1. hover bar: keeps the deepest levels, folds the shallow end away")
     selftest_ancestry_line()
     print("   ok")
-    print("2. hover bar: the chain is the ontology path, acronyms and all")
+    print("2. hover bar: the chain is the ontology path, acronyms and ids and all")
     selftest_ancestry_labels()
     print("   ok")
     print("\nall hover_bar selftests passed")

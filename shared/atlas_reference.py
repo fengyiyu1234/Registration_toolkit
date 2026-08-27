@@ -610,21 +610,47 @@ def annotation_features(atlas):
     return {"index": np.arange(len(atlas.present_ids)), "region": names, "id": ids}
 
 
+def search_haystack(sid, info):
+    """The one string a tree search matches against: name, acronym and id.
+
+    All three in one, because all three are things people arrive with. The
+    acronym (DevCCF's "SPall", "THyA", ...) is often what you remember, and
+    the ID is what the tools quote back at you -- the hover bar, the export
+    report, the .regions.json sidecar and the pipeline config all speak ids,
+    so pasting one into the search box has to find its region.
+    """
+    return f"{info['name']} {info.get('acronym') or ''} {sid}".lower()
+
+
 def visible_tree_ids(structures, node_voxels, text, hide_empty):
     """Which ontology ids a search box showing `text` should leave visible.
 
     Every ancestor of a match is included, otherwise a deep hit would be
     unreachable -- the tree can only show a node if the whole chain down to
-    it is showing. Matching is on name and acronym, since the acronym
-    (DevCCF's "SPall", "THyA", ...) is often what you actually remember.
+    it is showing.
+
+    The query is split on whitespace and EVERY term has to appear somewhere
+    in search_haystack(), as a plain substring. Two consequences, both
+    deliberate:
+
+      - "cortex 5", "5 cortex" and "layer 5 of the primary motor" all find
+        `Primary motor area, layer 5`, which a single-substring match cannot:
+        nobody remembers an ontology name's exact word order or punctuation.
+      - a bare number finds a region by id ("315" -> Isocortex), and also
+        every region whose id merely CONTAINS those digits. That is the same
+        "contains" rule as the words, and a filter listing a few extra rows
+        is cheaper than a search that silently finds nothing when you paste
+        the id the rest of the tool just showed you.
     """
-    text = text.strip().lower()
+    terms = text.strip().lower().split()
     visible = set()
     for sid, info in structures.items():
         if hide_empty and not node_voxels.get(sid):
             continue
-        if text and text not in info["name"].lower() and text not in (info.get("acronym") or "").lower():
-            continue
+        if terms:
+            haystack = search_haystack(sid, info)
+            if not all(term in haystack for term in terms):
+                continue
         visible.update(info["structure_id_path"])
     return visible
 
@@ -668,7 +694,7 @@ def selftest_ontology_node_voxels():
 
 
 def selftest_ontology_tree_filter():
-    print("2. ontology: search reveals ancestors, matches acronyms, respects hide-empty")
+    print("2. ontology: search reveals ancestors, matches acronym/id/terms, respects hide-empty")
     structures = _fake_ontology()
     node_voxels = {1: 10, 10: 10, 100: 3, 101: 7}
 
@@ -679,6 +705,16 @@ def selftest_ontology_tree_filter():
     assert visible_tree_ids(structures, node_voxels, "leaf A2", True) == {1, 10, 101}
     # Acronyms are searchable: "SPall"/"THyA" is often what you remember.
     assert visible_tree_ids(structures, node_voxels, "a1", True) == {1, 10, 100}
+
+    # ...and so is the ID, which is what every other part of these tools
+    # quotes: the hover bar, the export report, the sidecars, the config.
+    assert visible_tree_ids(structures, node_voxels, "101", True) == {1, 10, 101}
+    # Several terms are ANDed, in any order, so a half-remembered name works
+    # where one substring cannot ("Primary motor area, layer 5" vs "motor 5").
+    assert visible_tree_ids(structures, node_voxels, "leaf a2", True) == {1, 10, 101}
+    assert visible_tree_ids(structures, node_voxels, "a2 leaf", True) == {1, 10, 101}
+    assert visible_tree_ids(structures, node_voxels, "leaf 101", True) == {1, 10, 101}
+    assert visible_tree_ids(structures, node_voxels, "leaf nonesuch", True) == set()
 
     # An empty region stays hidden while hide-empty is on, and is reachable
     # (to look at, not to assign) once it's off.

@@ -1330,7 +1330,7 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     # "the first spin box" is not this panel's brush-label box.
     search = QLineEdit()
     search.setObjectName("ontology_search")
-    search.setPlaceholderText("Filter regions by name/acronym...")
+    search.setPlaceholderText("Filter by name / acronym / id, any order...")
     hide_empty = QCheckBox("Only regions with voxels in this annotation")
     hide_empty.setObjectName("ontology_hide_empty")
     hide_empty.setChecked(True)
@@ -2072,7 +2072,7 @@ def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels
 
     search = QLineEdit()
     search.setObjectName("partition_search")
-    search.setPlaceholderText("Filter regions by name/acronym...")
+    search.setPlaceholderText("Filter by name / acronym / id, any order...")
     hide_empty = QCheckBox("Only regions with voxels in this annotation")
     hide_empty.setObjectName("partition_hide_empty")
     hide_empty.setChecked(True)

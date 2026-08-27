@@ -2041,7 +2041,7 @@ def _add_region_panel(viewer, atlas, win):
     (_REGION_DOCK_WIDTH) -- see _shrinkable for what used to nail it open.
     """
     search = _shrinkable(QLineEdit())
-    search.setPlaceholderText("Filter regions by name/acronym...")
+    search.setPlaceholderText("Filter by name / acronym / id, any order...")
     hide_empty = _shrinkable(QCheckBox("Only regions with voxels here"))
     hide_empty.setChecked(True)
 
