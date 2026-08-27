@@ -120,6 +120,55 @@ def _read_array(path):
     return sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
 
 
+# float32 carries 24 bits of integer precision, so every integer up to this is
+# exact and everything past it snaps to the nearest representable value.
+LOSSLESS_INT_LIMIT = 2 ** 24
+
+
+def check_label_dtype(dtype, present_ids, path):
+    """Warn when a structure-id volume was stored in a dtype that cannot hold
+    its ids, and say what it costs. Returns True when the volume is
+    trustworthy.
+
+    CCF ids run to 614,454,277 and 127 of them sit above LOSSLESS_INT_LIMIT,
+    where the float32 step is 32 -- so storing an annotation as float32 snaps
+    neighbouring structures onto a shared bogus id. Measured on the DeMBA P5
+    annotation before it was replaced: those 127 ids collapsed into 24 float32
+    values, 20 of them unrecoverable, 1,032,402 voxels = 3.6% of everything
+    labelled. `corpus callosum, body` was one of them, which is why the
+    callosum rendered as a broken C instead of a continuous arch.
+
+    Nothing reported any of it, in either repo, until someone noticed the
+    picture looked wrong -- and the ids that survive rounding still LOOK like
+    valid ids, so every downstream lookup fails quietly rather than loudly:
+    np.isin(annotation, descendant_ids_of(776)) simply matches zero voxels.
+    That is the reason this is a check and not a comment. The full account,
+    plus the four casts that had to be closed on the pipeline side, is in
+    ../Registration_ants/src/registration_ants/io_utils._LABEL_DTYPE_NOTE.
+
+    Warns rather than raises: a suspect atlas that still draws is more useful
+    than a traceback, and the caller may be looking at a template or a
+    deliberately downsampled volume where none of this applies.
+    """
+    if not np.issubdtype(np.dtype(dtype), np.floating):
+        return True
+    ids = np.asarray(present_ids)
+    big = ids[ids > LOSSLESS_INT_LIMIT]
+    name = Path(path).name
+    print(f"WARNING: {name} is {np.dtype(dtype)}, not an integer type. Structure ids above "
+          f"{LOSSLESS_INT_LIMIT:,} cannot be represented exactly.")
+    if big.size:
+        # Rounded values land on multiples of the float32 step for their
+        # magnitude, so a genuine id in this range is the exception; report the
+        # count rather than trying to decide which are real.
+        print(f"         {big.size} of the {ids.size} labels here are above that line "
+              f"(largest {int(big.max()):,}) -- expect merged structures and lookups by "
+              f"ontology id that match nothing.")
+    print(f"         Re-export it as uint32, or point this tool at an annotation that "
+          f"already is one.")
+    return False
+
+
 def _reorient_zyx(arr_zyx, orientation, atlas_utils):
     """Apply a ClearMap-style orientation spec to a (z,y,x) array.
 
@@ -474,6 +523,7 @@ def load_atlas_reference(atlas_cfg, include_template=True):
 
     print(f"[atlas] annotation: {atlas_cfg.annotation_path}")
     annotation = _read_array(atlas_cfg.annotation_path)
+    annotation_dtype = annotation.dtype        # kept past the `del` below
     # Reorient and downsample as views, so the only full-size array alive is
     # the one SimpleITK just read; _compact_annotation reads through the view
     # a slab at a time and the 1.1 GB original is dropped immediately after.
@@ -481,6 +531,10 @@ def load_atlas_reference(atlas_cfg, include_template=True):
         _slice_zyx(_reorient_zyx(annotation, atlas_cfg.orientation, atlas_utils),
                    getattr(atlas_cfg, "slicing", None))[sub])
     del annotation
+
+    # After _compact_annotation, not before: present_ids is the np.unique pass
+    # it already paid for, so the check costs nothing on a 1.1 GB annotation.
+    check_label_dtype(annotation_dtype, present_ids, atlas_cfg.annotation_path)
 
     counts = np.bincount(compact.ravel(), minlength=len(present_ids))
     node_voxels = voxels_per_ontology_node(structures, present_ids, counts)

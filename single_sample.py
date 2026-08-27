@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidge
                              QFileDialog, QMessageBox, QSizePolicy)
 from PyQt5.QtCore import Qt
 
+from shared import atlas_reference   # check_label_dtype (lossy label dtypes)
 from shared import local_config      # configs/<tool>.yaml
 from shared import ontology_tree_ui  # shrinkable / set_dock_width
 
@@ -278,6 +279,13 @@ class DataLoader:
         # 部分 id 超过 32767（本机 p5 图谱里 128 个），在 int16 里已经溢出成负数；
         # 直接 astype(uint32) 会变成 40 多亿的假 id，hover 显示 "Region 4294935936"。
         # 归零 = 当作背景，比假 id 诚实（受影响体素约 1%）。
+        # Same class of problem as the signed-overflow branch below, opposite
+        # direction: a float32 label volume has already lost the ids above
+        # 2**24 by the time it reaches us, and casting to uint32 here makes the
+        # rounded values look like clean integers again. Checked before the
+        # cast, because afterwards there is nothing left to see.
+        if np.issubdtype(np.dtype(dtype), np.unsignedinteger) and np.issubdtype(arr.dtype, np.floating):
+            atlas_reference.check_label_dtype(arr.dtype, np.unique(arr), path)
         if np.issubdtype(np.dtype(dtype), np.unsignedinteger) and np.issubdtype(arr.dtype, np.signedinteger):
             n_neg = int((arr < 0).sum())
             if n_neg:

@@ -20,6 +20,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from shared import atlas_reference  # noqa: E402
 from shared import landmark_io  # noqa: E402
 from shared import local_config  # noqa: E402
 
@@ -176,6 +177,37 @@ def test_resolve_inputs_no_form(tmp):
     print("   OK (no Qt import on this path)")
 
 
+# =====================================================================================
+# shared.atlas_reference.check_label_dtype
+# =====================================================================================
+def test_check_label_dtype(tmp, capture=None):
+    print("6. atlas_reference: a float32 annotation is called out, uint32 is not...")
+    limit = atlas_reference.LOSSLESS_INT_LIMIT
+
+    # The real shape of the bug: ids on both sides of the float32 integer
+    # limit. 484682516 is `corpus callosum, body`, the id that actually went
+    # missing on this data.
+    ids = np.array([0, 776, 1009, 484682516, 614454277], dtype=np.uint32)
+    assert atlas_reference.check_label_dtype(np.uint32, ids, "fixed.tif"), \
+        "uint32 holds every CCF id and must not warn"
+    assert not atlas_reference.check_label_dtype(np.float32, ids, "stale.tif"), \
+        "float32 cannot hold ids past 2**24 and must warn"
+
+    # ...and it is the DTYPE that decides, not whether these particular ids
+    # happen to be large: a float32 annotation of a small-id atlas is still
+    # the wrong container, and one whose ids all fit is still worth saying so
+    # about, just without the "N labels above the line" detail.
+    small = np.array([0, 1, 2, 997], dtype=np.uint32)
+    assert not atlas_reference.check_label_dtype(np.float32, small, "small.tif"), \
+        "the dtype decides, not the ids that happen to be present"
+
+    # Guard the constant itself -- it is the whole basis of the check.
+    assert float(np.float32(limit)) == limit, "2**24 must be exactly representable"
+    assert float(np.float32(limit + 1)) != limit + 1, \
+        f"{limit}+1 must NOT be representable, or the limit is wrong"
+    print("   OK")
+
+
 def main():
     print("=== tests/test_tool_inputs_smoke.py ===")
     with tempfile.TemporaryDirectory() as tmp:
@@ -185,6 +217,7 @@ def main():
         test_load_points_agrees_with_landmark_io(tmp)
         test_values_from_config(tmp)
         test_resolve_inputs_no_form(tmp)
+        test_check_label_dtype(tmp)
     print("\nALL SMOKE TESTS PASSED")
     return 0
 
