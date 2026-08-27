@@ -257,7 +257,7 @@ def test_labels_mode_window(tmp, inputs):
     import napari
     import SimpleITK as sitk
     import paint_mask as pm
-    from shared import atlas_reference
+    from shared import atlas_reference, hover_bar
 
     out = tmp / "corrected_guide.nii.gz"
     pm._run_labels(SimpleNamespace(
@@ -344,11 +344,60 @@ def test_labels_mode_window(tmp, inputs):
         pick(315)
         _button(panel, "own brush label").click()
         iso_label = label_of("Isocortex")
+
+        # The whole annotation, not just the partition's handful of groups,
+        # and in atlas_view's OWN colour indices so the two tools agree.
+        regions = viewer.layers["atlas regions (all, read-only)"]
+        assert regions.data.shape == LABELS_SHAPE, \
+            "the region reference belongs on the registration's grid"
+        assert viewer.layers.index(regions) < viewer.layers.index(paint), \
+            "the reference must sit UNDER the paint layer, or it hides what you draw"
+        atlas_ref = atlas_reference.load_atlas_reference(
+            atlas_reference.atlas_reference_config({
+                "atlas_annotation_path": str(inputs.annotation),
+                "ontology_path": str(inputs.ontology),
+                "atlas_resolution_um": 25}), include_template=False)
+        # (z, y, x) = (5, 10, 1) is in the first slab, i.e. Isocortex (315).
+        assert int(regions.data[5, 10, 1]) == atlas_ref.index_of_id[315], \
+            "the layer must hold compact present_ids indices, which is what makes the "\
+            "colours identical to tools/atlas_view.py's"
+
+        # ...and the bottom bar reads that region's whole ancestor chain off
+        # it, in the colour the layer is drawing it in. Driven through the
+        # viewer's own callback, world coordinates and all, because a
+        # LAYER-level callback is delivered to the active layer only -- which
+        # is exactly why this panel used to sit there empty.
+        bar = _widget(viewer, "Region under cursor")
+        # Width decides how many levels fit, and an off-screen window's docks are
+        # narrow -- so give the bar the room a real window would.
+        bar.resize(1400, 64)
+        assert viewer.mouse_move_callbacks, "nothing is watching the cursor"
+        on_move = viewer.mouse_move_callbacks[0]
+        on_move(viewer, SimpleNamespace(position=(5 * 25.0, 10 * 25.0, 1 * 25.0)))
+        text = bar.text()
+        assert "Isocortex" in text and "Cerebral cortex" in text, text
+        assert text.index("Cerebral cortex") < text.index("Isocortex"), \
+            "the chain runs root -> leaf, shallowest first"
+        rgba = regions.colormap.map(np.array([atlas_ref.index_of_id[315]]))[0]
+        assert hover_bar.colours(rgba)[0] in bar.styleSheet(), \
+            "the strip must be painted the region's own colour"
+
+        # Off the volume: the bar says so instead of holding the last region.
+        on_move(viewer, SimpleNamespace(position=(1e6, 1e6, 1e6)))
+        assert "Isocortex" not in bar.text(), bar.text()
         for z in (2, 6):
             plane = paint.data[z]
             ys, xs = np.nonzero(plane != 0)
             plane[ys[:len(ys) // 8], xs[:len(ys) // 8]] = iso_label
         paint.refresh()
+
+        # A voxel that was actually corrected says so in the bar, on top of
+        # the atlas chain -- that is what tells a correction apart from a
+        # region left alone, once the whole plane counts as a keyframe.
+        zyx = np.argwhere(paint.data != viewer.layers["registration as-is (read-only)"].data)[0]
+        scale = RAW_VOXEL_UM[::-1]
+        on_move(viewer, SimpleNamespace(position=tuple(c * s for c, s in zip(zyx, scale))))
+        assert "REPAINTED" in bar.text(), bar.text()
 
         _button(_widget(viewer, "Correction Export"), "Export").click()
 

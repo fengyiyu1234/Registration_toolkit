@@ -29,6 +29,8 @@ shared/                  imported, never run
   label_partition.py       brush label <-> atlas region, and refining it per region
   ontology_tree_ui.py      the searchable Qt ontology tree, + the dock layout
                              helpers all three GUI tools share
+  hover_bar.py             the wide "region under the cursor" strip along the
+                             bottom, shared by atlas_view and paint_mask
 
 tools/                   the smaller runnable tools
   atlas_view.py
@@ -101,7 +103,10 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
     put it, then give it its own brush label — `Field CA1` in one click,
     without changing how coarsely the cerebellum is
     described — and the atlas-side subtraction that nesting requires
-    (`atlas_exclude_ids`) is derived rather than maintained by hand. See
+    (`atlas_exclude_ids`) is derived rather than maintained by hand. Alongside
+    the brush labels there is a read-only layer holding *every* region the
+    registration produced, in `tools/atlas_view.py`'s own colours, and a hover
+    bar along the bottom reading that region's ancestor chain off it. See
     `shared/label_partition.py` for the measured reason a uniform ontology
     depth is not a usable knob.
 - **`single_sample.py`** — napari QC viewer for one registered sample: overlays
@@ -296,6 +301,7 @@ python paint_mask.py --selftest
 python tools/atlas_view.py --selftest
 python shared/atlas_reference.py --selftest
 python shared/label_partition.py --selftest
+python shared/hover_bar.py --selftest
 python tests/test_tool_inputs_smoke.py
 python tests/test_registration_eval_smoke.py
 python tests/test_gui_smoke.py            # builds real napari windows, ~3 s

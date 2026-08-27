@@ -21,9 +21,13 @@ and switching modes is a one-line edit.
     ontology depth: pick ANY node in the ontology tree -- at any depth --
     and it lights up on the sample where the registration put it; split it
     out and it gets its own brush label to be corrected under, without
-    touching how coarsely the cerebellum is described. See the
-    "mode: labels" section further down, and shared/label_partition.py for
-    the measured reason a uniform ontology depth is not a usable knob.
+    touching how coarsely the cerebellum is described. Two more layers make
+    that decidable: EVERY atlas region the registration produced, read-only
+    and in tools/atlas_view.py's own colours, and a hover bar along the
+    bottom naming the region under the cursor with its whole ancestor chain
+    (shared/hover_bar.py). See the "mode: labels" section further down, and
+    shared/label_partition.py for the measured reason a uniform ontology
+    depth is not a usable knob.
 
     THE CANVAS IS STILL THE RAW STACK. The registration output arrives on
     the isotropic grid registration ran on (the pipeline's fine_target_um --
@@ -182,6 +186,7 @@ from shared import atlas_reference   # GUI-free atlas loading + ontology math
 from shared import local_config      # configs/<tool>.yaml
 from shared import label_partition   # brush-label <-> ontology-region partitions
 from shared import ontology_tree_ui  # the shared Qt ontology tree widget
+from shared import hover_bar         # the shared bottom 'region under cursor' bar
 
 # napari/PyQt5 are imported lazily by _import_gui() rather than here, and
 # mask_utils by _interpolate_sparse_mask(), so that --selftest (pure numpy +
@@ -1632,6 +1637,30 @@ def _run_guide(args):
 #      or each session interpolates on top of the last one's guess; the
 #      .keyframes.json sidecar records which planes were real and where the true
 #      baseline lives, and load_labels_resume enforces it.
+#
+# FIVE LAYERS, bottom to top, and only one of them is editable:
+#
+#   sample                          the raw stack, grayscale
+#   atlas regions (all, read-only)  every region the registration produced, in
+#                                   compact present_ids indices -- i.e. the same
+#                                   colours tools/atlas_view.py gives them.
+#                                   Hidden by default (the paint layer is what
+#                                   you work on), and what the bottom hover bar
+#                                   reads: a brush label says "Cerebral cortex"
+#                                   whether the voxel is layer 5 of the motor
+#                                   area or the subiculum, and that difference
+#                                   is exactly what decides where to split.
+#   regions (paint here)            the brush labels -- the one editable layer
+#   registration as-is (read-only)  the baseline collapse, to compare a keyframe
+#                                   against once interpolation has overwritten
+#                                   the planes between two of them
+#   selected region (atlas pick)    what the ontology tree currently points at
+#
+# The three reference layers live on the REGISTRATION's grid with their own
+# napari scale, not regridded onto the raw stack: both grids share physical
+# origin 0 and an identity direction (regrid_nearest's own precondition), so
+# napari lands them on top of each other, and each costs an array the size of
+# the registration output rather than of the raw stack.
 
 
 def plane_keyframes(paint, baseline):
@@ -2289,6 +2318,38 @@ def _run_labels(args):
     # a Labels one, so the highlight reads as a highlight over whatever the
     # paint layer is showing rather than as another region to confuse it with.
     fine_ids = np.unique(fine_labels)
+
+    # EVERY atlas region the registration produced, not just the handful the
+    # partition collapses them into: the paint layer answers "which brush
+    # label is this", and this one answers "which structure did the atlas
+    # actually put here", which is the question the hover bar reads off and
+    # the one the partition is being built against.
+    #
+    # Held as COMPACT INDICES into atlas.present_ids rather than raw ontology
+    # ids, for the same two reasons atlas_reference._compact_annotation
+    # exists: napari's Labels colormap on ids reaching 6.1e8 is a colour per
+    # id nobody can tell apart, and -- because tools/atlas_view.py draws the
+    # very same indices -- the colours here are IDENTICAL to that tool's, so
+    # a region looked up there is the same colour here.
+    index_dtype = np.uint8 if len(atlas.present_ids) <= 255 else np.uint16
+    # An id the atlas annotation does not contain (the DeMBA P5 output has a
+    # handful) goes wherever background went, rather than to index 0 on the
+    # assumption that the two are the same: index 0 is whatever sorted
+    # FIRST, which is id 0 in every real annotation but need not be.
+    background_index = atlas.index_of_id.get(0, 0)
+    index_of_id = np.array([atlas.index_of_id.get(int(i), background_index) for i in fine_ids],
+                           dtype=index_dtype)
+    region_index = index_of_id[np.searchsorted(fine_ids, fine_labels)]
+    atlas_regions = viewer.add_labels(
+        region_index, name="atlas regions (all, read-only)", visible=False, opacity=0.6,
+        scale=fine_spacing_zyx)
+    atlas_regions.editable = False
+    # UNDER the paint layer, not on top of it: it is a reference to look at
+    # beneath what you are drawing, and napari draws in list order, so a
+    # layer added last would hide the painting. Everything else added here
+    # (the read-only baseline, the highlight) is meant to sit above it.
+    viewer.layers.move(viewer.layers.index(atlas_regions), 1)
+
     highlight = viewer.add_image(
         np.zeros(fine_labels.shape, dtype=np.uint8), name="selected region (atlas pick)",
         colormap="red", blending="additive", opacity=0.8, visible=False,
@@ -2320,9 +2381,28 @@ def _run_labels(args):
         highlight.visible = bool(voxels)
         return voxels
 
+    def region_colour(structure_id):
+        """The RGBA the atlas-regions layer draws this structure in, read off
+        the layer's own colormap so the bar cannot drift out of step with the
+        picture -- and, because those are atlas.present_ids indices, the same
+        colour tools/atlas_view.py gives it."""
+        try:
+            index = atlas.index_of_id.get(int(structure_id), 0)
+            return list(atlas_regions.colormap.map(np.array([index]))[0])
+        except Exception:               # any colormap napari might grow later
+            return [0.5, 0.5, 0.5, 1.0]
+
+    # The bottom strip, not a side panel: see shared/hover_bar.py for why.
+    # It reads the ATLAS region under the cursor (the layer above), with its
+    # ancestors, which is what a brush label alone cannot tell you -- a group
+    # is "Cerebral cortex" whether the voxel under the cursor is layer 5 of
+    # the motor area or the subiculum.
+    hover = hover_bar.add_hover_bar(
+        viewer, structures, region_colour,
+        resting="Hover over the sample to read the atlas region the registration put there.")
+
     status_label = QLabel("")
     status_label.setWordWrap(True)
-    hover_label = QLabel("Under cursor: -")
 
     def on_partition_changed():
         new_baseline = baseline_for(partition)
@@ -2335,28 +2415,52 @@ def _run_labels(args):
                                  own_voxels, voxel_mm3, args.min_region_mm3, on_partition_changed,
                                  on_highlight=highlight_region)
 
-    def on_mouse_move(_layer, event):
-        data = paint_layer.data
-        if data.ndim != 3:
-            return
-        z, y, x = (int(round(c)) for c in paint_layer.world_to_data(event.position))
-        if not all(0 <= c < n for c, n in zip((z, y, x), data.shape)):
-            return
-        def described(value):
-            group = partition.groups.get(value)
-            if group is not None:
-                return group.name
-            return "background" if not value else f"unassigned label {value}"
+    def _at(layer, position):
+        """The value of `layer` under a world position, or None off the grid.
 
-        label = int(data[z, y, x])
-        was = int(state["baseline"][z, y, x])
-        # Showing what the registration said, not just what is there now, is
-        # what tells a correction apart from a region you have not touched --
-        # the whole plane looks hand-drawn once it becomes a keyframe.
-        note = "" if label == was else f"   (registration said: {described(was)})"
-        hover_label.setText(f"Under cursor: {described(label)} [{label}]{note}")
+        Read out by hand rather than through layer.get_value(): the two
+        volumes here are on DIFFERENT grids (raw stack vs registration), and
+        world_to_data is the transform that maps between them -- the same one
+        napari uses to draw them on top of each other.
+        """
+        index = tuple(int(round(c)) for c in layer.world_to_data(position))
+        if len(index) != layer.data.ndim or not all(
+                0 <= c < n for c, n in zip(index, layer.data.shape)):
+            return None
+        return int(layer.data[index])
 
-    paint_layer.mouse_move_callbacks.append(on_mouse_move)
+    def described(value):
+        group = partition.groups.get(value)
+        if group is not None:
+            return group.name
+        return "background" if not value else f"unassigned label {value}"
+
+    def on_mouse_move(_viewer, event):
+        index = _at(atlas_regions, event.position)
+        # Back to an ontology id, because index 0 is not a synonym for
+        # background: present_ids is just what the annotation contains,
+        # sorted, and it only starts with 0 because real annotations have
+        # background voxels in them. The id is what says "no region".
+        sid = 0 if index is None or index >= len(atlas.present_ids) else \
+            int(atlas.present_ids[index])
+        label = _at(paint_layer, event.position)
+        was = _at(reference, event.position)
+        # What the registration SAID, not just what is there now, is what
+        # tells a correction apart from a region you have not touched -- the
+        # whole plane looks hand-drawn once it becomes a keyframe. Only when
+        # they differ: on every other voxel it is noise, and it rides at the
+        # deep end of the chain, where fit_ancestry_line never folds it away.
+        extra = ()
+        if label is not None and was is not None and label != was:
+            extra = (f"REPAINTED as {described(label)} [{label}], was {described(was)}",)
+        hover.show(None if index is None else sid, extra)
+
+    # On the VIEWER, not on the paint layer: napari delivers layer mouse
+    # callbacks to the active layer only, so a layer-level callback goes
+    # quiet the moment the selection moves to any of the other four layers
+    # here (and it starts out on whichever was added last). That is why the
+    # old "Under cursor" panel showed nothing.
+    viewer.mouse_move_callbacks.append(on_mouse_move)
 
     def describe():
         planes = sorted(plane_keyframes(paint_layer.data, state["baseline"]))
@@ -2365,7 +2469,10 @@ def _run_labels(args):
                 f"Planes that differ from the registration so far ({len(planes)}): {planes}\n"
                 "Correct a plane anywhere and the WHOLE plane becomes a keyframe -- every\n"
                 "region on it, not just what you repainted. Planes between two keyframes\n"
-                "are interpolated; planes outside them stay empty in the guide.")
+                "are interpolated; planes outside them stay empty in the guide.\n"
+                "The bar along the bottom names the atlas region under the cursor and its\n"
+                "ancestors; tick 'atlas regions (all, read-only)' in the layer list to see\n"
+                "every region the registration produced, not just the brush labels.")
 
     status_label.setText(describe())
 
@@ -2445,10 +2552,6 @@ def _run_labels(args):
         print(msg)
         panel.refresh()
 
-    dock = QWidget()
-    QVBoxLayout(dock).addWidget(hover_label)
-    ontology_tree_ui.shrinkable(dock)
-    hover_dock = viewer.window.add_dock_widget(dock, area="right", name="Under cursor")
     export_dock = _make_export_dock(viewer, status_label, export, "Export Guide + Atlas",
                                     "Registration Correction Export")
     relabel_dock = _add_relabel_panel(
@@ -2456,9 +2559,13 @@ def _run_labels(args):
             f"Bulk relabel {src} -> {dst} touched every plane it appears on -- each of those is "
             f"now a keyframe.\n" + describe()))
     erase_dock = _add_erase_panel(viewer, paint_layer)
-    display_dock = _add_display_panel(viewer, [paint_layer, reference])
+    display_dock = _add_display_panel(viewer, [paint_layer, reference, atlas_regions])
+    # The brush layer selected, not whichever was added last: napari hands the
+    # keyboard and the paint tools to the ACTIVE layer, and this window opens
+    # with five of them.
+    viewer.layers.selection = {paint_layer}
     _tab_the_panels(viewer, left=[panel.dock],
-                    right=[export_dock, hover_dock, relabel_dock, erase_dock, display_dock])
+                    right=[export_dock, relabel_dock, erase_dock, display_dock])
 
 
 # =====================================================================================

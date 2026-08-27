@@ -4,8 +4,9 @@ A read-only reference viewer -- three synced ortho panes (grayscale template,
 full annotation in colour, and whatever the ontology tree currently selects),
 plus an ontology panel to pick one or several regions at once (their union
 highlighted together -- see _add_region_panel) and a wide hover bar along the
-bottom (_add_hover_bar) reading off the deepest levels of the ancestor chain
-of whatever the mouse is over, in that region's own atlas colour. Nothing here writes
+bottom (shared/hover_bar.py, wired up by _add_hover_bar) reading off the
+deepest levels of the ancestor chain of whatever the mouse is over, in that
+region's own atlas colour. Nothing here writes
 anything or registers to anything; it exists purely so you can look at an
 atlas and understand its ontology.
 
@@ -70,6 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shared import atlas_reference   # GUI-free atlas loading + ontology math
 from shared import local_config      # configs/<tool>.yaml
 from shared import ontology_tree_ui  # the shared Qt ontology tree widget
+from shared import hover_bar         # the shared bottom 'region under cursor' bar
 
 # napari/PyQt5 are imported lazily by _import_gui(), for the same reason
 # paint_mask.py does it: --selftest (pure numpy, no window) should run
@@ -171,22 +173,6 @@ _ORTHO_DOCK_HEIGHT = 300
 # dorsal part, layer 6a" and friends), which is most of a screen wide.
 _REGION_DOCK_WIDTH = 340
 _REGION_NAME_COLUMN_WIDTH = 260
-
-# The hover bar along the bottom (_add_hover_bar): its STARTING height in px
-# (draggable afterwards, like every other dock here), the type size that
-# height corresponds to, and how many ontology levels it will show at most
-# before it starts folding the shallow end away. Dragging the bar taller or
-# shorter scales the type with it, between the two limits -- a one-line bar
-# has nothing else to do with the height, and "make the text bigger" is the
-# reason to want a taller one.
-_HOVER_BAR_HEIGHT = 64
-_HOVER_BAR_MIN_HEIGHT = 26
-_HOVER_BAR_FONT_PT = 15
-_HOVER_BAR_FONT_PT_RANGE = (8, 36)
-_HOVER_BAR_MAX_LEVELS = 6
-_HOVER_BAR_PADDING_PX = 14
-_HOVER_SEPARATOR = "  \u203a  "
-_HOVER_ELLIPSIS = "\u2026"
 
 # How near a cut line a press has to land to grab it and start aiming that
 # plane instead of panning the camera (see grabbed_cut_line). Screen pixels,
@@ -1981,264 +1967,53 @@ def _add_sample_panel(viewer, win):
                            offset_boxes=offset_boxes, scale_box=scale_box)
 
 
-def ancestry_labels(structures, structure_id):
-    """The root -> voxel chain of `structure_id`, one short label per level.
-
-    The same chain format_ancestry() renders as an indented block, flattened
-    to a list for the one-line hover bar: no indent, no markers, just the
-    names (with acronyms, which are what stays recognisable when a name is
-    long) in ontology order, shallowest first.
-    """
-    info = structures.get(structure_id)
-    if info is None:
-        return [f"id {structure_id} (not in the ontology)"]
-    labels = []
-    for sid in info["structure_id_path"]:
-        node = structures.get(sid)
-        if node is None:
-            labels.append(f"[{sid}] ?")
-            continue
-        acronym = node.get("acronym")
-        labels.append(f"{node['name']} ({acronym})" if acronym else node["name"])
-    return labels
-
-
-def render_ancestry_line(labels, folded):
-    """`labels` joined into one bar line, with a leading ellipsis iff levels
-    above them were folded away."""
-    line = _HOVER_SEPARATOR.join(labels)
-    return f"{_HOVER_ELLIPSIS}{_HOVER_SEPARATOR}{line}" if folded else line
-
-
-def fit_ancestry_line(labels, fits, max_levels=_HOVER_BAR_MAX_LEVELS):
-    """The DEEPEST levels of `labels` (root -> leaf) that `fits` accepts, as
-    one line.
-
-    The bar is one row across the window, so which levels get dropped when
-    the chain is too long has to be decided rather than left to clipping. The
-    deep end is the useful end -- the voxel's own region is the level the
-    annotation actually stores, and the levels just above it are what say
-    which structure it belongs to -- so the chain is kept from the leaf
-    backwards and folded away from the SHALLOW (root) end, behind a leading
-    ellipsis. The voxel's own region always survives, even when it alone is
-    too wide to fit.
-
-    `fits` is a predicate on the rendered string, which keeps the decision
-    testable without a window: the GUI passes "QFontMetrics says this is
-    narrower than the bar", the selftest passes a character count.
-    """
-    labels = [str(label) for label in labels if str(label)]
-    if not labels:
-        return ""
-    kept = labels[-max_levels:] if max_levels else list(labels)
-    folded = len(labels) - len(kept)
-    line = render_ancestry_line(kept, folded)
-    while len(kept) > 1 and not fits(line):
-        kept, folded = kept[1:], folded + 1
-        line = render_ancestry_line(kept, folded)
-    return line
-
-
-def hover_bar_font_pt(height,
-                      reference=(_HOVER_BAR_HEIGHT, _HOVER_BAR_FONT_PT),
-                      limits=_HOVER_BAR_FONT_PT_RANGE):
-    """Type size in points for a bar `height` px tall.
-
-    Straight proportion off the bar's default height/size pair, clamped: the
-    bar holds ONE line, so a taller bar is only worth anything if the line
-    grows with it, and a shorter one has to give the line back or it clips.
-    The clamp keeps a dock dragged to either extreme legible rather than
-    microscopic or absurd.
-    """
-    ref_height, ref_pt = reference
-    lo, hi = limits
-    scaled = int(round(ref_pt * float(height) / float(ref_height)))
-    return max(lo, min(hi, scaled))
-
-
-def hover_bar_colours(rgba):
-    """(background, foreground) CSS colours for a bar painted in one label's
-    own atlas colour.
-
-    The background is exactly the RGB napari draws that label with, so the
-    bar and the voxel under the cursor are visibly the same region. The text
-    colour is then forced to whichever of near-black/white the background can
-    actually carry -- the annotation colormap spans everything from dark
-    navy to pale yellow, and one fixed text colour is unreadable on half of
-    it. Fully transparent (i.e. background label 0) gets a neutral strip.
-    """
-    rgba = [float(v) for v in rgba]
-    if len(rgba) > 3 and rgba[3] <= 0.0:
-        return "#20232a", "#c8ccd4"
-    r, g, b = (min(max(v, 0.0), 1.0) for v in rgba[:3])
-    background = "#%02x%02x%02x" % tuple(int(round(v * 255)) for v in (r, g, b))
-    # Rec. 709 luminance: how bright the colour actually looks, not its mean.
-    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    return background, ("#101010" if luminance > 0.5 else "#ffffff")
-
-
 def _add_hover_bar(viewer, atlas, panes, below=None):
-    """One wide strip along the BOTTOM of the window: the region under the
-    cursor, in large type, painted in that region's own atlas colour.
+    """The shared bottom bar (shared/hover_bar.py), wired to these panes.
 
-    This replaces the old right-hand "Region hierarchy" dock, which showed
-    the whole root->leaf chain as an indented block. The chain is still what
-    a voxel's single label is worth reading against (the annotation stores
-    something like "layer 5 of primary motor area" and the level you care
-    about is one of its ancestors), but a tall panel on the right cost a
-    column of window width permanently and put the text as far from the
-    cursor as it could get. A bar instead: the DEEPEST few levels only
-    (fit_ancestry_line folds the rest away from the root end when the line
-    does not fit), big enough to read without looking away from the atlas,
-    and colour-matched to the annotation layer so the bar and the voxel agree
-    at a glance.
+    This replaced the old right-hand "Region hierarchy" dock; the module's
+    docstring says why a strip along the bottom beats a column on the right.
+    All that is left here is the wiring: what the cursor is over, and what
+    colour this window is drawing it in.
 
-    `below` is the ortho-views dock, if there is one: the bar is split
-    beneath it so it spans the whole width at the very bottom rather than
-    being parked beside the ortho panes.
+    `below` is the ortho-views dock, so the bar is split beneath it and spans
+    the whole width at the very bottom rather than being parked beside the
+    ortho panes.
 
-    Both the bar's width and its HEIGHT are the user's to drag, like every
-    other dock here: the width decides how many levels fit and the height
-    decides the type size (hover_bar_font_pt).
-
-    Returns SimpleNamespace(label=, show=, dock=) so the behaviour is
-    testable without synthesising Qt mouse events: `show` takes a compact
-    index and is the whole of what the mouse callbacks do.
+    Returns hover_bar.add_hover_bar's handle -- SimpleNamespace(label=,
+    show=, dock=) -- so the behaviour is testable without synthesising Qt
+    mouse events: `show` takes an ontology id and is the whole of what the
+    mouse callbacks do.
     """
-    resting = "Hover over the atlas to read the region under the cursor."
-
-    class HoverBar(QLabel):
-        """A QLabel that re-fits itself whenever it is resized: how many
-        levels fit is a function of the bar's width (so narrowing the window
-        folds levels away rather than clipping them) and the type size is a
-        function of its height (so dragging the dock taller enlarges the
-        line instead of padding it with empty colour).
-
-        It also REMEMBERS the height it was last given, and reports it as its
-        size hint. QMainWindow re-divides a dock area on every relayout --
-        every window resize, every other dock that opens -- handing each dock
-        what its contents ask for, so a one-line label whose hint is one line
-        tall gets squashed straight back to the minimum and the height the
-        user dragged the splitter to is lost. Hinting the current height
-        makes that redistribution a no-op instead.
-        """
-
-        def __init__(self, text):
-            super().__init__(text)
-            self._height = _HOVER_BAR_HEIGHT
-
-        def sizeHint(self):
-            return QSize(super().sizeHint().width(), self._height)
-
-        def resizeEvent(self, event):
-            super().resizeEvent(event)
-            if self.height() >= _HOVER_BAR_MIN_HEIGHT:
-                self._height = self.height()
-            render()
-
-    bar = HoverBar(resting)
-    bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-    bar.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    # No word wrap and no minimum width: the line is fitted to the bar by
-    # hand (see render), and a wrapping label would drive the window's
-    # minimum height instead -- see ontology_tree_ui.scrollable.
-    bar.setWordWrap(False)
-    bar.setMinimumWidth(1)
-    # A floor, and no ceiling: the splitter above the bar is then draggable
-    # in both directions, which is the whole point of scaling the type with
-    # the height. The floor is explicit rather than left to the label's own
-    # minimumSizeHint so that neither the text nor the stylesheet padding can
-    # push the dock's minimum height back up, the way the panel captions used
-    # to push its width (see _shrinkable).
-    bar.setMinimumHeight(_HOVER_BAR_MIN_HEIGHT)
-
-    def bar_font():
-        """The font the line is drawn in: this bar's height, in points.
-
-        Built by hand rather than read back off the widget because
-        `bar.font()` is not the last word here -- napari sets a font-size on
-        every QLabel from its APPLICATION stylesheet, which in Qt beats
-        setFont() outright. The size therefore has to be written into the
-        bar's OWN stylesheet (a widget stylesheet beats the application's)
-        by paint(), and measured from a QFont assembled to match.
-        """
-        font = QFont(bar.font())
-        font.setPointSize(hover_bar_font_pt(bar.height()))
-        font.setBold(True)
-        return font
-
-    def paint(background, foreground, point_size):
-        style = (f"background: {background}; color: {foreground}; "
-                 f"padding: 0px {_HOVER_BAR_PADDING_PX}px; "
-                 f"font-size: {point_size}pt; font-weight: bold;")
-        # Re-applying an identical stylesheet still re-polishes the widget,
-        # which can resize it, which lands back here: only write on a change.
-        if style != bar.styleSheet():
-            bar.setStyleSheet(style)
-
-    def colour_of(compact_index):
-        """The RGBA napari paints this compact label with, straight out of
-        the annotation layer's own colormap -- so the bar cannot drift out of
+    def colour_of(structure_id):
+        """The RGBA napari paints this region with, straight out of the
+        annotation layer's own colormap -- so the bar cannot drift out of
         step with the picture, whatever colormap the layer ends up on."""
         try:
             layer = panes[0].layers.annotation
-            return list(layer.colormap.map(np.array([compact_index]))[0])
+            index = atlas.index_of_id.get(int(structure_id), 0)
+            return list(layer.colormap.map(np.array([index]))[0])
         except Exception:               # any colormap napari might grow later
             return [0.5, 0.5, 0.5, 1.0]
 
-    # mouse_move fires continuously; re-rendering the same chain on every
-    # pixel of travel is pure waste, and the flicker is visible.
-    last = {"index": -1}
-
-    def render():
-        index = last["index"]
-        font = bar_font()
-        if index <= 0:
-            neutral = hover_bar_colours([0.0, 0.0, 0.0, 0.0])
-            paint(*neutral, font.pointSize())
-            bar.setText(resting if index < 0 else "(background -- no region)")
-            return
-        sid = int(atlas.present_ids[index])
-        metrics = QFontMetrics(font)
-        room = max(bar.width() - 2 * _HOVER_BAR_PADDING_PX - 4, 40)
-        bar.setText(fit_ancestry_line(
-            ancestry_labels(atlas.structures, sid),
-            lambda text: metrics.horizontalAdvance(text) <= room))
-        paint(*hover_bar_colours(colour_of(index)), font.pointSize())
-
-    def show(compact_index):
-        if compact_index is None:
-            compact_index = 0
-        compact_index = int(compact_index)
-        if compact_index == last["index"]:
-            return
-        last["index"] = compact_index
-        render()
+    bar = hover_bar.add_hover_bar(
+        viewer, atlas.structures, colour_of, below=below,
+        resting="Hover over the atlas to read the region under the cursor.")
 
     def watcher(pane):
         def on_move(_model, event):
             # The annotation layer is a 2D reslice now, so the value under the
             # cursor is a plain lookup in it -- no view direction, no slider
-            # axis to reconstruct.
-            show(pane.layers.annotation.get_value(event.position, world=True))
+            # axis to reconstruct. It holds COMPACT indices (see
+            # atlas_reference._compact_annotation), which the bar knows
+            # nothing about, so they are mapped back to ontology ids here.
+            index = pane.layers.annotation.get_value(event.position, world=True)
+            index = 0 if index is None else int(index)
+            bar.show(int(atlas.present_ids[index]) if index > 0 else 0)
         return on_move
 
     for pane in panes:
         pane.model.mouse_move_callbacks.append(watcher(pane))
-
-    render()
-    dock = viewer.window.add_dock_widget(bar, area="bottom", name="Region under cursor")
-    qt_window = viewer.window._qt_window
-    if below is not None:
-        # addDockWidget would put the bar BESIDE the ortho views (Qt fills a
-        # dock area left to right); splitting it off vertically is what makes
-        # it a full-width strip under everything.
-        qt_window.splitDockWidget(below, dock, Qt.Vertical)
-    # A starting height only: the bar is one line, but it is a draggable
-    # dock like the rest, and the line's type size follows whatever height
-    # it is dragged to.
-    qt_window.resizeDocks([dock], [_HOVER_BAR_HEIGHT], Qt.Vertical)
-    return SimpleNamespace(label=bar, show=show, dock=dock)
+    return bar
 
 
 def _add_region_panel(viewer, atlas, win):
@@ -2732,51 +2507,11 @@ def selftest_pane_axes():
 
 def selftest_hover_bar_line():
     print("11. hover bar: keeps the deepest levels, folds the shallow end away")
-    labels = ["root", "grey matter", "cerebrum", "cortex", "motor area", "layer 5"]
-
-    # Room for everything: no ellipsis, ontology order preserved.
-    line = fit_ancestry_line(labels, lambda _t: True)
-    assert _HOVER_ELLIPSIS not in line, line
-    assert line.split(_HOVER_SEPARATOR) == labels, line
-
-    # Narrower and narrower bars drop shallow levels first, and the voxel's
-    # own region survives every one of them.
-    seen = set()
-    for room in (200, 60, 40, 25, 10, 1):
-        line = fit_ancestry_line(labels, lambda text: len(text) <= room)
-        assert line.endswith("layer 5"), (room, line)
-        parts = [p for p in line.split(_HOVER_SEPARATOR) if p != _HOVER_ELLIPSIS]
-        # Whatever survives is a contiguous DEEP tail of the chain.
-        assert labels[-len(parts):] == parts, (room, line)
-        assert (_HOVER_ELLIPSIS in line) == (len(parts) < len(labels)), (room, line)
-        if len(line) > room:
-            # The only line allowed to overflow is the last level on its own.
-            assert parts == labels[-1:], (room, line)
-        seen.add(len(parts))
-    assert len(seen) > 1, seen              # the bar really does fold, not just clip
-
-    # max_levels caps the chain even when the bar is infinitely wide.
-    capped = fit_ancestry_line(labels, lambda _t: True, max_levels=2)
-    assert capped == render_ancestry_line(labels[-2:], 4), capped
-    assert fit_ancestry_line([], lambda _t: True) == ""
-
-    # The strip is painted the label's own colour, with text that survives it.
-    for rgba, expected_text in (([0.05, 0.05, 0.2, 1.0], "#ffffff"),
-                                ([0.9, 0.95, 0.4, 1.0], "#101010")):
-        background, foreground = hover_bar_colours(rgba)
-        assert background == "#%02x%02x%02x" % tuple(
-            int(round(v * 255)) for v in rgba[:3]), background
-        assert foreground == expected_text, (rgba, foreground)
-    assert hover_bar_colours([0.0, 0.0, 0.0, 0.0])[0] == "#20232a"
-
-    # Height is a size the user drags, not a constant: the type follows it,
-    # monotonically, and stays legible at both extremes.
-    lo, hi = _HOVER_BAR_FONT_PT_RANGE
-    assert hover_bar_font_pt(_HOVER_BAR_HEIGHT) == _HOVER_BAR_FONT_PT
-    sizes = [hover_bar_font_pt(h) for h in (10, 30, 64, 120, 400)]
-    assert sizes == sorted(sizes), sizes
-    assert sizes[0] == lo and sizes[-1] == hi, sizes
-    assert all(lo <= pt <= hi for pt in sizes), sizes
+    # The bar itself lives in shared/hover_bar.py now (paint_mask's labels
+    # mode grew the same strip); this keeps it in THIS tool's selftest run,
+    # because this is the tool whose window it was built for.
+    hover_bar.selftest_ancestry_line()
+    hover_bar.selftest_ancestry_labels()
     print("   ok")
 
 
