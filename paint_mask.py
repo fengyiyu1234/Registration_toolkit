@@ -68,7 +68,14 @@ blob rather than something that needs a meaningful value on every plane.
     only way a high-level node means anything, since the annotation's own
     labels sit at ontology depths 2-12 and a depth-3 node owns no voxels
     under its own id. The export records the ontology IDS (see
-    write_guide_sidecars for why ids rather than names).
+    write_guide_sidecars for why ids rather than names). The tree's top
+    entry, "damage / no atlas counterpart" (DAMAGE_ID), is the one
+    pseudo-region: assign it to a label painted over sample tissue the
+    atlas cannot match (e.g. contralateral tissue past the midline on a
+    hemisphere sample) and the export records that label under the
+    sidecar's damage_labels key -- the pipeline excludes those voxels
+    from the registration metric (mask.guide_regions.damage_labels)
+    instead of building a guide pair.
 
     This panel only picks and assigns -- it draws nothing. To actually SEE
     the atlas (three synced ortho panes, a region highlighted among its
@@ -103,9 +110,11 @@ blob rather than something that needs a meaningful value on every plane.
     section: click a header to open it, and it stays open while you use it.
     They were four tabbed docks; each is a handful of controls, so tabs meant
     one small panel on screen and three hidden behind labels that had to be
-    remembered. The left side is also where napari's own layer list and layer
-    controls live, and it is a TAB BAR (see _tab_the_panels) so those do not
-    stack into slivers.
+    remembered. The left side is also where napari's own layer controls
+    live, tabbed together with this panel (see _tab_the_panels) so the two
+    do not stack into slivers; napari's layer list sits stacked below that
+    tab group instead of inside it, since it is what you check after
+    painting and should not need a tab click to see.
 
   A "Relabel" section: click-to-fill a single already-painted blob into
     another label, or renumber one label across the whole volume. A bulk
@@ -309,6 +318,9 @@ def _load_local_config(cli_path=None):
         existing_mask_path=cfg.get("existing_mask_path") or None,
         region_labels=_normalize_region_labels(cfg.get("region_labels") or {}),
         region_ids=_normalize_region_ids(cfg.get("region_ids") or {}),
+        damage_labels=_normalize_damage_labels(
+            cfg.get("damage_labels") or [],
+            cfg.get("region_labels") or {}, cfg.get("region_ids") or {}),
         atlas=atlas_reference.atlas_reference_config(cfg),
         # mode: labels only -- see the "painting on a registration result"
         # section of the module docstring.
@@ -404,6 +416,25 @@ def _normalize_region_ids(raw):
     GUI's ontology picker rather than by hand; ids beat names downstream
     because they are matched exactly instead of as substrings."""
     return _normalize_label_map(raw, "region_ids", int, "ontology structure id (integer)")
+
+
+def _normalize_damage_labels(raw, region_labels, region_ids):
+    """Sorted brush labels marking tissue with NO atlas counterpart (see
+    DAMAGE_ID). Refuses a label that also has region_labels/region_ids -- the
+    same contradiction mask.guide_regions.damage_labels-vs-atlas_ids is
+    refused on the Registration_ants side."""
+    try:
+        labels = sorted({int(v) for v in raw})
+    except (TypeError, ValueError):
+        raise ValueError(f"damage_labels must be a list of brush labels (integers), got {raw!r}") from None
+    if any(label < 1 for label in labels):
+        raise ValueError("damage_labels must be >= 1 (0 is background)")
+    conflict = set(labels) & {int(k) for k in list(region_labels) + list(region_ids)}
+    if conflict:
+        raise ValueError(
+            f"label(s) {sorted(conflict)} are in damage_labels AND region_labels/region_ids -- "
+            "a label cannot both mark tissue with no atlas counterpart and be paired with a region.")
+    return labels
 
 
 def _normalize_voxel_size_um(raw, key="voxel_size_um"):
@@ -548,7 +579,8 @@ def assignment_rows(assignment, structures):
     exactly when it was assigned regions and they were all removed again;
     see empty_assignment_labels.
     """
-    return [(label, [(sid, structures[sid]["name"]) for sid in assignment[label]])
+    return [(label, [(sid, DAMAGE_NAME if sid == DAMAGE_ID else structures[sid]["name"])
+                     for sid in assignment[label]])
             for label in sorted(assignment)]
 
 
@@ -580,7 +612,8 @@ def display_scale_from_voxel_size(voxel_size_um):
 
 
 def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size_um=None,
-                               atlas_exclude_ids=None, voxel_size_note=None):
+                               atlas_exclude_ids=None, voxel_size_note=None,
+                               damage_labels=None):
     """A ready-to-paste mask.guide_regions block for the pipeline config.
 
     Emitted on export because the ids are the whole point of picking regions
@@ -600,11 +633,14 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
         "  guide_regions:",
         f"    regions_mask: {output_path}",
         f"    voxel_size_um: [{voxel[0]}, {voxel[1]}, {voxel[2]}]   {note}",
-        "    atlas_ids:",
     ]
+    if region_ids:
+        lines.append("    atlas_ids:")
     for label in sorted(region_ids):
         names = ", ".join(region_names.get(label, []))
         lines.append(f"      {label}: {list(region_ids[label])}" + (f"   # {names}" if names else ""))
+    if damage_labels:
+        lines.append(f"    damage_labels: {sorted(damage_labels)}   # {DAMAGE_NAME} -> moving_mask hole")
     if atlas_exclude_ids:
         # Only `mode: labels` emits this, because only a nested partition can
         # produce it -- see label_partition.Partition.atlas_exclude_ids for
@@ -623,17 +659,19 @@ def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size
 
 
 def _tab_the_panels(viewer, left, right):
-    """Fold each side's docks into ONE TAB BAR instead of stacking them down
-    the column.
+    """Fold the left side into a TAB BAR (layer controls + the tools panel)
+    sitting above napari's own layer list, instead of three docks stacked
+    down the column.
 
     napari stacks docks vertically, and stacking is only usable while there
-    are two of them. The left side shares a column with napari's own layer
-    list and layer controls, so opening the window used to mean being handed
-    a pile of slivers, each of which had to be dragged open (at the cost of
-    the ones above it) before it could be used. Tabbed, whichever panel is in
-    front gets the whole column, and the rest are one click away -- and any
-    of them can still be dragged out of the tab bar into its own dock, or
-    floated, if two really are needed at once.
+    are two of them: three slivers each had to be dragged open (at the cost
+    of the ones above it) before it could be used. Layer controls and the
+    tools panel (Export/Relabel/Erase/Display) are tabbed together --
+    whichever is in front gets the whole tab's height, and the other is one
+    click away. The layer list is kept OUT of that tab group and left
+    stacked below it instead: it is what you check after painting to see
+    what layers exist, so it stays visible at all times rather than being a
+    tab someone has to remember to click over to.
 
     The right side is the region panel alone, so `right` is normally one
     entry and this leaves it alone; it stays a list because tabify is exactly
@@ -645,13 +683,16 @@ def _tab_the_panels(viewer, left, right):
     what makes a stacked left column unusable.
 
     Which tab starts in front: this tool's own panel rather than napari's
-    layer list, i.e. the tools panel on the left.
+    layer controls, i.e. the tools panel on the left.
     """
     ontology_tree_ui.free_layer_controls_height(viewer)
     left = [dock for dock in left if dock is not None]
     right = [dock for dock in right if dock is not None]
-    ontology_tree_ui.tabify(viewer, ontology_tree_ui.napari_layer_docks(viewer) + left,
-                            current=left[0] if left else None)
+    layer_controls_dock, layer_list_dock = ontology_tree_ui.napari_layer_docks(viewer)
+    tab_group = [dock for dock in [layer_controls_dock] + left if dock is not None]
+    ontology_tree_ui.tabify(viewer, tab_group, current=left[0] if left else None)
+    if layer_list_dock is not None:
+        layer_list_dock.show()
     ontology_tree_ui.tabify(viewer, right, current=right[0] if right else None)
 
 
@@ -941,6 +982,17 @@ def _erase_controls(viewer, paint_layer):
 # =====================================================================================
 MAX_LABEL = 255           # the exported volume is uint8, as is the paint layer
 
+# Pseudo-"region" for tissue that exists in the sample but has NO counterpart
+# in the atlas (e.g. a sliver of contralateral tissue past the midline on a
+# hemisphere sample). Assignable from the ontology picker like any region, but
+# it is never a real ontology id: the export strips it out of region_ids and
+# records the label under a separate `damage_labels` sidecar key, which the
+# pipeline turns into a moving_mask hole (mask.guide_regions.damage_labels)
+# instead of a guide pair. Negative so it can never collide with an ontology
+# structure id.
+DAMAGE_ID = -1
+DAMAGE_NAME = "damage / no atlas counterpart"
+
 VOXEL_SIZE_UM_NOTE = (
     "Voxel size is NOT in this file's header, by design. The source image (a raw "
     "registration.tif) carries no spacing, so SimpleITK reads spacing=(1,1,1) for it, "
@@ -1109,7 +1161,8 @@ def _output_stem(output_path):
 
 
 def write_guide_sidecars(output_path, image_path, result, region_labels, total_z,
-                         spacing_xyz=None, region_ids=None, atlas_info=None):
+                         spacing_xyz=None, region_ids=None, atlas_info=None,
+                         damage_labels=None):
     """Write the two sidecars next to the exported outline, and return their paths.
 
     <stem>.regions.json is the one that matters for this tool: it is the
@@ -1148,6 +1201,11 @@ def write_guide_sidecars(output_path, image_path, result, region_labels, total_z
     regions_path.write_text(json.dumps({
         "regions": regions,
         "region_ids": {str(lab): list(region_ids[lab]) for lab in sorted(region_ids)},
+        # Labels marked as tissue with NO atlas counterpart (DAMAGE_NAME in
+        # the GUI). Deliberately not in region_ids/regions: they carry no
+        # ontology id, and the pipeline reads this key as a fallback for
+        # mask.guide_regions.damage_labels (a moving_mask hole).
+        "damage_labels": sorted(int(v) for v in (damage_labels or [])),
         "annotated_slices": {str(lab): planes
                              for lab, planes in sorted(result.slices_by_label.items())},
         "image_path": str(image_path),
@@ -1225,6 +1283,7 @@ def load_guide_resume(existing_path, expected_shape):
         slices_by_label=slices_by_label,
         region_ids=_normalize_region_ids(meta.get("region_ids") or {}),
         region_labels=_normalize_region_labels(meta.get("regions") or {}),
+        damage_labels=sorted(int(v) for v in meta.get("damage_labels") or []),
         sidecar=sidecar,
     )
 
@@ -1262,7 +1321,7 @@ def _region_legend(region_labels):
     return f"Brush label -> brain region:\n{lines}\n"
 
 
-def _seed_assignment(region_labels, region_ids, structures):
+def _seed_assignment(region_labels, region_ids, structures, damage_labels=()):
     """Pre-fill the GUI assignment from the config.
 
     region_ids is taken as-is. Names from region_labels are resolved to ids
@@ -1271,7 +1330,20 @@ def _seed_assignment(region_labels, region_ids, structures):
     guessing on the operator's behalf would reintroduce it. A name that
     doesn't resolve is reported, not silently dropped, and stays usable as a
     name-only entry.
+
+    damage_labels get the DAMAGE_ID sentinel instead of ontology ids; a label
+    listed there AND carrying region ids/names is a config contradiction
+    (mirrors the pipeline's damage_labels-vs-atlas_ids refusal) and raises.
     """
+    damage_labels = {int(v) for v in damage_labels}
+    conflict = damage_labels & {lab for lab in set(region_labels) | set(region_ids)
+                                if region_ids.get(lab) or region_labels.get(lab)}
+    if conflict:
+        raise ValueError(
+            f"label(s) {sorted(conflict)} are listed under damage_labels AND have "
+            "region_ids/region_labels entries -- a label cannot both mark tissue with no "
+            "atlas counterpart and be paired with an atlas region.")
+
     by_name = {}
     for sid, info in structures.items():
         by_name.setdefault(info["name"].strip().lower(), []).append(sid)
@@ -1287,6 +1359,8 @@ def _seed_assignment(region_labels, region_ids, structures):
                 unresolved.append((label, name, len(matches)))
         if ids:
             assignment[label] = ids
+    for label in sorted(damage_labels):
+        assignment[label] = [DAMAGE_ID]
     return assignment, unresolved
 
 
@@ -1347,6 +1421,19 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
     # dock. A floor would only fight the splitter handle.
     items = ontology_tree_ui.populate_ontology_tree(tree, atlas.structures, atlas.node_voxels)
 
+    # Pseudo-entry, always at the top and exempt from the voxel/name filters
+    # (it is not in `items`, so refresh_filter never touches it): tissue that
+    # exists in the sample but has no counterpart in the atlas (e.g. past the
+    # midline on a hemisphere sample). Exports as mask.guide_regions.
+    # damage_labels -- a moving_mask hole -- never as a guide pair, so it
+    # deliberately carries no ontology id.
+    damage_item = QTreeWidgetItem([f"— {DAMAGE_NAME} —", "", str(DAMAGE_ID)])
+    damage_item.setData(0, Qt.UserRole, DAMAGE_ID)
+    damage_item.setToolTip(0, "Sample tissue the atlas cannot match (e.g. contralateral tissue "
+                              "past the midline). Excluded from the registration metric via "
+                              "mask.guide_regions.damage_labels instead of being guided.")
+    tree.insertTopLevelItem(0, damage_item)
+
     label_spin = QSpinBox()
     label_spin.setObjectName("ontology_brush_label")
     label_spin.setRange(1, MAX_LABEL)
@@ -1387,6 +1474,11 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
         sid = selected_id()
         if sid is None:
             return
+        if sid == DAMAGE_ID:
+            picker_status.setText(
+                f"{DAMAGE_NAME}: for sample tissue the atlas cannot match. Exports as "
+                "damage_labels (excluded from the metric), not as a guide region.")
+            return
         info = atlas.structures[sid]
         voxels = atlas.node_voxels.get(sid, 0)
         if voxels:
@@ -1402,12 +1494,24 @@ def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
         if sid is None:
             picker_status.setText("Select a region in the tree first.")
             return
-        if not atlas.node_voxels.get(sid):
+        label = label_spin.value()
+        # A label is either damage or guided, never both -- the same refusal
+        # the pipeline config makes for damage_labels vs atlas_ids.
+        if sid == DAMAGE_ID and any(s != DAMAGE_ID for s in assignment.get(label, [])):
+            picker_status.setText(
+                f"label {label} already carries atlas region(s) -- remove them first; a label "
+                f"cannot be both a guide region and {DAMAGE_NAME}.")
+            return
+        if sid != DAMAGE_ID and DAMAGE_ID in assignment.get(label, []):
+            picker_status.setText(
+                f"label {label} is marked {DAMAGE_NAME} -- remove that first; a label "
+                f"cannot be both a guide region and damage.")
+            return
+        if sid != DAMAGE_ID and not atlas.node_voxels.get(sid):
             picker_status.setText(
                 f"{atlas.structures[sid]['name']} has no voxels in this annotation -- "
                 f"refusing to assign it.")
             return
-        label = label_spin.value()
         entries = assignment.setdefault(label, [])
         if sid not in entries:
             entries.append(sid)
@@ -1610,7 +1714,9 @@ def _run_guide(args):
         # than any config convenience.
         seed_labels = resume.region_labels if resume is not None else args.region_labels
         seed_ids = resume.region_ids if resume is not None else args.region_ids
-        assignment, unresolved = _seed_assignment(seed_labels, seed_ids, atlas.structures)
+        seed_damage = resume.damage_labels if resume is not None else args.damage_labels
+        assignment, unresolved = _seed_assignment(seed_labels, seed_ids, atlas.structures,
+                                                  damage_labels=seed_damage)
         for label, name, n in unresolved:
             print(f"WARNING: region_labels label {label}: {name!r} matches "
                   f"{'several' if n else 'no'} structures in the ontology ({n}), so it was not "
@@ -1643,7 +1749,9 @@ def _run_guide(args):
         # what was actually looked at); the config's region_labels are the
         # fallback for the no-atlas case.
         if atlas is not None:
-            region_ids = {lab: list(ids) for lab, ids in assignment.items() if ids}
+            damage_labels = sorted(lab for lab, ids in assignment.items() if DAMAGE_ID in ids)
+            region_ids = {lab: list(ids) for lab, ids in assignment.items()
+                          if ids and DAMAGE_ID not in ids}
             region_labels = {lab: [atlas.structures[sid]["name"] for sid in ids]
                              for lab, ids in region_ids.items()}
             atlas_info = {
@@ -1654,6 +1762,7 @@ def _run_guide(args):
             }
         else:
             region_ids, region_labels, atlas_info = dict(args.region_ids), args.region_labels, None
+            damage_labels = list(args.damage_labels)
 
         out_sitk = sitk.GetImageFromArray(result.volume)
         out_sitk.CopyInformation(base_sitk)      # keeps the source's (1,1,1) -- see module docstring
@@ -1661,20 +1770,25 @@ def _run_guide(args):
         regions_path, slices_path = write_guide_sidecars(
             args.output_path, args.image_path, result, region_labels,
             arr.shape[0], spacing_xyz=base_sitk.GetSpacing(),
-            region_ids=region_ids, atlas_info=atlas_info)
+            region_ids=region_ids, atlas_info=atlas_info, damage_labels=damage_labels)
 
+        # Damage labels are folded into the naming only for the printout and
+        # the warnings -- never into region_labels itself, which feeds the
+        # sidecar's `regions` key and would round-trip DAMAGE_NAME into a
+        # (bogus) ontology-name lookup on resume.
+        display_labels = dict(region_labels, **{lab: [DAMAGE_NAME] for lab in damage_labels})
         lines = [f"Wrote {args.output_path}", f"Wrote {regions_path}", f"Wrote {slices_path}"]
         for label in sorted(result.slices_by_label):
             lines.append(
-                f"  label {label} ({_label_name(label, region_labels)}): "
+                f"  label {label} ({_label_name(label, display_labels)}): "
                 f"{len(result.slices_by_label[label])} painted planes "
                 f"{result.slices_by_label[label]} -> {result.voxels_by_label[label]} voxels")
-        lines += [f"WARNING: {w}" for w in guide_export_warnings(result, region_labels)]
-        if region_ids:
+        lines += [f"WARNING: {w}" for w in guide_export_warnings(result, display_labels)]
+        if region_ids or damage_labels:
             lines += ["", "Paste this into the pipeline config:", "",
                       guide_regions_yaml_snippet(
                           region_ids, region_labels, args.output_path,
-                          voxel_size_um=args.voxel_size_um)]
+                          voxel_size_um=args.voxel_size_um, damage_labels=damage_labels)]
 
         print("\n".join(lines))
 
@@ -2979,7 +3093,8 @@ def selftest_sidecars(interp, tmp_dir):
         out_path, "/data/s12t/registration.tif", result, region_labels,
         SHAPE[0], spacing_xyz=(1.0, 1.0, 1.0), region_ids=region_ids,
         atlas_info={"annotation_path": "/atlas/P04_annotations.nii.gz",
-                    "ontology_path": "/atlas/DevCCFv1_ontology.json"})
+                    "ontology_path": "/atlas/DevCCFv1_ontology.json"},
+        damage_labels=[9])
 
     assert regions_path.name == "s12t_guide_sample.regions.json", regions_path
     assert slices_path.name == "s12t_guide_sample.annotated_slices.json", slices_path
@@ -2988,6 +3103,9 @@ def selftest_sidecars(interp, tmp_dir):
     assert regions["regions"] == {"1": ["layer 1 of A", "layer 2 of A"],
                                   "2": ["cerebellar hemisphere"]}, regions["regions"]
     assert regions["region_ids"] == {"1": [15751, 15756], "2": [15623]}, regions["region_ids"]
+    # Damage labels live under their own key, never inside regions/region_ids
+    # (they have no ontology id for the pipeline to pair with).
+    assert regions["damage_labels"] == [9], regions["damage_labels"]
     assert regions["annotated_slices"] == {"1": [0, 4, 8], "2": [2, 6]}, regions["annotated_slices"]
     assert regions["image_path"] == "/data/s12t/registration.tif"
     assert regions["atlas"]["ontology_path"].endswith("DevCCFv1_ontology.json"), regions["atlas"]
@@ -2996,10 +3114,11 @@ def selftest_sidecars(interp, tmp_dir):
     # The paste-ready pipeline snippet must carry the IDS (names are a comment
     # only -- two authorities that can disagree is what ids exist to remove).
     snippet = guide_regions_yaml_snippet(region_ids, region_labels, out_path,
-                                         voxel_size_um=[2.6, 2.6, 32.0])
+                                         voxel_size_um=[2.6, 2.6, 32.0], damage_labels=[9])
     parsed = yaml.safe_load(snippet)["mask"]["guide_regions"]
     assert parsed["atlas_ids"] == {1: [15751, 15756], 2: [15623]}, parsed
     assert parsed["voxel_size_um"] == [2.6, 2.6, 32.0], parsed
+    assert parsed["damage_labels"] == [9], parsed
     assert "atlas_names" not in parsed, parsed
 
     # Same key registration_eval.load_region_annotation_hint() reads. Asserted
@@ -3104,6 +3223,12 @@ def selftest_config_normalizers():
     rejects(_normalize_region_labels, {1: "cortex", "1": "cortex"}, "twice")
     rejects(_normalize_region_labels, ["cortex"], "mapping")
 
+    assert _normalize_damage_labels([9, "3", 9], {}, {}) == [3, 9]
+    assert _normalize_damage_labels([], {1: ["cortex"]}, {}) == []
+    rejects(lambda v: _normalize_damage_labels(v, {}, {}), [0], ">= 1")
+    rejects(lambda v: _normalize_damage_labels(v, {}, {}), ["cortex"], "integers")
+    rejects(lambda v: _normalize_damage_labels(v, {9: ["cortex"]}, {}), [9], "cannot both")
+
     assert _normalize_voxel_size_um([2.6, 2.6, 32.0]) == [2.6, 2.6, 32.0]
     assert _normalize_voxel_size_um(None) is None
     rejects(_normalize_voxel_size_um, [2.6, 2.6], "exactly 3 numbers")
@@ -3185,6 +3310,18 @@ def selftest_seed_assignment():
     # guess -- substring/ambiguous matching is exactly what ids exist to avoid.
     assert 2 not in assignment and 3 not in assignment, assignment
     assert sorted((lab, n) for lab, _name, n in unresolved) == [(2, 0), (3, 2)], unresolved
+
+    # damage_labels seed as the sentinel; a label that is both damage and a
+    # region is a contradiction and must refuse, same as the pipeline config.
+    assignment, _ = _seed_assignment(region_labels={}, region_ids={1: [101]},
+                                     structures=structures, damage_labels=[9])
+    assert assignment[9] == [DAMAGE_ID] and assignment[1] == [101], assignment
+    try:
+        _seed_assignment(region_labels={}, region_ids={9: [101]},
+                         structures=structures, damage_labels=[9])
+        raise AssertionError("damage + region on one label must raise")
+    except ValueError:
+        pass
     print("   ok")
 
 
@@ -3204,6 +3341,11 @@ def selftest_assignment_rows():
     # rather than in guide_export_warnings after the export.
     assert empty_assignment_labels(assignment) == [3]
     assert empty_assignment_labels({1: [101]}) == []
+
+    # A damage-marked label has no ontology entry to look up -- the row names
+    # it via the sentinel instead of KeyErroring on structures[-1].
+    rows = assignment_rows({5: [DAMAGE_ID]}, structures)
+    assert rows == [(5, [(DAMAGE_ID, DAMAGE_NAME)])], rows
     print("   ok")
 
 

@@ -35,6 +35,15 @@ common:
 
   region_ids:
 
+  # 【可选】把某几个画笔 label 标成"样本上存在、但图谱里没有对应物的组织"
+  # （比如半脑样本局部越过中线多出的对侧薄片）。GUI 里也可以直接在 ontology
+  # 树顶部选 "damage / no atlas counterpart" 分配给 label，效果一样。
+  # 导出时这些 label 不进 region_ids/guide pair，而是写进 sidecar 的
+  # damage_labels 键；Registration_ants 会自动读它并从配准 metric 里
+  # 挖掉这些体素（等同 mask.guide_regions.damage_labels）。
+  # 同一个 label 不能既是 damage 又配了 region_labels/region_ids。
+  damage_labels:
+
 # =====================================================================================
 # guide —— 只有 mode: guide 读
 # =====================================================================================

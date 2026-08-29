@@ -188,17 +188,17 @@ def scroll_wrap_dock(dock, min_height=48):
 
 
 def napari_layer_docks(viewer):
-    """napari's own 'layer controls' + 'layer list' docks, or [] if this
-    napari does not have them where it used to.
+    """napari's own 'layer controls' and 'layer list' docks, as
+    (controls, list) -- either is None if this napari does not have it
+    where it used to.
 
     Reached through _qt_viewer, which is private, hence the getattr dance:
     every caller uses this for layout polish only, so a napari that moved
     them should cost the polish, not raise on startup.
     """
     qt_viewer = getattr(getattr(viewer, "window", None), "_qt_viewer", None)
-    docks = [getattr(qt_viewer, name, None)
-             for name in ("dockLayerControls", "dockLayerList")]
-    return [dock for dock in docks if dock is not None]
+    return tuple(getattr(qt_viewer, name, None)
+                 for name in ("dockLayerControls", "dockLayerList"))
 
 
 def free_layer_controls_height(viewer, min_height=48):
@@ -211,7 +211,7 @@ def free_layer_controls_height(viewer, min_height=48):
     column, so that floor is subtracted from every other panel sharing the
     left side -- with no way to trade the space back on a laptop screen.
     """
-    docks = napari_layer_docks(viewer)
+    docks = [dock for dock in napari_layer_docks(viewer) if dock is not None]
     for dock in docks:
         scroll_wrap_dock(dock, min_height)
     return docks
