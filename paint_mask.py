@@ -1676,21 +1676,21 @@ def _run_guide(args):
     base_sitk, arr = _read_sitk_array(args.image_path)
 
     prefill = np.zeros(arr.shape, dtype=np.uint8)
-    resume = load_guide_resume(args.existing_mask, arr.shape) if args.existing_mask else None
+    resume = load_guide_resume(args.existing_mask_path, arr.shape) if args.existing_mask_path else None
     if resume is not None:
         prefill = resume.prefill
         planes = sum(len(p) for p in resume.slices_by_label.values())
         print(f"[resume] restored {planes} hand-drawn planes from {resume.sidecar.name} "
               f"({ {lab: p for lab, p in sorted(resume.slices_by_label.items())} }); "
               f"the interpolated planes were dropped -- just keep painting.")
-    elif args.existing_mask:
+    elif args.existing_mask_path:
         # No sidecar: all this can do is binarize, which merges every region
         # into label 1 and treats interpolated planes as hand-drawn. Usable as
         # a rough tracing backdrop, not as a resume.
-        loaded = _load_mask_array(args.existing_mask, arr.shape)
+        loaded = _load_mask_array(args.existing_mask_path, arr.shape)
         if loaded is not None:
             prefill = loaded
-            print(f"WARNING: no .regions.json next to {args.existing_mask}, so it cannot be "
+            print(f"WARNING: no .regions.json next to {args.existing_mask_path}, so it cannot be "
                   f"resumed as keyframes.\n"
                   f"         Pre-filled binarized instead: every region is merged into label 1, "
                   f"and interpolated planes count as hand-drawn.\n"
@@ -1723,7 +1723,7 @@ def _run_guide(args):
                   f"resolved to an id; pick it again in the tree.")
         picker = _add_ontology_picker(viewer, atlas, paint_layer, assignment)
 
-    guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask else ""
+    guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask_path else ""
     header = ("Pick a region in the ontology tree on the left, set a brush label, click\n"
               "Assign to label, then paint the sample with that brush number.\n"
               if atlas else _region_legend(args.region_labels))
@@ -3267,6 +3267,32 @@ def selftest_config_normalizers():
     rejects(lambda cfg: flatten_config_sections(cfg, "guide"),
             {"common": ["image_path"]}, "mapping")
 
+    # Every args.<field> the two mode entry points read must exist on the
+    # namespace parse_config builds. Checked statically because the real call
+    # needs a GUI, an atlas and an image on disk -- so the failure mode is an
+    # AttributeError minutes into a launch, after the atlas has loaded. (That
+    # is exactly how damage_labels shipped broken: it was added to
+    # _load_local_config but not to the hand-listed namespace main() used to
+    # build for _run_guide -- that namespace is gone now, and this keeps the
+    # next field from finding a new way to drift.)
+    import ast
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    provided = {kw.arg for node in ast.walk(module)
+                if isinstance(node, ast.FunctionDef) and node.name == "_load_local_config"
+                for ret in ast.walk(node) if isinstance(ret, ast.Return)
+                for call in ast.walk(ret) if isinstance(call, ast.Call)
+                for kw in call.keywords if kw.arg}
+    assert "image_path" in provided, "_load_local_config's namespace fields were not found"
+    for entry in ("_run_guide", "_run_labels"):
+        read = {n.attr for node in ast.walk(module)
+                if isinstance(node, ast.FunctionDef) and node.name == entry
+                for n in ast.walk(node)
+                if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id == "args"}
+        missing = sorted(read - provided)
+        assert not missing, (f"{entry} reads args.{{{', '.join(missing)}}}, which "
+                             "_load_local_config never sets")
+
     # uint8 export: a brush value the output can't hold must fail loudly.
     try:
         interpolate_labels_separately({300: {0: np.ones((4, 4), bool)}}, (2, 4, 4),
@@ -3608,14 +3634,15 @@ def main():
         return run_selftests()
 
     cfg = _load_local_config(args_cli.config)
+    # Both modes take the parsed config straight through. _run_guide used to
+    # get a hand-listed SimpleNamespace instead (only to rename
+    # existing_mask_path -> existing_mask), which meant every new config field
+    # had to be added in two places -- and a forgotten one is an AttributeError
+    # at GUI launch, after the atlas has already loaded. Not worth the rename.
     if cfg.mode == "labels":
         _run_labels(cfg)
     else:
-        _run_guide(SimpleNamespace(
-            image_path=cfg.image_path, output_path=cfg.output_path,
-            existing_mask=cfg.existing_mask_path,
-            region_labels=cfg.region_labels, region_ids=cfg.region_ids,
-            voxel_size_um=cfg.voxel_size_um, atlas=cfg.atlas))
+        _run_guide(cfg)
 
     napari.run()
     return 0
