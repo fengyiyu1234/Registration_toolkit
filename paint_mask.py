@@ -790,11 +790,12 @@ def _relabel_controls(viewer, paint_layer, on_change=None):
 
       pick + fill: click a blob, it takes the target label. This is napari's
         own FILL mode, exposed as a button because the tool is otherwise a
-        keyboard shortcut people do not find. n_edit_dimensions is forced to
-        1 first: the default would flood-fill across z, and on a sparse
-        keyframe stack the planes are not connected anyway, so a 3D fill
-        either does nothing extra or -- once the interpolated resume of a
-        previous export is loaded -- silently eats neighbouring planes.
+        keyboard shortcut people do not find. n_edit_dimensions is pinned to
+        2 -- the fill spreads across x and y, i.e. the plane on screen, and
+        stops there. 3 would flood across z, which on a sparse keyframe
+        stack either does nothing (the planes are not connected) or --
+        once the interpolated resume of a previous export is loaded --
+        silently eats neighbouring planes.
 
       relabel all: renumber every voxel of one label at once, for when a
         whole region was drawn under the wrong number.
@@ -823,7 +824,9 @@ def _relabel_controls(viewer, paint_layer, on_change=None):
 
     def start_fill():
         # selected_label is what FILL paints with, so set it from `to`.
-        paint_layer.n_edit_dimensions = 1
+        # 2 = the fill spans x and y, the plane on screen. 1 would span only
+        # the last displayed axis, filling a single row of pixels.
+        paint_layer.n_edit_dimensions = 2
         paint_layer.selected_label = int(to_spin.value())
         paint_layer.mode = "fill"
         say(f"Fill mode: click any blob and it becomes label {int(to_spin.value())}. "
@@ -910,12 +913,10 @@ def _erase_controls(viewer, paint_layer):
     0 turns it into an eraser, which is all this panel wires up -- no new
     editing path, so undo/redo and the keyframe bookkeeping are unchanged.
 
-    n_edit_dimensions is forced back to 2 on the way in, for two reasons:
-    polygon painting is 2D-only (Labels._get_polygon_mask_and_bbox raises
-    otherwise) and the Relabel panel's click-to-fill leaves it at 1, so
-    erasing after a fill would otherwise throw. 2 also means the erase stays
-    on the plane you can see -- every other plane is hand-drawn work that a
-    polygon dragged somewhere else must not touch.
+    n_edit_dimensions is set to 2 on the way in: polygon painting is 2D-only
+    (Labels._get_polygon_mask_and_bbox raises otherwise), and 2 also means
+    the erase stays on the plane you can see -- every other plane is
+    hand-drawn work that a polygon dragged somewhere else must not touch.
 
     It erases every label inside the polygon, not just the selected one:
     that is what "eraser" means everywhere else in the tool, and the blob
@@ -953,8 +954,6 @@ def _erase_controls(viewer, paint_layer):
     def back_to_brush():
         viewer.layers.selection = {paint_layer}
         # 2 = napari's default, i.e. the brush paints the plane on screen.
-        # Restored here because the Relabel panel's click-to-fill drops it to
-        # 1 and leaves it there.
         paint_layer.n_edit_dimensions = 2
         paint_layer.selected_label = last_label["value"]
         paint_layer.mode = "paint"
