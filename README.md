@@ -86,6 +86,20 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
   from the atlas annotation volume, so normally only the sample side is
   painted here.
 
+  Both modes also carry a **Reposition** section, for a sample that cracked and
+  has flaps of tissue swung out of place. The flaps are not traced a second
+  time: on the planes where one is open it is already its own connected
+  component, so clicking it grabs it and walks it along z until it stops being
+  separate — which is the hinge, and which is also how far it goes. Pose each
+  one per plane with two drawn segments and four sliders against a live
+  preview — which segment is the source is read off the fragment outline, not
+  off drawing order — and the export writes `<stem>.reposition.json` +
+  `<stem>_fragments.nii.gz` alongside the guide. Point the pipeline config's
+  `sample.reposition_plan` at that JSON and the stack, the outlines, the damage
+  mask and the cell centroids all move together. The transform is in-plane only
+  (translate, rotate, whole-plane z shift) — see
+  `registration_ants/reposition.py` for why out-of-plane rotation is left out.
+
   - `mode: guide` (default) — trace regions by hand on the raw sample, from
     blank planes, and assign each brush number to atlas structures in the
     ontology tree. Sparse keyframes, each label interpolated separately.

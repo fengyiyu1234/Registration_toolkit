@@ -95,6 +95,7 @@ _ONTOLOGY = {"msg": [{
 LEAF_IDS = (315, 1080, 822, 703, 1129)
 
 RAW_SHAPE = (8, 200, 220)          # (z, y, x)
+RAW_UM = [2.6, 2.6, 32.0]          # (x, y, z) microns, as a real raw stack has
 RAW_VOXEL_UM = [2.6, 2.6, 32.0]    # (x, y, z), as the pipeline config states it
 LABELS_SHAPE = (11, 22, 24)
 LABELS_VOXEL_UM = [25.0, 25.0, 25.0]
@@ -213,7 +214,7 @@ def test_guide_mode_window(tmp, inputs):
     # Ontology" dock -- the panel this covers is the one that gets used, and
     # atlas=None quietly skips it.
     pm._run_guide(SimpleNamespace(
-        image_path=str(inputs.raw), output_path=str(out), existing_mask=None,
+        image_path=str(inputs.raw), output_path=str(out), existing_mask_path=None, damage_labels=[],
         region_labels={1: ["Isocortex"]}, region_ids={}, voxel_size_um=None,
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
@@ -222,7 +223,18 @@ def test_guide_mode_window(tmp, inputs):
     viewer = napari.current_viewer()
     try:
         paint = viewer.layers["guide outline (paint here)"]
-        assert [l.name for l in viewer.layers] == ["sample", "guide outline (paint here)"]
+        # The two painting layers come first and in this order; the Reposition
+        # section's three follow, hidden, and are asserted by name rather than
+        # by an exact list so adding a panel layer is not a test edit.
+        names = [l.name for l in viewer.layers]
+        assert names[:2] == ["sample", "guide outline (paint here)"], names
+        assert set(names[2:]) == {pm._REPOSITION_FRAGMENTS_LAYER,
+                                  pm._REPOSITION_SEGMENTS_LAYER,
+                                  pm._REPOSITION_PREVIEW_LAYER}, names
+        assert not any(viewer.layers[n].visible for n in names[2:]), \
+            "reposition layers must start hidden -- most samples never cracked"
+        assert viewer.layers.selection == {viewer.layers["guide outline (paint here)"]}, \
+            "the region brush stays selected, not the fragments layer added after it"
         assert any("Ontology" in k for k in viewer.window._dock_widgets), \
             "the ontology picker did not build its panel"
 
@@ -618,7 +630,7 @@ def test_panels_are_resizable(tmp, inputs):
     # tree included -- it is the deepest widget here and the easiest to pin.
     pm._run_guide(SimpleNamespace(
         image_path=str(inputs.raw), output_path=str(tmp / "widths_guide.nii.gz"),
-        existing_mask=None, region_labels={}, region_ids={}, voxel_size_um=None,
+        existing_mask_path=None, damage_labels=[], region_labels={}, region_ids={}, voxel_size_um=None,
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
             "ontology_path": str(inputs.ontology),
@@ -670,7 +682,7 @@ def test_panels_are_resizable(tmp, inputs):
 def _open_guide(pm, tmp, inputs, atlas_reference, name, **overrides):
     """Guide mode with an atlas, opened on the synthetic inputs."""
     args = dict(
-        image_path=str(inputs.raw), output_path=str(tmp / name), existing_mask=None,
+        image_path=str(inputs.raw), output_path=str(tmp / name), existing_mask_path=None, damage_labels=[],
         region_labels={}, region_ids={}, voxel_size_um=None,
         atlas=atlas_reference.atlas_reference_config({
             "atlas_annotation_path": str(inputs.annotation),
@@ -732,7 +744,7 @@ def test_assignment_panel_drops_one_region(tmp, inputs):
 
 
 def test_panels_are_tabbed_and_short(tmp, inputs):
-    print("8. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
+    print("13. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
     import paint_mask as pm
     from PyQt5.QtWidgets import QScrollArea
     from shared import atlas_reference
@@ -743,13 +755,19 @@ def test_panels_are_tabbed_and_short(tmp, inputs):
         qt_viewer = viewer.window._qt_viewer
         docks = viewer.window._dock_widgets
 
-        # Left: napari's own two docks and this tool's tools panel share one
-        # tab bar.
+        # Left: the layer controls and this tool's tools panel share one tab
+        # bar. The LAYER LIST is deliberately not in it -- _tab_the_panels
+        # keeps it stacked below and always visible, since it is what you
+        # check after painting to see which layers exist. (This assertion
+        # used to demand the opposite and had gone stale against that change.)
         ontology = docks[[k for k in docks if "Ontology" in k][0]]
         left = set(window.tabifiedDockWidgets(qt_viewer.dockLayerControls))
-        assert docks["Export & tools"] in left and qt_viewer.dockLayerList in left, (
+        assert docks["Export & tools"] in left, (
             "the left panels are stacked, not tabbed -- three docks down one column arrive "
             "as slivers")
+        assert qt_viewer.dockLayerList not in left, (
+            "the layer list must stay stacked and visible, not hidden behind a tab")
+        assert qt_viewer.dockLayerList.isVisible(), "the layer list should be shown"
 
         # ...and the region panel is NOT one of them: it owns the right column
         # on its own, which is what the left/right swap was for.
@@ -787,6 +805,345 @@ def test_panels_are_tabbed_and_short(tmp, inputs):
     print("   OK")
 
 
+
+def _viewer_plan(viewer, pm):
+    """The reposition plan the panel currently holds, via the fragments
+    layer's metadata."""
+    return viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER].metadata["reposition_state"].plan()
+
+
+def _reposition_section(pm, viewer):
+    """The Reposition section's widget, and its four named pose controls."""
+    tools = viewer.window._dock_widgets["Export & tools"].widget()
+    headers = {b.text().strip("\u25be\u25b8 "): b
+               for b in tools.findChildren(pm.QPushButton) if b.isCheckable()}
+    assert "REPOSITION" in headers, f"no Reposition section; have {sorted(headers)}"
+    headers["REPOSITION"].setChecked(True)          # a folded section hides its controls
+    boxes = {key: tools.findChild(pm.QDoubleSpinBox, f"reposition_{key}")
+             for key in ("tx", "ty", "rot", "dz", "feather")}
+    boxes["fragment"] = tools.findChild(pm.QSpinBox, "reposition_fragment")
+    boxes["share"] = tools.findChild(pm.QDoubleSpinBox, "reposition_share")
+    missing = [k for k, v in boxes.items() if v is None]
+    assert not missing, f"reposition controls not found: {missing}"
+    return tools, boxes
+
+
+def test_reposition_panel(tmp, inputs):
+    print("8. paint_mask: the Reposition section in guide mode -- pose, keyframe, export, resume...")
+    import paint_mask as pm
+    from shared import atlas_reference
+    from registration_ants import reposition as rp
+
+    out = tmp / "repo.nii.gz"
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name, voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+
+        # Paint fragment 1 on two planes only, then let the panel fill the gap
+        # -- the whole point of keyframed outlines is not tracing every plane.
+        data = frag.data.copy()
+        data[1, 12:22, 12:22] = 1
+        data[5, 12:22, 12:22] = 1
+        frag.data = data
+        _button(tools, "Fill outlines between painted planes").click()
+        assert (frag.data[3] == 1).any(), "planes between the painted ones stayed empty"
+
+        # Pose plane 10, keyframe it; pose plane 14 differently, keyframe that.
+        viewer.dims.set_current_step(0, 1)
+        boxes["tx"].setValue(0.0)
+        boxes["rot"].setValue(0.0)
+        _button(tools, "Set keyframe on this plane").click()
+        viewer.dims.set_current_step(0, 5)
+        boxes["tx"].setValue(50.0)
+        boxes["rot"].setValue(6.0)
+        _button(tools, "Set keyframe on this plane").click()
+
+        plan = _viewer_plan(viewer, pm)
+        assert len(plan["fragments"]) == 1, plan["fragments"]
+        kfs = plan["fragments"][0]["keyframes"]
+        assert [k["z"] for k in kfs] == [1, 5], kfs
+        assert kfs[1]["tx_um"] == 50.0 and kfs[1]["theta_deg"] == 6.0, kfs[1]
+
+        # Scrolling to an in-between plane must show what interpolation will
+        # actually do there, not leave the last edited pose on screen.
+        viewer.dims.set_current_step(0, 3)
+        assert abs(boxes["tx"].value() - 25.0) < 0.05, boxes["tx"].value()
+
+        # The live preview has to build a real plane through the same code the
+        # export uses; this is where a bad affine or translate would throw.
+        preview_box = [c for c in tools.findChildren(pm.QCheckBox)
+                       if "live preview" in c.text()][0]
+        preview_box.setChecked(True)
+        preview = viewer.layers[pm._REPOSITION_PREVIEW_LAYER]
+        assert preview.visible and preview.data.shape[0] == 1, preview.data.shape
+        # It must sit on the plane being viewed, whatever dz says -- napari
+        # renders a layer only at its own world z, so a preview parked on the
+        # target plane is invisible from the one the slider is dragged on.
+        scale_z = viewer.layers["sample"].scale[0]
+        for plane in (2, 4):
+            viewer.dims.set_current_step(0, plane)
+            boxes["dz"].setValue(2)
+            assert abs(preview.translate[0] - plane * scale_z) < 1e-6, \
+                (plane, preview.translate[0], scale_z)
+        boxes["dz"].setValue(0)
+        _button(tools, "Boundary check").click()
+
+        _button(tools, "Export Outline").click()
+    finally:
+        viewer.close()
+
+    stem = pm._output_stem(str(out))
+    plan_path = Path(f"{stem}.reposition.json")
+    fragments_path = Path(f"{stem}_fragments.nii.gz")
+    assert plan_path.exists() and fragments_path.exists(), "reposition export wrote nothing"
+    written = rp.read_plan(plan_path)
+    assert [k["z"] for k in written["fragments"][0]["keyframes"]] == [1, 5], written
+    assert written["labels_path"] == str(fragments_path)
+
+    # Reopening the same output path picks the work back up.
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        resumed = _viewer_plan(viewer, pm)
+        assert [k["z"] for k in resumed["fragments"][0]["keyframes"]] == [1, 5], resumed
+        assert (viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER].data == 1).any(), \
+            "the fragment outlines did not come back"
+    finally:
+        viewer.close()
+
+    # A sample that never cracked must not acquire an empty plan file next to
+    # every guide it exports.
+    clean = tmp / "clean.nii.gz"
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, clean.name)
+    try:
+        tools, _ = _reposition_section(pm, viewer)
+        _button(tools, "Export Outline").click()
+    finally:
+        viewer.close()
+    assert not Path(f"{pm._output_stem(str(clean))}.reposition.json").exists(), \
+        "an untouched Reposition section still wrote a plan"
+    print("   OK")
+
+
+
+def test_reposition_grab_from_click(tmp, inputs):
+    print("9. paint_mask: grabbing a flap from a click, and where it decides the hinge is...")
+    import numpy as np
+    import tifffile
+    import paint_mask as pm
+    from shared import atlas_reference
+
+    # A slab with a flap along its top edge, separated by a two-voxel crack on
+    # planes 0..5 and welded on from plane 6 -- a hinge, the geometry the whole
+    # per-plane model exists for.
+    stack = np.full((8, 200, 220), 50, dtype=np.uint16)
+    stack[:, 80:180, 20:200] = 3000                 # the brain
+    stack[:, 20:70, 60:160] = 3000                  # the flap
+    stack[6:, 70:80, 60:160] = 3000                 # ...welded on from z=6
+    raw = tmp / "flap_stack.tif"
+    tifffile.imwrite(str(raw), stack)
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "grab.nii.gz",
+                         image_path=str(raw), voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        assert not frag.data.any(), "nothing should be outlined before the grab"
+
+        scale = viewer.layers["sample"].scale
+        viewer.cursor.position = tuple(c * s for c, s in zip((3, 45, 110), scale))
+        _button(tools, "Grab fragment under the cursor").click()
+
+        got = frag.data == 1
+        planes = sorted(int(z) for z in np.unique(np.nonzero(got)[0]))
+        assert planes == [0, 1, 2, 3, 4, 5], f"the walk should stop at the hinge, got {planes}"
+        assert got[3, 20:70, 60:160].all(), "the flap itself was not filled"
+        assert not got[3, 80:180, 20:200].any(), "the grab leaked across the crack into the brain"
+
+        # Clicking off tissue is a mistake worth naming, and must not wipe the
+        # outline already grabbed.
+        viewer.cursor.position = tuple(c * s for c, s in zip((3, 2, 2), scale))
+        _button(tools, "Grab fragment under the cursor").click()
+        assert (frag.data == 1).any(), "a bad click destroyed the previous grab"
+    finally:
+        viewer.close()
+    print("   OK")
+
+
+
+def test_reposition_segments_belong_to_a_fragment(tmp, inputs):
+    print("10. paint_mask: line pairs are tagged per fragment, and survive a reopen...")
+    import numpy as np
+    import paint_mask as pm
+    from shared import atlas_reference
+    from registration_ants import reposition as rp
+
+    out = tmp / "pairs.nii.gz"
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name, voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        segments = viewer.layers[pm._REPOSITION_SEGMENTS_LAYER]
+
+        data = frag.data.copy()
+        data[2, 5:25, 5:25] = 1
+        data[2, 45:65, 5:25] = 2
+        frag.data = data
+
+        def draw(label, first_x, second_x, y):
+            """One pair for `label`, the way a hand would: pick the fragment
+            first, then draw -- napari tags a shape from the layer's defaults
+            at the moment it is added."""
+            boxes["fragment"].setValue(label)
+            for x in (first_x, second_x):
+                segments.add([[[2, y, x], [2, y, x + 20]]], shape_type="line")
+
+        # The line ON the fragment is drawn SECOND for fragment 2, to prove the
+        # fit reads the outline rather than the drawing order.
+        draw(1, 10, 60, 10)        # fragment 1: on-fragment line first,  moves +50
+        draw(2, 20, 10, 50)        # fragment 2: on-fragment line second, moves +10
+
+        assert list(segments.features["fragment"]) == [1, 1, 2, 2], segments.features
+        # Roles are worked out from the outline as the lines land, not on Fit,
+        # and they follow the outline rather than the drawing order: fragment
+        # 1's on-fragment line was drawn first, fragment 2's second.
+        assert list(segments.features["role"]) == ["source", "target", "target", "source"], \
+            segments.features
+        widths = list(np.atleast_1d(segments.edge_width))
+        assert widths[0] > widths[1] and widths[3] > widths[2], widths
+
+        # Back on fragment 1, the fit must use FRAGMENT 1's pair -- not simply
+        # the last two lines in the layer, which now belong to fragment 2.
+        boxes["fragment"].setValue(1)
+        viewer.dims.set_current_step(0, 2)
+        _button(tools, "Fit from the 2 drawn lines").click()
+        assert abs(boxes["tx"].value() - 50 * RAW_UM[0]) < 0.5, \
+            f"fit picked up the wrong fragment's lines: tx={boxes['tx'].value()}"
+        _button(tools, "Set keyframe on this plane").click()
+
+        boxes["fragment"].setValue(2)
+        _button(tools, "Fit from the 2 drawn lines").click()
+        assert abs(boxes["tx"].value() - 10 * RAW_UM[0]) < 0.5, boxes["tx"].value()
+        _button(tools, "Set keyframe on this plane").click()
+
+        plan = _viewer_plan(viewer, pm)
+        by_label = {f["label"]: f for f in plan["fragments"]}
+        assert set(by_label) == {1, 2}, by_label
+        for label, expect in ((1, 50 * RAW_UM[0]), (2, 10 * RAW_UM[0])):
+            kf = by_label[label]["keyframes"][0]
+            assert abs(kf["tx_um"] - expect) < 0.5, (label, kf)
+            assert kf.get("segments"), f"fragment {label} kept no record of its pair"
+
+        _button(tools, "Export Outline").click()
+    finally:
+        viewer.close()
+
+    written = rp.read_plan(f"{pm._output_stem(str(out))}.reposition.json")
+    assert all(f["keyframes"][0].get("segments") for f in written["fragments"]), written
+
+    # Reopening puts each pair back on the canvas, still tagged.
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name)
+    try:
+        _reposition_section(pm, viewer)
+        segments = viewer.layers[pm._REPOSITION_SEGMENTS_LAYER]
+        assert sorted(segments.features["fragment"]) == [1, 1, 2, 2], segments.features
+    finally:
+        viewer.close()
+    print("   OK")
+
+
+
+def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
+    print("11. paint_mask: cortex split in three -- three fragments closing toward the middle...")
+    import numpy as np
+    import tifffile
+    import paint_mask as pm
+    from shared import atlas_reference
+
+    # One band of "cortex" cut into three by two gaps. Each piece is a third of
+    # the tissue on its plane, which is why the grab's share-of-plane backstop
+    # has to be a control and not a constant.
+    stack = np.full((8, 200, 220), 50, dtype=np.uint16)
+    for x0, x1 in ((10, 70), (76, 136), (142, 202)):
+        stack[:, 60:140, x0:x1] = 3000
+    raw = tmp / "three_pieces.tif"
+    tifffile.imwrite(str(raw), stack)
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "three.nii.gz",
+                         image_path=str(raw), voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        boxes["share"].setValue(0.5)
+        scale = viewer.layers["sample"].scale
+
+        # Left and right pieces move inward; the middle one is the anchor and
+        # is never grabbed -- tissue that split did not shrink, so something
+        # has to hold still or closing the gaps just makes the cortex smaller.
+        for label, x in ((1, 40), (2, 172)):
+            boxes["fragment"].setValue(label)
+            viewer.cursor.position = tuple(c * s for c, s in zip((3, 100, x), scale))
+            _button(tools, "Grab fragment under the cursor").click()
+
+        got = frag.data
+        assert (got == 1)[3, 100, 40] and (got == 2)[3, 100, 172], "a piece was not grabbed"
+        assert not (got == 1)[3, 100, 100], "the grab crossed the gap into the middle piece"
+        assert not (got == 2)[3, 100, 100], "the grab crossed the gap into the middle piece"
+        assert not got[3, 100, 100], "the anchor piece must stay unclaimed"
+
+        # Each carries its own transform, in its own direction.
+        viewer.dims.set_current_step(0, 3)
+        for label, tx in ((1, 6.0), (2, -6.0)):
+            boxes["fragment"].setValue(label)
+            boxes["tx"].setValue(tx)
+            _button(tools, "Set keyframe on this plane").click()
+        plan = _viewer_plan(viewer, pm)
+        moves = {f["label"]: f["keyframes"][0]["tx_um"] for f in plan["fragments"]}
+        assert moves == {1: 6.0, 2: -6.0}, moves
+    finally:
+        viewer.close()
+    print("   OK")
+
+
+
+def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
+    print("12. paint_mask: no voxel_size_um -> the panel opens but will not export a plan...")
+    import numpy as np
+    import paint_mask as pm
+    from pathlib import Path
+    from shared import atlas_reference
+
+    # _open_guide already passes voxel_size_um=None, which is legal for painting
+    # a guide (it only sets the display aspect) and NOT legal for a plan: the
+    # offsets would be voxel counts wearing a micron label, self-consistent on
+    # the image and the wrong scale on the cells.
+    out = tmp / "novoxel.nii.gz"
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        assert any("VOXELS, not microns" in w.text()
+                   for w in tools.findChildren(pm.QLabel)), "no warning about the missing scale"
+
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        data = frag.data.copy()
+        data[2, 5:25, 5:25] = 1
+        frag.data = data
+        viewer.dims.set_current_step(0, 2)
+        boxes["tx"].setValue(5.0)
+        _button(tools, "Set keyframe on this plane").click()
+
+        # Exporting reports the refusal and writes the guide anyway -- the two
+        # are independent, and an exception out of a Qt handler would abort the
+        # process instead of saying anything.
+        assert pm._export_reposition(frag.metadata["reposition_state"], str(out)) == []
+        _button(tools, "Export Outline").click()
+    finally:
+        viewer.close()
+    assert not Path(f"{pm._output_stem(str(out))}.reposition.json").exists()
+    print("   OK")
+
+
 def main():
     print("=== tests/test_gui_smoke.py ===")
     if not _ensure_display():
@@ -811,6 +1168,11 @@ def main():
         test_single_sample_fill_switch()
         test_panels_are_resizable(tmp, inputs)
         test_assignment_panel_drops_one_region(tmp, inputs)
+        test_reposition_panel(tmp, inputs)
+        test_reposition_grab_from_click(tmp, inputs)
+        test_reposition_segments_belong_to_a_fragment(tmp, inputs)
+        test_reposition_three_pieces_each_move_their_own_way(tmp, inputs)
+        test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs)
         test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")
     return 0
