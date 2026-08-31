@@ -1058,7 +1058,13 @@ VOXEL_SIZE_UM_NOTE = (
 #                          than guessed at. Lines are tagged and coloured by
 #                          the fragment showing in the spin box, so several
 #                          flaps' pairs can sit on the canvas at once.
-#   The four sliders       the fine pose, against a live preview of the plane.
+#   The four sliders       the fine pose. There is deliberately no live image
+#                          preview here: judging a reposition means looking at
+#                          every plane it touches, which is a batch job with
+#                          numbers attached, not something to squint at one
+#                          slice at a time while dragging. tools/qc_guide_mask.py
+#                          renders the before/after strip and the boundary
+#                          report, off the same code the export uses.
 #   Rotation centre        put it ON the hinge. The tear a rigid move opens is
 #                          exactly the displacement at the still-attached
 #                          point, so pivoting there makes it zero.
@@ -1068,11 +1074,17 @@ VOXEL_SIZE_UM_NOTE = (
 
 _REPOSITION_FRAGMENTS_LAYER = "fragments to reposition (paint here)"
 _REPOSITION_SEGMENTS_LAYER = "reposition segments (draw 2 lines)"
-_REPOSITION_PREVIEW_LAYER = "reposition preview (this plane)"
 # Cycled over the `fragment` feature so a line's colour says which flap it
 # belongs to. Distinct at a glance against grayscale tissue, and enough of
 # them that the samples with several cracks do not wrap round.
 _FRAGMENT_COLOURS = ("#ffd166", "#06d6a0", "#ef476f", "#118ab2", "#c77dff", "#f78c6b")
+# The one brush number on the fragments layer that is not a fragment: voxels
+# painted with it are taken OUT of the tissue before a grab walks it. That is
+# the answer to a crack too tight for any threshold to separate -- a few
+# strokes across the join, rather than tracing the whole piece by hand. Kept
+# out of the fragment numbering (the spin box stops one below it) and stripped
+# from the export, so it can never be mistaken for something that moves.
+_REPOSITION_CUT_LABEL = 255
 
 
 def _slider_row(text, lo, hi, decimals=1, suffix=" um", name=None):
@@ -1204,13 +1216,6 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             segments.add([[[z, y0 / voxel_um[1], x0 / voxel_um[0]],
                            [z, y1 / voxel_um[1], x1 / voxel_um[0]]]], shape_type="line")
 
-    # One plane, not a second copy of the stack: a full-volume preview of a
-    # 190 x 3967 x 2249 raw stack is gigabytes of allocation for a control that
-    # has to answer while a hand is still on the slider. The layer is parked at
-    # the plane being looked at by its translate.
-    preview = viewer.add_image(np.zeros((1,) + image_arr.shape[1:], dtype=np.float32),
-                               name=_REPOSITION_PREVIEW_LAYER, visible=False,
-                               colormap="gray", **scale_kwargs)
 
     section = QWidget()
     layout = QVBoxLayout(section)
@@ -1221,7 +1226,7 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     label_layout.setContentsMargins(0, 0, 0, 0)
     label_layout.addWidget(QLabel("fragment"))
     label_spin = QSpinBox()
-    label_spin.setRange(1, 255)
+    label_spin.setRange(1, _REPOSITION_CUT_LABEL - 1)
     # Named for the same reason the sliders are: the tools dock holds several
     # spin boxes (Relabel has its own), and findChild() would hand a test
     # whichever came first.
@@ -1326,45 +1331,6 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                                     interpolate=interpolate_box.isChecked(),
                                     feather_um=feather_box.value())
 
-    def live_transform():
-        """What the sliders currently say, as a one-plane plan -- so the
-        preview shows the pose being dragged rather than the last one saved."""
-        label = label_spin.value()
-        plan = build_plan()
-        kf = reposition.make_keyframe(current_z(), tx_box.value(), ty_box.value(),
-                                      th_box.value(), int(dz_box.value()), centre_for(label))
-        for frag in plan["fragments"]:
-            if int(frag["label"]) == label:
-                frag["keyframes"] = [k for k in frag["keyframes"] if k["z"] != kf["z"]] + [kf]
-                frag["keyframes"].sort(key=lambda k: k["z"])
-                break
-        else:
-            plan["fragments"].append(reposition.make_fragment(label, [kf], entry(label)["name"]))
-        return plan
-
-    sample_layer = next((layer for layer in viewer.layers if layer.name == "sample"), None)
-
-    def refresh_preview(*_):
-        # `preview in viewer.layers` is the teardown guard: closing the window
-        # removes the layers but keeps delivering dims events for a moment,
-        # and a name lookup into an emptied LayerList raises from inside a Qt
-        # callback, where it surfaces as a crash on close rather than anything
-        # a user could act on.
-        if not preview.visible or preview not in viewer.layers:
-            return
-        # The plane being LOOKED AT, as it will come out -- not the plane this
-        # fragment's content lands on. napari only renders a layer at its own
-        # world z, so parking the preview at z+dz would make it invisible from
-        # the plane the slider is being dragged on, which is the one moment it
-        # has to be visible. Scrolling to the target plane then shows the
-        # fragment arriving; scrolling to the source plane shows it vacated.
-        z = current_z()
-        plane = reposition.preview_plane(image_arr, frag_layer.data, live_transform(), z)
-        preview.data = plane[np.newaxis].astype(np.float32)
-        preview.translate = (z * (scale[0] if scale else 1.0), 0.0, 0.0)
-        if sample_layer is not None and sample_layer in viewer.layers:
-            preview.contrast_limits = sample_layer.contrast_limits
-
     def refresh_list(*_):
         keyframes_list.clear()
         for label, e in sorted(fragments.items()):
@@ -1404,7 +1370,6 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         dz_box.blockSignals(False)
         c = centre_for(label_spin.value())
         centre_label.setText(f"rotation centre: x={c[0]:.0f} y={c[1]:.0f} um")
-        refresh_preview()
 
     # ---------------------------------------------------------------- actions
 
@@ -1504,16 +1469,16 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                f"it is not a rigid copy -- that difference is absorbed silently. Copy the line "
                f"rather than drawing a second one by hand."
                if drift > max(0.02 * length, voxel_um[0]) else ""))
-        refresh_preview()
 
     def set_keyframe():
         label = label_spin.value()
         e = entry(label)
         e["name"] = name_edit.text().strip()
         if not (frag_layer.data[current_z()] == label).any():
-            status.setText(f"Plane {current_z()} has no label-{label} voxels painted, so a "
-                           f"keyframe here would move nothing. Paint the fragment on this "
-                           f"plane first (or interpolate the outlines).")
+            status.setText(f"Plane {current_z()} has no fragment {label} on it, so a keyframe "
+                           f"here would move nothing. Grab the fragment on this plane first -- "
+                           f"the planes you grab are the outline's keyframes, and the planes "
+                           f"between them are filled when the plan is applied.")
             return
         e["keyframes"][current_z()] = dict(
             tx_um=tx_box.value(), ty_um=ty_box.value(), theta_deg=th_box.value(),
@@ -1524,7 +1489,6 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             # recompute the transform, which is already recorded above.
             segments=pending_segments.get(label))
         refresh_list()
-        refresh_preview()
 
     def delete_keyframe():
         e = entry(label_spin.value(), create=False)
@@ -1543,9 +1507,8 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
              float(pos[1] / (scale[1] if scale else 1.0) * voxel_um[1])]
         entry(label_spin.value())["center_um"] = c
         centre_label.setText(f"rotation centre: x={c[0]:.0f} y={c[1]:.0f} um  (from cursor)")
-        refresh_preview()
 
-    def grab_fragment():
+    def grab_fragment(follow_z=False):
         """Take the fragment from a click instead of a traced outline.
 
         On the planes where it is open, a flap is already its own connected
@@ -1555,6 +1518,24 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         which is the hinge; the z extent falls out of the same walk rather
         than being another thing to judge by eye.
 
+        THIS PLANE ONLY by default, and following it through z is the option
+        rather than the other way round. Not because the walk goes wrong on
+        several pieces -- it stops cleanly at each one's ends, and a phantom
+        of two pieces sharing an xy footprint at different z does NOT run them
+        together -- but because it DECIDES the extent, and a sample with
+        several pieces is one where that decision is already known and worth
+        stating rather than inferring. Grabbing the first and last plane of a
+        piece and filling between them is the same sparse-keyframe idiom the
+        guide outlines use, keeps each piece's extent exactly where it was put,
+        and matches the keyframes that have to bracket it anyway.
+
+        The walk is still the quicker route for a single flap whose extent is
+        genuinely unknown, and it is the only thing that finds the hinge.
+
+        A single-plane grab replaces only THAT plane for this fragment, so the
+        planes already grabbed for it survive; the z walk replaces the whole
+        fragment, since it produces a whole extent in one go.
+
         The threshold, not the guide layer, is what tissue means here: a guide
         outline is sparse keyframes interpolated into a smooth blob, and that
         interpolation closes the thin crack this depends on.
@@ -1563,19 +1544,27 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         seed = tuple(int(round(pos[axis] / (scale[axis] if scale else 1.0))) for axis in (0, 1, 2))
         label = label_spin.value()
         try:
+            cuts = frag_layer.data == _REPOSITION_CUT_LABEL
             mask, planes, note = reposition.grab_fragment(
-                reposition.threshold_planes(image_arr, grab_box.value()), seed,
-                max_fraction=share_box.value())
+                reposition.threshold_planes(image_arr, grab_box.value(),
+                                            exclude=cuts if cuts.any() else None),
+                seed, max_fraction=share_box.value(), follow_z=follow_z)
         except ValueError as exc:
             status.setText(str(exc))
             return
         data = frag_layer.data.copy()
-        data[data == label] = 0                  # replace, so a re-grab is not a union
-        data[mask] = label
+        if follow_z:
+            data[data == label] = 0              # replace, so a re-grab is not a union
+        else:
+            data[seed[0]][data[seed[0]] == label] = 0        # this plane only
+        data[mask & (data != _REPOSITION_CUT_LABEL)] = label
         frag_layer.data = data
         entry(label)["center_um"] = None         # the centroid moved with the new outline
         print(f"Grabbed fragment {label} from (z={seed[0]}, y={seed[1]}, x={seed[2]}): {note}")
-        status.setText(f"Fragment {label}: {note}\n\nToo much or too little? The 'tissue' "
+        planes_now = sorted(int(z) for z in np.unique(np.nonzero(data == label)[0]))
+        status.setText(f"Fragment {label}: {note}\n"
+                       f"now spans plane(s) {planes_now[0]}..{planes_now[-1]} "
+                       f"({len(planes_now)} grabbed)\n\nToo much or too little? The 'tissue' "
                        f"slider decides what counts as tissue -- a crack only separates the "
                        f"pieces while it sits above the gap -- and 'max share' is how big a "
                        f"piece may get before the walk calls it the hinge. Raise it for a "
@@ -1583,21 +1572,66 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         refresh_roles()
         load_plane()
 
-    def interpolate_outlines():
-        """Fill the fragment layer between the planes it was painted on, with
-        the same per-label interpolation guide outlines get -- so a flap needs
-        a handful of traced planes, not every one of them."""
-        painted = sparse_keyframes_by_label(frag_layer.data)
-        if not painted:
-            status.setText("Nothing painted on the fragments layer yet.")
+    def draw_segment():
+        """Put the line tool in your hand on the segments layer.
+
+        The layer starts hidden and is one of five in the list; finding it,
+        showing it, selecting it and picking the line tool is four steps of
+        fumbling before the first useful one. The fragment number is stamped
+        on here too, so a line cannot be drawn before it has an owner."""
+        label = label_spin.value()
+        segments.visible = True
+        segments.feature_defaults = {"fragment": label, "role": "?"}
+        viewer.layers.selection = {segments}
+        segments.mode = "add_line"
+        status.setText(
+            f"Line tool ready, tagged fragment {label}. Draw ONE line across a feature you "
+            f"can recognise ON the fragment -- a corner of the break, a vessel, a texture "
+            f"edge. Then use 'Copy the segment to its target' and drag the copy onto where "
+            f"that feature belongs.")
+
+    def copy_segment():
+        """Duplicate this fragment's last line and hand back the copy, selected.
+
+        A copy rather than a second freehand line, because a copy cannot be
+        stretched: the length is the one degree of freedom an in-plane rigid
+        move does not have, and drawing the second line by hand is the only
+        way to introduce a length change the fit would then absorb silently.
+        Offset a little so it does not sit invisibly on top of the original.
+        """
+        label = label_spin.value()
+        lines = fragment_lines(label)
+        if not lines:
+            status.setText(f"Fragment {label} has no line yet -- draw one on the fragment first.")
             return
-        result = interpolate_labels_separately(painted, frag_layer.data.shape)
-        frag_layer.data = result.volume
-        status.setText("Filled outlines between painted planes: "
-                       + ", ".join(f"label {lab}: {len(planes)} painted -> "
-                                   f"{int((result.volume == lab).sum())} voxels"
-                                   for lab, planes in sorted(result.slices_by_label.items())))
-        refresh_preview()
+        source = np.asarray(lines[-1], dtype=float)
+        offset = np.array([0.0, max(4.0, 0.25 * np.linalg.norm(source[1, 1:] - source[0, 1:])), 0.0])
+        segments.visible = True
+        segments.feature_defaults = {"fragment": label, "role": "?"}
+        segments.add([source + offset], shape_type="line")
+        viewer.layers.selection = {segments}
+        segments.mode = "select"
+        segments.selected_data = {len(segments.data) - 1}
+        status.setText(
+            "Copy made and selected, in select mode. Drag it onto where that feature belongs; "
+            "the handle at its corner rotates it. Its length is fixed, which is what makes the "
+            "fit exact. Then press 'Fit from the 2 drawn lines'.")
+
+    def cut_brush():
+        """Hand the brush the cut number and get out of the way.
+
+        Reachable as a button rather than left to be typed into the layer's own
+        label box, because it is the one number on this layer that does not
+        mean a fragment, and nothing on screen would otherwise say so."""
+        frag_layer.selected_label = _REPOSITION_CUT_LABEL
+        frag_layer.mode = "paint"
+        viewer.layers.selection = {frag_layer}
+        frag_layer.visible = True
+        status.setText(
+            f"Brush set to {_REPOSITION_CUT_LABEL} = CUT. Draw a short stroke across the join "
+            f"on the planes where the pieces touch, then Grab again: cut voxels are taken out "
+            f"of the tissue, which makes the two sides separate components. Cuts are stripped "
+            f"from the export -- they only steer the grab, they never move.")
 
     def check_boundaries():
         plan = build_plan()
@@ -1615,36 +1649,27 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
 
     # ---------------------------------------------------------------- wiring
 
-    buttons = [("Grab fragment under the cursor", grab_fragment),
-               ("Fit from the 2 drawn lines", fit_from_segments),
+    buttons = [("Grab this plane under the cursor", grab_fragment),
+               ("Grab and follow through z", lambda: grab_fragment(follow_z=True)),
+               ("Draw a cut (for pieces that touch)", cut_brush),
+               ("1. Draw a segment on the fragment", draw_segment),
+               ("2. Copy the segment to its target", copy_segment),
+               ("3. Fit from the 2 drawn lines", fit_from_segments),
                ("Rotation centre <- cursor", centre_from_cursor),
                ("Set keyframe on this plane", set_keyframe),
                ("Delete keyframe on this plane", delete_keyframe),
-               ("Fill outlines between painted planes", interpolate_outlines),   # manual fallback
                ("Boundary check", check_boundaries)]
     for text, handler in buttons:
         btn = QPushButton(text)
         btn.clicked.connect(handler)
         layout.addWidget(btn)
 
-    preview_box = QCheckBox("live preview of this plane")
-
-    def toggle_preview(checked):
-        preview.visible = bool(checked)
-        refresh_preview()
-
-    preview_box.toggled.connect(toggle_preview)
-    layout.addWidget(preview_box)
     layout.addWidget(interpolate_box)
     layout.addWidget(feather_row)
     layout.addWidget(QLabel("keyframes"))
     layout.addWidget(keyframes_list)
     layout.addWidget(status)
 
-    for box in (tx_box, ty_box, th_box, dz_box):
-        box.valueChanged.connect(refresh_preview)
-    feather_box.valueChanged.connect(refresh_preview)
-    interpolate_box.toggled.connect(refresh_preview)
     def fragment_selected(*_):
         frag_layer.selected_label = label_spin.value()
         # Set BEFORE the next line is drawn, not read after: napari tags a new
@@ -1677,10 +1702,15 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                 "pipeline's sample.voxel_size_um) and export again.")
         stem = _output_stem(output_path)
         fragments_path = f"{stem}_fragments.nii.gz"
-        painted = sparse_keyframes_by_label(frag_layer.data)
-        volume = (interpolate_labels_separately(painted, frag_layer.data.shape).volume
-                  if painted else frag_layer.data)
-        sitk.WriteImage(sitk.GetImageFromArray(volume.astype(np.uint8)), fragments_path)
+        # Cuts steer the grab and nothing else: leaving them in would ship a
+        # label the pipeline has no fragment for, sitting exactly on the seam.
+        # Written SPARSE, exactly as grabbed. The planes carrying voxels are
+        # the keyframes, and that is the only record of which planes were
+        # decided rather than inferred -- filling here would erase it, and a
+        # reopened session could not tell the two apart. The pipeline and
+        # scripts/apply_reposition.py fill it on load instead.
+        outlines = np.where(frag_layer.data == _REPOSITION_CUT_LABEL, 0, frag_layer.data)
+        sitk.WriteImage(sitk.GetImageFromArray(outlines.astype(np.uint8)), fragments_path)
         plan["labels_path"] = fragments_path
         plan_path = f"{stem}.reposition.json"
         reposition.write_plan(plan_path, plan)

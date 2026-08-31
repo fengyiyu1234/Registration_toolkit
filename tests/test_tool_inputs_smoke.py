@@ -208,6 +208,62 @@ def test_check_label_dtype(tmp, capture=None):
     print("   OK")
 
 
+
+def test_qc_reposition_audit(tmp):
+    print("7. qc_guide_mask.audit_reposition: numbers, warnings and a before/after strip...")
+    import numpy as np
+    import SimpleITK as sitk
+    import tifffile
+    from registration_ants import reposition as rp
+    import tools.qc_guide_mask as qc
+
+    d = tmp / "qcrep"
+    d.mkdir(exist_ok=True)
+    stack = np.full((10, 120, 140), 50, dtype=np.uint16)
+    stack[:, 60:110, 15:130] = 3000                 # the brain
+    stack[2:8, 15:45, 40:100] = 3000                # the flap
+    tifffile.imwrite(str(d / "raw.tif"), stack)
+
+    # SPARSE outline: grabbed on 2 and 7 only, as the GUI exports it.
+    frag = np.zeros(stack.shape, dtype=np.uint8)
+    frag[2, 15:45, 40:100] = 1
+    frag[7, 15:45, 40:100] = 1
+    sitk.WriteImage(sitk.GetImageFromArray(frag), str(d / "frag.nii.gz"))
+
+    plan = rp.make_plan(
+        stack.shape, (2.6, 2.6, 32.0),
+        [rp.make_fragment(1, [rp.make_keyframe(2, tx_um=0.0),
+                              rp.make_keyframe(7, tx_um=26.0, ty_um=52.0, theta_deg=6.0)],
+                          "flap A")],
+        labels_path=str(d / "frag.nii.gz"))
+    rp.write_plan(d / "plan.json", plan)
+    cfg = {"sample": {"raw_tiff": str(d / "raw.tif"),
+                      "reposition_plan": str(d / "plan.json"),
+                      "voxel_size_um": [2.6, 2.6, 32.0]}}
+
+    written = qc.audit_reposition(cfg, d, n_planes=6)
+    assert len(written) == 1, written
+    out = Path(written[0])
+    assert out.exists() and out.stat().st_size > 5000, out
+
+    # The audit must see the FILLED span, not just the two grabbed planes --
+    # that is the whole point of exporting sparse and filling on use.
+    dense = rp.densify_fragments(qc.load_painted_mask(d / "frag.nii.gz"))
+    assert sorted(int(z) for z in np.unique(np.nonzero(dense == 1)[0])) == [2, 3, 4, 5, 6, 7]
+
+    # A plan whose outline volume has no voxels for its label is reported, not
+    # crashed on: the two files are edited separately and can drift apart.
+    empty = np.zeros(stack.shape, dtype=np.uint8)
+    sitk.WriteImage(sitk.GetImageFromArray(empty), str(d / "empty.nii.gz"))
+    rp.write_plan(d / "orphan.json", dict(plan, labels_path=str(d / "empty.nii.gz")))
+    cfg2 = dict(cfg, sample=dict(cfg["sample"], reposition_plan=str(d / "orphan.json")))
+    assert qc.audit_reposition(cfg2, d, n_planes=6) == []
+
+    # No plan at all is simply nothing to do.
+    assert qc.audit_reposition({"sample": {"raw_tiff": str(d / "raw.tif")}}, d) == []
+    print("   OK")
+
+
 def main():
     print("=== tests/test_tool_inputs_smoke.py ===")
     with tempfile.TemporaryDirectory() as tmp:
@@ -218,6 +274,7 @@ def main():
         test_values_from_config(tmp)
         test_resolve_inputs_no_form(tmp)
         test_check_label_dtype(tmp)
+        test_qc_reposition_audit(tmp)
     print("\nALL SMOKE TESTS PASSED")
     return 0
 

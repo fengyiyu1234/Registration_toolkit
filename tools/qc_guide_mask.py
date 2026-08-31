@@ -27,6 +27,16 @@ the labels just come out wrong:
    drawing consistently small does not. Below ~50% or above ~200% a guide is
    usually worse than no guide at all.
 
+3. A REPOSITION POSED WRONG. When the config carries a `sample.reposition_plan`
+   (paint_mask.py's Reposition panel), this also audits that: per fragment, how
+   far the tissue actually travels on each plane, which outline planes have no
+   transform and therefore stay put, the step-in-z boundary report, and a
+   before/after strip rendered through the export's own code. That strip is the
+   ONLY place a reposition gets looked at -- the painting panel deliberately has
+   no live preview, because judging one means seeing every plane it touches with
+   the displacement written next to it, not squinting at one slice while
+   dragging a slider.
+
 This is the QC pass for what `paint_mask.py`'s `kind: guide` exports -- run it
 between painting and registering.
 
@@ -57,7 +67,7 @@ from pathlib import Path
 
 import numpy as np
 
-from registration_ants import atlas_utils, config as config_mod
+from registration_ants import atlas_utils, reposition, config as config_mod
 
 # Run as `python tools/<name>.py`, so sys.path[0] is tools/, not the repo
 # root -- put the root on it before importing anything from shared/.
@@ -227,6 +237,166 @@ def write_montage(dense, label, name, keyframes, raw_path, out_path, n_planes=12
     return out_path
 
 
+def audit_reposition(cfg, out_dir, n_planes=12, downsample=4, montage=True):
+    """QC `sample.reposition_plan` -- the numbers, and a before/after strip.
+
+    Same bargain as the rest of this tool: check it before spending hours on a
+    registration, because none of what can go wrong here announces itself. A
+    fragment posed the wrong way still produces a clean warp, a step left in z
+    still registers, and cells still get regions -- just wrong ones.
+
+    This is also where the reposition gets LOOKED at. paint_mask's panel has no
+    live image preview on purpose: judging a reposition means seeing every
+    plane it touches with the displacement written next to it, which is a
+    batch job, not something to squint at one slice at a time while dragging a
+    slider. The planes rendered here go through reposition.preview_plane, the
+    same arithmetic the export runs, so this is the result and not a likeness
+    of it.
+
+    Returns the list of montage paths written (empty when there is no plan).
+    """
+    sample = cfg["sample"]
+    plan_path = sample.get("reposition_plan")
+    if not plan_path:
+        return []
+
+    plan = reposition.read_plan(plan_path)
+    fragments = reposition.densify_fragments(
+        load_painted_mask(Path(plan["labels_path"])))
+    raw_path = Path(sample["raw_tiff"])
+    interpolate = bool(plan.get("interpolate", True))
+    n_all = fragments.shape[0]
+
+    print(f"\n[reposition] {plan_path}")
+    print(f"             grid {tuple(plan['voxel_size_um'])} um/voxel (x, y, z), "
+          f"interpolate={interpolate}")
+    written = []
+    for frag in plan["fragments"]:
+        label = int(frag["label"])
+        name = frag.get("name") or f"fragment {label}"
+        moved = reposition.fragment_source_planes(frag, n_all, interpolate)
+        outline = sorted(int(z) for z in np.unique(np.nonzero(fragments == label)[0]))
+        kf = [int(k["z"]) for k in frag["keyframes"]]
+        if not outline:
+            print(f"  label {label} ({name}): WARNING -- keyframes on {kf} but the outline "
+                  f"volume has no voxels for this label at all; nothing will move.")
+            continue
+
+        # What the tissue actually travels, per plane, at its furthest point --
+        # the centroid understates a rotation about a distant hinge, and the
+        # far edge is where a bad pose shows first.
+        travel = {}
+        for z in moved:
+            mask = fragments[z] == label
+            if not mask.any():
+                continue
+            tf = reposition.plane_transform(frag, z, interpolate)
+            iy, ix = np.nonzero(mask)
+            pts = np.column_stack([ix * plan["voxel_size_um"][0],
+                                   iy * plan["voxel_size_um"][1]])
+            travel[z] = float(np.abs(reposition.transform_points_um(pts, tf) - pts).max())
+
+        idle = [z for z in outline if z not in moved]
+        print(f"  label {label} ({name}): {len(kf)} keyframe(s) {kf}")
+        print(f"      outline planes {outline[0]}..{outline[-1]} ({len(outline)}), "
+              f"{int((fragments == label).sum())} voxels after filling")
+        print(f"      moves on {len(travel)} plane(s), travel "
+              f"{min(travel.values(), default=0):.0f}..{max(travel.values(), default=0):.0f} um")
+        if idle:
+            # Outline without a transform is inert, which is fine at the edges
+            # and a mistake in the middle -- either way it is not obvious from
+            # the files, so it gets said.
+            print(f"      NOTE: {len(idle)} outline plane(s) have no transform and stay put: "
+                  f"{idle if len(idle) <= 12 else str(idle[:12]) + ' ...'}")
+        if montage and travel:
+            path = Path(out_dir) / f"reposition_label{label}.png"
+            written.append(write_reposition_montage(
+                raw_path, fragments, plan, frag, sorted(travel), travel,
+                path, n_planes=n_planes, downsample=downsample))
+            print(f"      wrote {path}")
+
+    for line in reposition.boundary_warnings(
+            reposition.boundary_report(plan, fragments)):
+        print(f"  WARNING: {line}")
+    return written
+
+
+def write_reposition_montage(raw_path, fragments, plan, frag, planes, travel, out_path,
+                             n_planes=12, downsample=4):
+    """Before/after pairs across a fragment's moved planes.
+
+    Two rows, not an outline over one: what is being judged is whether the
+    tissue MESHES on the far side of the gap, and an outline drawn on the
+    unmoved image cannot show that.
+
+    Each pair is rendered through reposition.preview_plane -- the export's own
+    arithmetic -- on a stand-in volume of one plane, or two when that plane
+    also moves in z (the erase happens on the source plane and the paste on the
+    target, so both have to be present). The keyframe is re-based to index 0 of
+    the stand-in: handing preview_plane a fragment whose keyframes sit at real
+    z values, against a volume one plane tall, would find no transform at all
+    and quietly render the input back.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    label = int(frag["label"])
+    interpolate = bool(plan.get("interpolate", True))
+    picks = sorted(set(np.linspace(planes[0], planes[-1], min(n_planes, len(planes)))
+                       .round().astype(int).tolist()) & set(planes))
+    cols = len(picks)
+    fig, axes = plt.subplots(2, cols, figsize=(3.1 * cols, 6.6), squeeze=False)
+    for ax in axes.ravel():
+        ax.axis("off")
+
+    for i, z in enumerate(picks):
+        tf = reposition.plane_transform(frag, z, interpolate)
+        dz = int(tf["dz_planes"])
+        src = _raw_plane(raw_path, z)
+        mask = (fragments[z] == label)
+        if dz == 0:
+            stack = src[np.newaxis]
+            masks = np.where(mask, label, 0).astype(np.uint8)[np.newaxis]
+            z_out, base = 0, src
+        else:
+            base = _raw_plane(raw_path, z + dz)
+            stack = np.stack([src, base])
+            masks = np.stack([np.where(mask, label, 0), np.zeros_like(mask, dtype=int)]
+                             ).astype(np.uint8)
+            z_out = 1
+        mini = reposition.make_plan(
+            stack.shape, plan["voxel_size_um"],
+            [reposition.make_fragment(label, [reposition.make_keyframe(
+                0, tf["tx_um"], tf["ty_um"], tf["theta_deg"],
+                min(dz, 1), tf["center_um"])], frag.get("name", ""))],
+            interpolate=False, feather_um=plan.get("feather_um", 0.0))
+        after = reposition.preview_plane(stack, masks, mini, z_out)
+
+        finite = base[base > 0]
+        vmin, vmax = (np.percentile(finite, [1, 99.5]) if finite.size else (0, 1))
+        for row, (img, tag) in enumerate(((base, "before"), (after, "after"))):
+            ax = axes[row][i]
+            ax.imshow(img[::downsample, ::downsample], cmap="gray", vmin=vmin, vmax=vmax)
+            small = mask[::downsample, ::downsample]
+            if small.any():
+                ax.contour(small.astype(float), levels=[0.5], colors="cyan", linewidths=1.0)
+            title = f"z={z} {tag}"
+            if row:
+                title += f"  {travel[z]:.0f} um" + (f"  dz={dz:+d}" if dz else "")
+            ax.set_title(title, fontsize=9)
+            ax.axis("on")
+            ax.set_xticks([])
+            ax.set_yticks([])
+    fig.suptitle(f"reposition label {label}: {frag.get('name') or ''}   "
+                 f"(cyan = the fragment's ORIGINAL outline, drawn on both rows so the "
+                 f"move is visible against it)", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=100)
+    plt.close(fig)
+    return out_path
+
+
 def open_napari(dense, raw_path, voxel_size_um, names):
     """Interpolated mask over the raw stack, with the display scaled by the
     real voxel size -- without `scale` the 2.6/2.6/32um stack is squashed 12x
@@ -284,7 +454,15 @@ def main():
     cfg = config_mod.load_config(reg_config_path)
     guide_cfg = (cfg.get("mask") or {}).get("guide_regions")
     if not isinstance(guide_cfg, dict):
-        sys.exit("This config has no dict-form mask.guide_regions (nothing to QC).")
+        # A cracked sample can carry a reposition plan and no guide regions at
+        # all, and that plan is the more dangerous of the two to ship unchecked.
+        if cfg.get("sample", {}).get("reposition_plan"):
+            out_dir = Path(out_override) if out_override else Path(cfg["sample"]["raw_tiff"]).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            audit_reposition(cfg, out_dir, n_planes=n_planes, montage=not args.no_montage)
+            return
+        sys.exit("This config has no dict-form mask.guide_regions and no "
+                 "sample.reposition_plan (nothing to QC).")
 
     mask_path = Path(guide_cfg["regions_mask"])
     voxel_size_um = tuple(guide_cfg["voxel_size_um"])
@@ -398,6 +576,14 @@ def main():
                               raw_path, out_dir / f"label{label}.png", n_planes=n_planes)
             if p:
                 print(f"  wrote {p}")
+
+    # After the guide audit, because a reposition moves the guide outline along
+    # with the stack: a guide that is wrong on its own is wrong either way, and
+    # reading that first keeps the two failures apart.
+    out_dir = (Path(out_override) if out_override
+               else mask_path.parent / (mask_path.name.split(".")[0] + "_qc"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    audit_reposition(cfg, out_dir, n_planes=n_planes, montage=not args.no_montage)
 
     if args.napari:
         open_napari(dense, cfg["sample"]["raw_tiff"], voxel_size_um, names)
