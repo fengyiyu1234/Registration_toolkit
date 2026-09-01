@@ -1334,13 +1334,14 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     # numbers the drag produced.
     ghost = viewer.add_shapes(
         name=_REPOSITION_GHOST_LAYER, ndim=3, visible=False,
-        features={"fragment": np.zeros(0, dtype=int)},
-        feature_defaults={"fragment": 1},
+        features={"fragment": np.zeros(0, dtype=int), "plane": np.zeros(0, dtype=int)},
+        feature_defaults={"fragment": 1, "plane": 0},
         edge_color="fragment", edge_color_cycle=list(_FRAGMENT_COLOURS),
         face_color="transparent", edge_width=2, **scale_kwargs)
     ghost.text = {"string": "f{fragment} ghost", "size": 9, "color": "white",
                   "anchor": "upper_left"}
-    ghost_source = {}       # label -> {"z": int, "xy_um": (N, 2) as copied}
+    ghost_source = {}       # (label, z) -> (N, 2) xy microns, as copied
+    dropping = {"busy": False}   # set while a ghost is being removed, not dragged
 
     section = QWidget()
     layout = QVBoxLayout(section)
@@ -1736,20 +1737,32 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                        f"connected component, and two pieces that touch are one.")
         load_plane()
 
-    def ghost_index(label):
-        """The index of this fragment's ghost polygon, or None."""
-        tags = ghost.features.get("fragment")
-        if tags is None:
+    def ghost_index(label, z):
+        """The index of the ghost for this fragment ON THIS PLANE, or None.
+
+        Per (fragment, plane), not per fragment: a ghost describes one plane's
+        pose, so plane 12's copy has no business being read, moved or thrown
+        away while plane 20 is being worked on. Each stays on the plane it was
+        copied on -- which is also where napari draws it -- so scrolling back
+        shows what was done there.
+        """
+        tags, planes = ghost.features.get("fragment"), ghost.features.get("plane")
+        if tags is None or planes is None:
             return None
-        found = [i for i in range(len(ghost.data)) if int(tags.iloc[i]) == int(label)]
+        found = [i for i in range(len(ghost.data))
+                 if int(tags.iloc[i]) == int(label) and int(planes.iloc[i]) == int(z)]
         return found[-1] if found else None
 
-    def drop_ghost(label):
-        index = ghost_index(label)
+    def drop_ghost(label, z):
+        index = ghost_index(label, z)
         if index is not None:
-            ghost.selected_data = {index}
-            ghost.remove_selected()
-        ghost_source.pop(int(label), None)
+            dropping["busy"] = True       # removing a shape is not somebody dragging one
+            try:
+                ghost.selected_data = {index}
+                ghost.remove_selected()
+            finally:
+                dropping["busy"] = False
+        ghost_source.pop((int(label), int(z)), None)
 
     def copy_outline():
         """Copy this fragment's outline on this plane, ready to be dragged.
@@ -1767,15 +1780,13 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         except ValueError as exc:
             status.setText(str(exc))
             return
-        drop_ghost(label)                    # one ghost per fragment, always the latest
+        drop_ghost(label, z)                 # this plane's ghost only, replaced by the new one
         vertices = np.column_stack([np.full(len(poly), float(z)), poly[:, 0], poly[:, 1]])
-        ghost.feature_defaults = {"fragment": int(label)}
+        ghost.feature_defaults = {"fragment": int(label), "plane": int(z)}
         ghost.visible = True
         ghost.add([vertices], shape_type="polygon")
-        ghost_source[int(label)] = {
-            "z": int(z),
-            "xy_um": np.column_stack([poly[:, 1] * voxel_um[0], poly[:, 0] * voxel_um[1]]),
-        }
+        ghost_source[(int(label), int(z))] = np.column_stack(
+            [poly[:, 1] * voxel_um[0], poly[:, 0] * voxel_um[1]])
         viewer.layers.selection = {ghost}
         ghost.mode = "select"
         ghost.selected_data = {len(ghost.data) - 1}
@@ -1787,22 +1798,32 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             f"is not a rigid move (it is reported, never applied).")
 
     def moved_ghost():
-        """The fragment whose ghost is no longer where it was copied, as
-        (label, shape index, vertices) -- (None, None, None) if none has been
-        dragged. Which one MOVED is the question, not which one is selected:
-        two pieces on one plane have two ghosts on screen at once.
+        """The fragment whose ghost ON THIS PLANE is no longer where it was
+        copied, as (label, vertices) -- (None, None) if none has been dragged.
+
+        Which one MOVED is the question, not which one is selected: two pieces
+        on one plane have two ghosts on screen at once and either may be the
+        one being dragged.
+
+        Restricted to the plane on screen, and that restriction is the whole
+        point of keying ghosts by plane. Every plane already posed still has
+        its ghost sitting off its copy, so a search across all of them would
+        answer "which was dragged" with a plane nobody is looking at -- and
+        then record ITS pose against the plane on screen.
         """
-        for label, source in ghost_source.items():
-            index = ghost_index(label)
+        for (label, z), source in ghost_source.items():
+            if z != current_z():
+                continue
+            index = ghost_index(label, z)
             if index is None:
                 continue                  # its polygon was dropped, entry not yet cleaned up
             poly = np.asarray(ghost.data[index], dtype=float)
-            if (len(poly) == len(source["xy_um"])
-                    and np.allclose(poly[:, 2] * voxel_um[0], source["xy_um"][:, 0])
-                    and np.allclose(poly[:, 1] * voxel_um[1], source["xy_um"][:, 1])):
+            if (len(poly) == len(source)
+                    and np.allclose(poly[:, 2] * voxel_um[0], source[:, 0])
+                    and np.allclose(poly[:, 1] * voxel_um[1], source[:, 1])):
                 continue                  # sitting where it was copied: nothing said yet
-            return label, index, poly
-        return None, None, None
+            return label, poly
+        return None, None
 
     def fit_from_outline(*_):
         """Read the pose back off the dragged ghost -- as it is dragged.
@@ -1819,9 +1840,9 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         rigid move that best explains where every point went -- not a match of
         two shapes, which is a harder problem with a worse answer.
         """
-        if posing["busy"]:
+        if posing["busy"] or dropping["busy"]:
             return
-        label, index, moved = moved_ghost()
+        label, moved = moved_ghost()
         if label is None:
             return              # nothing dragged yet, or a ghost was just replaced
         if label != label_spin.value():
@@ -1830,12 +1851,12 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             # whichever number the spin box happened to be left on would fit
             # the wrong piece -- or, more often, silently fit nothing.
             label_spin.setValue(int(label))
-        source = ghost_source[label]
+        source = ghost_source[(int(label), current_z())]
         dst = np.column_stack([moved[:, 2] * voxel_um[0], moved[:, 1] * voxel_um[1]])
         e = entry(label)
         try:
             tx, ty, theta, centre, scale = reposition.fit_from_points(
-                source["xy_um"], dst, e.get("center_um"))
+                source, dst, e.get("center_um"))
         except ValueError as exc:
             status.setText(str(exc))
             return

@@ -1351,9 +1351,28 @@ def test_reposition_drag_the_outline(tmp, inputs):
         assert said, "a 20% resize of the ghost went unreported"
         assert "+20" in said[0], said[0]
 
-        # Copying again replaces the ghost rather than piling them up.
+        # Copying again on the SAME plane replaces that plane's ghost...
         _button(tools, "Copy this outline").click()
-        assert len(ghost.data) == 1, f"{len(ghost.data)} ghosts for one fragment"
+        assert len(ghost.data) == 1, f"{len(ghost.data)} ghosts for one fragment on one plane"
+
+        # ...but another plane gets its own, and the first one stays put. It has
+        # to: every posed plane's ghost sits off its copy for good, so a ghost
+        # from elsewhere would answer "which one was just dragged" with a plane
+        # nobody is looking at -- and its pose would be recorded here.
+        posed_on_2 = _viewer_plan(viewer, pm)["fragments"][0]["keyframes"][0]
+        data = frag.data.copy()
+        data[4, 10:40, 10:60] = 2
+        frag.data = data
+        viewer.dims.set_current_step(0, 4)
+        _button(tools, "Copy this outline").click()
+        assert len(ghost.data) == 2, "plane 4's copy replaced plane 2's instead of joining it"
+        fresh = np.asarray(ghost.data[-1], dtype=float)
+        assert int(fresh[0, 0]) == 4, "the new ghost was not put on the plane it was copied on"
+        keyframes = _viewer_plan(viewer, pm)["fragments"][0]["keyframes"]
+        assert [k["z"] for k in keyframes] == [2], \
+            "copying on a new plane recorded a pose there before anything was dragged"
+        assert keyframes[0] == posed_on_2, "plane 2's pose changed while plane 4 was opened"
+        viewer.dims.set_current_step(0, 2)
 
         # TWO PIECES ON ONE PLANE, one ghost each. Copying fragment 3's outline
         # leaves fragment 2's alone, and dragging either one is what picks it --
@@ -1364,8 +1383,9 @@ def test_reposition_drag_the_outline(tmp, inputs):
         frag.data = data
         boxes["fragment"].setValue(3)
         _button(tools, "Copy this outline").click()
-        assert len(ghost.data) == 2, "the second fragment did not get its own ghost"
-        assert sorted(int(v) for v in ghost.features["fragment"]) == [2, 3], ghost.features
+        here = [int(f) for f, z in zip(ghost.features["fragment"], ghost.features["plane"])
+                if int(z) == 2]
+        assert sorted(here) == [2, 3], f"one ghost each on this plane, got {here}"
         three = np.asarray(ghost.data[-1], dtype=float)
         assert three[:, 1].min() >= 59 and three[:, 2].min() >= 89, \
             "fragment 3's outline picked up fragment 2's voxels"
