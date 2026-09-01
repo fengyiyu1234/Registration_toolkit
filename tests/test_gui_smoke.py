@@ -237,10 +237,24 @@ def test_guide_mode_window(tmp, inputs):
         assert any("Ontology" in k for k in viewer.window._dock_widgets), \
             "the ontology picker did not build its panel"
 
+        tools = _widget(viewer, "Export & tools")
+        # WHICH sample is open, on screen rather than only in the config: the
+        # window title carries its name, and the banner pinned above the tools
+        # sections carries the paths behind it (with the full path as the
+        # tooltip, since the dock is narrower than they are).
+        assert "sample_registration" in viewer.title, viewer.title
+        banner = [(l.text(), l.toolTip()) for l in tools.findChildren(pm.QLabel)]
+        assert ("sample_registration", str(inputs.raw)) in banner, banner
+        assert any(text.startswith("image:") and tip == str(inputs.raw)
+                   for text, tip in banner), banner
+        assert any(text.startswith("export:") and tip == str(out)
+                   for text, tip in banner), banner
+        assert not any(text.startswith("resume:") for text, _ in banner), \
+            "no existing_mask_path was given, so that row must be dropped, not shown empty"
+
         # Regions are FILLED by default in both modes -- napari's own default,
         # never overridden here, and the thing single_sample.py was changed to
         # agree with.
-        tools = _widget(viewer, "Export & tools")
         checkbox = [b for b in tools.findChildren(pm.QCheckBox)
                     if "outline only" in b.text()][0]
         assert paint.contour == 0, "a region layer must start filled, not as an outline"
@@ -293,6 +307,18 @@ def test_labels_mode_window(tmp, inputs):
             f"{RAW_SHAPE} -- the isotropic grid's planes were never imaged")
         assert paint.data.any(), "the collapsed registration came out empty"
         assert "registration as-is (read-only)" in viewer.layers
+
+        # Same banner as guide mode, plus the registration being corrected --
+        # "which file of which sample" is the question this mode most needs
+        # answered before an hour of painting (see pm._sample_banner).
+        assert "sample_registration" in viewer.title, viewer.title
+        banner = [(l.text(), l.toolTip())
+                  for l in _widget(viewer, "Export & tools").findChildren(pm.QLabel)]
+        assert ("sample_registration", str(inputs.raw)) in banner, banner
+        assert any(text.startswith("registration:") and tip == str(inputs.labels)
+                   for text, tip in banner), banner
+        assert any(text.startswith("dense out:") and tip.endswith("corrected_guide_atlas.nii.gz")
+                   for text, tip in banner), banner
 
         panel = _widget(viewer, "Partition")
         listing = panel.findChildren(pm.QListWidget)[0]

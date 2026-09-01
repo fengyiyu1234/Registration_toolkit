@@ -116,6 +116,13 @@ blob rather than something that needs a meaningful value on every plane.
     tab group instead of inside it, since it is what you check after
     painting and should not need a tab click to see.
 
+  THE SAMPLE IS NAMED ON SCREEN: the window title carries it, and the strip
+    pinned above those sections repeats it with the files this session reads
+    and writes -- image, resume, and where the export is going
+    (_sample_banner). Both modes' windows are otherwise identical whichever
+    brain is in them, and the only record of which one that was used to be
+    the config, off in a terminal that had scrolled away.
+
   A "Relabel" section: click-to-fill a single already-painted blob into
     another label, or renumber one label across the whole volume. A bulk
     renumber carries that label's ontology assignment with it, so the number
@@ -562,16 +569,42 @@ def _widen_brush_size_slider(paint_layer, maximum=MAX_BRUSH_SIZE):
     paint_layer.brush_size = previous
 
 
+def _sample_name(image_path):
+    """What to call the open sample: the image file name with the image
+    suffix taken off (s12t_raw.nii.gz -> s12t_raw).
+
+    Nothing computed depends on it. It exists because both modes used to open
+    a window that looked identical whichever sample the config named, so two
+    sessions side by side -- or one reopened a day later against a config
+    that was never edited -- had nothing on screen saying which brain was
+    being painted."""
+    return _output_stem(image_path).name if image_path else ""
+
+
+def _short_path(path):
+    """The tail of a path, for a dock too narrow for the whole thing: the
+    parent directory and the file name. The full path goes in the tooltip;
+    these are absolute and several levels deep, and the tail is the part that
+    differs between samples."""
+    path = Path(path)
+    return f"\u2026/{path.parent.name}/{path.name}" if path.parent.name else path.name
+
+
 def _launch_viewer(arr, prefill, scale=None, title="Paint guide outline",
-                   layer_name="guide outline (paint here)"):
+                   layer_name="guide outline (paint here)", image_path=None):
     """The sample window: the grayscale volume plus the layer painted on.
 
     scale: optional (z, y, x) physical size per voxel, applied to BOTH layers
     so they stay registered to each other. Without it a raw 2.6/2.6/32 um
     stack is drawn as if it were isotropic, i.e. squashed 12x along z, which
     makes the orthogonal views unusable. Purely a display transform -- layer
-    .data, and therefore the export, is untouched."""
-    viewer = napari.Viewer(title=title)
+    .data, and therefore the export, is untouched.
+
+    image_path: only to put the sample's name in the window title (see
+    _sample_name). The layer keeps its fixed "sample" name -- that is what
+    the rest of the code and the tests look it up by."""
+    sample = _sample_name(image_path)
+    viewer = napari.Viewer(title=f"{title}  \u2014  {sample}" if sample else title)
     scale_kwargs = {"scale": scale} if scale is not None else {}
     viewer.add_image(arr, name="sample", colormap="gray", **scale_kwargs)
     paint_layer = viewer.add_labels(prefill.copy(), name=layer_name, **scale_kwargs)
@@ -725,7 +758,50 @@ def _export_controls(on_export, button_text):
     return section
 
 
-def _add_tools_panel(viewer, sections, name="Export & tools", area="left", open_first=True):
+def _sample_banner(image_path, rows):
+    """The strip at the top of the tools dock naming which sample is open,
+    and the files this session reads and writes.
+
+    The window title carries the name (see _sample_name); this carries the
+    paths behind it, which is the half that answers the question actually
+    worth asking before painting for an hour -- not just "which sample" but
+    "which FILE of it", i.e. was the resume picked up, is the registration
+    being corrected the one that was just re-run, where is this about to be
+    written. All of it is in the config and none of it was on screen.
+
+    It sits above the foldable sections and does not fold: it is three or
+    four lines, and a fact you want to be able to glance at is not one to put
+    behind a click.
+
+    `rows` is [(caption, path or None), ...]; a row with no path is dropped,
+    so callers can list an optional input unconditionally.
+    """
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 4)
+    layout.setSpacing(2)
+    heading = QLabel(_sample_name(image_path) or "(no image_path)")
+    heading.setStyleSheet("font-weight: bold; font-size: 14px;")
+    heading.setToolTip(str(image_path))
+    layout.addWidget(heading)
+    for caption, path in rows:
+        if not path:
+            continue
+        line = QLabel(f"{caption}: {_short_path(path)}")
+        # Wrapped, not clipped: the dock is shrinkable (its minimum width is 1),
+        # so a path too long for the current width would otherwise be cut off
+        # mid-word with nothing to say it had been.
+        line.setWordWrap(True)
+        line.setStyleSheet("color: rgba(255, 255, 255, 150);")
+        line.setToolTip(str(path))          # the whole path, on hover
+        line.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(line)
+    ontology_tree_ui.shrinkable(section)
+    return section
+
+
+def _add_tools_panel(viewer, sections, name="Export & tools", area="left", open_first=True,
+                     header=None):
     """Export, Relabel, Erase and Display as COLLAPSIBLE SECTIONS of one dock,
     on the LEFT, rather than four tab pages on the right.
 
@@ -749,12 +825,17 @@ def _add_tools_panel(viewer, sections, name="Export & tools", area="left", open_
     header toggles it -- several can be open at once, since they are
     independent controls rather than pages of one thing.
 
+    `header` is an optional widget pinned above them all, unfoldable (the
+    sample banner -- see _sample_banner).
+
     The dock is scroll-wrapped so it can still be dragged short on a laptop
     screen (the same helper napari's own layer controls get, for the same
     reason).
     """
     dock = QWidget()
     layout = QVBoxLayout(dock)
+    if header is not None:
+        layout.addWidget(header)
     for index, (title, widget) in enumerate(sections):
         if index:
             # Painted rather than a sunken QFrame line: napari's dark theme
@@ -2516,7 +2597,8 @@ def _run_guide(args):
                   f"that still has its sidecar.")
 
     viewer, paint_layer = _launch_viewer(
-        arr, prefill, scale=display_scale_from_voxel_size(args.voxel_size_um))
+        arr, prefill, scale=display_scale_from_voxel_size(args.voxel_size_um),
+        image_path=args.image_path)
 
     # The atlas ontology is loaded here only to populate the region-assignment
     # tree and check which structures this annotation actually has voxels
@@ -2652,7 +2734,11 @@ def _run_guide(args):
         ("Erase", _erase_controls(viewer, paint_layer)),
         ("Reposition", reposition_section),
         ("Display", _display_controls([paint_layer, reposition_state.fragments_layer])),
-    ], name="Export & tools")
+    ], name="Export & tools",
+       header=_sample_banner(args.image_path, [
+           ("image", args.image_path),
+           ("resume", args.existing_mask_path),
+           ("export", args.output_path)]))
     # The region brush selected, not the fragments layer added after it:
     # painting regions is what this window is for, and a session that never
     # touches Reposition should not have to find its way back.
@@ -3382,7 +3468,8 @@ def _run_labels(args):
 
     viewer, paint_layer = _launch_viewer(
         sample_arr, prefill, scale=display_scale_from_voxel_size(raw_voxel_um),
-        title="Correct a registration result", layer_name="regions (paint here)")
+        title="Correct a registration result", layer_name="regions (paint here)",
+        image_path=args.image_path)
     paint_layer.opacity = 0.5
     scale_kwargs = {"scale": display_scale_from_voxel_size(raw_voxel_um)}
     # The untouched registration, to compare a keyframe against once
@@ -3651,7 +3738,13 @@ def _run_labels(args):
         ("Reposition", reposition_section),
         ("Display", _display_controls([paint_layer, reference, atlas_regions,
                                        reposition_state.fragments_layer])),
-    ], name="Export & tools")
+    ], name="Export & tools",
+       header=_sample_banner(args.image_path, [
+           ("image", args.image_path),
+           ("registration", args.labels_path),
+           ("resume", resume_path if resume is not None else None),
+           ("guide out", args.output_path),
+           ("dense out", dense_output_path)]))
     # The brush layer selected, not whichever was added last: napari hands the
     # keyboard and the paint tools to the ACTIVE layer, and this window opens
     # with five of them.
