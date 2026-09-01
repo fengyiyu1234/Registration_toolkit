@@ -743,7 +743,7 @@ def test_assignment_panel_drops_one_region(tmp, inputs):
 
 
 def test_panels_are_tabbed_and_short(tmp, inputs):
-    print("8. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
+    print("20. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
     import paint_mask as pm
     from PyQt5.QtWidgets import QScrollArea
     from shared import atlas_reference
@@ -841,7 +841,7 @@ def _reposition_section(pm, viewer):
 
 
 def test_reposition_panel(tmp, inputs):
-    print("9. paint_mask: the Reposition section in guide mode -- pose, keyframe, export, resume...")
+    print("8. paint_mask: the Reposition section in guide mode -- pose, keyframe, export, resume...")
     import paint_mask as pm
     from shared import atlas_reference
     from registration_ants import reposition as rp
@@ -926,7 +926,7 @@ def test_reposition_panel(tmp, inputs):
 
 
 def test_reposition_grab_from_click(tmp, inputs):
-    print("10. paint_mask: grabbing a piece from a click, cleanly across the crack...")
+    print("9. paint_mask: grabbing a piece from a click, cleanly across the crack...")
     import numpy as np
     import tifffile
     import paint_mask as pm
@@ -969,7 +969,7 @@ def test_reposition_grab_from_click(tmp, inputs):
 
 
 def test_reposition_segments_belong_to_a_fragment(tmp, inputs):
-    print("11. paint_mask: line pairs are tagged per fragment, and survive a reopen...")
+    print("10. paint_mask: line pairs are tagged per fragment, and survive a reopen...")
     import numpy as np
     import paint_mask as pm
     from shared import atlas_reference
@@ -1006,6 +1006,9 @@ def test_reposition_segments_belong_to_a_fragment(tmp, inputs):
         # 1's on-fragment line was drawn first, fragment 2's second.
         assert list(segments.features["role"]) == ["source", "target", "target", "source"], \
             segments.features
+        # Both facts are written on the canvas, because neither is recoverable
+        # from the colour: the cycle groups by fragment but names none of them.
+        assert segments.text.string.format == "f{fragment} {role}", segments.text.string
         widths = list(np.atleast_1d(segments.edge_width))
         assert widths[0] > widths[1] and widths[3] > widths[2], widths
 
@@ -1051,7 +1054,7 @@ def test_reposition_segments_belong_to_a_fragment(tmp, inputs):
 
 
 def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
-    print("12. paint_mask: cortex split in three -- three fragments closing toward the middle...")
+    print("11. paint_mask: cortex split in three -- three fragments closing toward the middle...")
     import numpy as np
     import tifffile
     import paint_mask as pm
@@ -1102,7 +1105,7 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
 
 
 def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
-    print("13. paint_mask: no voxel_size_um -> the panel opens but will not export a plan...")
+    print("12. paint_mask: no voxel_size_um -> the panel opens but will not export a plan...")
     import numpy as np
     import paint_mask as pm
     from pathlib import Path
@@ -1140,7 +1143,7 @@ def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
 
 
 def test_reposition_cut_brush_separates_touching_pieces(tmp, inputs):
-    print("14. paint_mask: a cut stroke gets a grab past a crack too tight to threshold...")
+    print("13. paint_mask: a cut stroke gets a grab past a crack too tight to threshold...")
     import numpy as np
     import tifffile
     from pathlib import Path
@@ -1201,7 +1204,7 @@ def test_reposition_cut_brush_separates_touching_pieces(tmp, inputs):
 
 
 def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
-    print("15. paint_mask: per-plane grab for pieces that overlap in xy at different z...")
+    print("14. paint_mask: per-plane grab for pieces that overlap in xy at different z...")
     import numpy as np
     import tifffile
     import paint_mask as pm
@@ -1257,7 +1260,7 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
 
 
 def test_reposition_draw_and_copy_segment_buttons(tmp, inputs):
-    print("16. paint_mask: the draw/copy segment buttons, and that a copy keeps its length...")
+    print("15. paint_mask: the draw/copy segment buttons, and that a copy keeps its length...")
     import numpy as np
     import paint_mask as pm
     from shared import atlas_reference
@@ -1301,7 +1304,7 @@ def test_reposition_draw_and_copy_segment_buttons(tmp, inputs):
 
 
 def test_reposition_export_stays_sparse(tmp, inputs):
-    print("17. paint_mask: the exported outline keeps the grabbed planes, and reopens as them...")
+    print("16. paint_mask: the exported outline keeps the grabbed planes, and reopens as them...")
     import numpy as np
     import SimpleITK as sitk
     from pathlib import Path
@@ -1348,7 +1351,7 @@ def test_reposition_export_stays_sparse(tmp, inputs):
 
 
 def test_reposition_grab_is_armed_then_clicked(tmp, inputs):
-    print("18. paint_mask: the grab button arms a click, and the result becomes visible...")
+    print("17. paint_mask: the grab button arms a click, and the result becomes visible...")
     import numpy as np
     import tifffile
     from types import SimpleNamespace
@@ -1399,7 +1402,7 @@ def test_reposition_grab_is_armed_then_clicked(tmp, inputs):
 
 
 def test_reposition_grab_prefers_the_painted_mask(tmp, inputs):
-    print("19. paint_mask: a grab takes the painted outline, not a threshold of the image...")
+    print("18. paint_mask: a grab takes the painted outline, not a threshold of the image...")
     import numpy as np
     import tifffile
     import paint_mask as pm
@@ -1457,6 +1460,47 @@ def test_reposition_grab_prefers_the_painted_mask(tmp, inputs):
     print("   OK")
 
 
+
+def test_reposition_names_follow_their_fragment(tmp, inputs):
+    print("19. paint_mask: a fragment's name stays with it when the number changes...")
+    import numpy as np
+    import paint_mask as pm
+    from shared import atlas_reference
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "names.nii.gz", voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        data = frag.data.copy()
+        data[2, 5:25, 5:25] = 1
+        data[2, 40:60, 5:25] = 2
+        frag.data = data
+        name_edit = tools.findChild(pm.QLineEdit, "reposition_name")
+        assert name_edit is not None, "the fragment name field was not found"
+        viewer.dims.set_current_step(0, 2)
+
+        boxes["fragment"].setValue(1)
+        name_edit.setText("flap A")
+        _button(tools, "Set keyframe on this plane").click()
+
+        # Switching must reload the box, or fragment 2 inherits "flap A" the
+        # moment its keyframe is set -- two pieces with one name, in the plan
+        # and in every QC line that quotes it.
+        boxes["fragment"].setValue(2)
+        assert name_edit.text() == "", f"the previous fragment's name stayed: {name_edit.text()!r}"
+        name_edit.setText("flap B")
+        _button(tools, "Set keyframe on this plane").click()
+
+        boxes["fragment"].setValue(1)
+        assert name_edit.text() == "flap A", name_edit.text()
+
+        names = {f["label"]: f["name"] for f in _viewer_plan(viewer, pm)["fragments"]}
+        assert names == {1: "flap A", 2: "flap B"}, names
+    finally:
+        viewer.close()
+    print("   OK")
+
+
 def main():
     print("=== tests/test_gui_smoke.py ===")
     if not _ensure_display():
@@ -1492,6 +1536,7 @@ def main():
         test_reposition_export_stays_sparse(tmp, inputs)
         test_reposition_grab_is_armed_then_clicked(tmp, inputs)
         test_reposition_grab_prefers_the_painted_mask(tmp, inputs)
+        test_reposition_names_follow_their_fragment(tmp, inputs)
         test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")
     return 0

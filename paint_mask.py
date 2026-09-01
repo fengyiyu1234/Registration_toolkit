@@ -1199,13 +1199,22 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         feature_defaults={"fragment": 1, "role": "?"},
         edge_color="fragment", edge_color_cycle=list(_FRAGMENT_COLOURS),
         face_color="transparent", edge_width=2, **scale_kwargs)
-    # Which line is which, written on the canvas. napari's Shapes has no dashed
-    # edge to spend on the distinction, and a colour would collide with the one
-    # already carrying the fragment number -- so the roles are spelled out
-    # instead of encoded, and need no legend to read. They are recomputed from
-    # the outline as the lines move, so the label is the answer the fit will
-    # use, visible before the fit is asked for.
-    segments.text = {"string": "{role}", "size": 9, "color": "white", "anchor": "upper_left"}
+    # WHICH FRAGMENT, AND WHICH END -- both written on the canvas.
+    #
+    # The colour cycle groups lines by fragment but cannot name one: napari
+    # assigns cycle colours in order of first appearance, so fragment 2 is
+    # green only if it happened to be drawn second. Good enough for "these two
+    # go together", useless for "this one is fragment 2", which is the question
+    # actually asked once several pieces have lines on the canvas at once. So
+    # the number is printed.
+    #
+    # The role is printed for a different reason: Shapes has no dashed edge to
+    # spend on source-vs-target, and a second colour would collide with the
+    # first. It is recomputed from the outline as the lines move, so what is
+    # written is the answer the fit will use, visible before the fit is asked
+    # for.
+    segments.text = {"string": "f{fragment} {role}", "size": 9, "color": "white",
+                     "anchor": "upper_left"}
     for label, pair in resumed_segments:
         # Back into the layer in microns -> voxels, tagged with their fragment,
         # so reopening shows what each keyframe was fitted from rather than an
@@ -1235,6 +1244,9 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     label_layout.addWidget(label_spin)
     name_edit = QLineEdit()
     name_edit.setPlaceholderText("name (optional)")
+    # Named for the same reason the spin box and sliders are: the tools dock
+    # holds several line edits, and findChild() hands back whichever is first.
+    name_edit.setObjectName("reposition_name")
     label_layout.addWidget(name_edit, 1)
     layout.addWidget(label_row)
 
@@ -1345,10 +1357,17 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                     + ("  \u25c0\u25b6" if kf.get("segments") else ""))
                 item.setData(Qt.UserRole, (label, z))
                 keyframes_list.addItem(item)
-        counts = ", ".join(f"{lab}:{len(e['keyframes'])}"
-                           for lab, e in sorted(fragments.items()) if e["keyframes"])
-        status.setText(f"keyframes per fragment -- {counts}" if counts else
-                       "no keyframes yet: pose a plane, then Set keyframe.")
+        rows = []
+        for lab, e in sorted(fragments.items()):
+            planes = sorted(int(z) for z in np.unique(np.nonzero(frag_layer.data == lab)[0]))
+            if not planes and not e["keyframes"]:
+                continue
+            rows.append(f"{lab}{' ' + e['name'] if e['name'] else ''}: "
+                        f"{len(planes)} grabbed plane(s)"
+                        + (f" {planes[0]}..{planes[-1]}" if planes else "")
+                        + f", {len(e['keyframes'])} keyframe(s)")
+        status.setText("\n".join(rows) if rows else
+                       "No fragments yet: pick a number, Grab this plane, then click a piece.")
 
     def load_plane(*_):
         """Sliders follow the plane being looked at, so scrolling through a
@@ -1372,6 +1391,13 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         dz_box.blockSignals(True)
         dz_box.setValue(tf["dz_planes"] if tf else 0)
         dz_box.blockSignals(False)
+        # The name follows the fragment too. It is only READ on Set keyframe,
+        # so leaving the previous fragment's name in the box means the next one
+        # silently inherits it -- two pieces called the same thing, in the plan
+        # and in every QC line that quotes it.
+        name_edit.blockSignals(True)
+        name_edit.setText(e.get("name", ""))
+        name_edit.blockSignals(False)
         c = centre_for(label_spin.value())
         centre_label.setText(f"rotation centre: x={c[0]:.0f} y={c[1]:.0f} um")
 
