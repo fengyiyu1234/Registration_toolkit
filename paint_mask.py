@@ -1525,14 +1525,14 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             except ValueError:
                 pass
             viewer.layers.selection, frag_layer.mode = previous
-            grab_fragment(event.position)
+            do_grab(event.position)
 
         viewer.mouse_drag_callbacks.append(on_click)
         status.setText(f"Now click the piece in the image, on this plane, as fragment "
                        f"{label_spin.value()}.")
         return on_click
 
-    def grab_fragment(position):
+    def do_grab(position):
         """Take the fragment from a click instead of a traced outline.
 
         On the planes where it is open, a flap is already its own connected
