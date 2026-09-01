@@ -743,7 +743,7 @@ def test_assignment_panel_drops_one_region(tmp, inputs):
 
 
 def test_panels_are_tabbed_and_short(tmp, inputs):
-    print("19. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
+    print("8. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
     import paint_mask as pm
     from PyQt5.QtWidgets import QScrollArea
     from shared import atlas_reference
@@ -841,7 +841,7 @@ def _reposition_section(pm, viewer):
 
 
 def test_reposition_panel(tmp, inputs):
-    print("8. paint_mask: the Reposition section in guide mode -- pose, keyframe, export, resume...")
+    print("9. paint_mask: the Reposition section in guide mode -- pose, keyframe, export, resume...")
     import paint_mask as pm
     from shared import atlas_reference
     from registration_ants import reposition as rp
@@ -926,7 +926,7 @@ def test_reposition_panel(tmp, inputs):
 
 
 def test_reposition_grab_from_click(tmp, inputs):
-    print("9. paint_mask: grabbing a flap from a click, and where it decides the hinge is...")
+    print("10. paint_mask: grabbing a piece from a click, cleanly across the crack...")
     import numpy as np
     import tifffile
     import paint_mask as pm
@@ -969,7 +969,7 @@ def test_reposition_grab_from_click(tmp, inputs):
 
 
 def test_reposition_segments_belong_to_a_fragment(tmp, inputs):
-    print("10. paint_mask: line pairs are tagged per fragment, and survive a reopen...")
+    print("11. paint_mask: line pairs are tagged per fragment, and survive a reopen...")
     import numpy as np
     import paint_mask as pm
     from shared import atlas_reference
@@ -1051,7 +1051,7 @@ def test_reposition_segments_belong_to_a_fragment(tmp, inputs):
 
 
 def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
-    print("11. paint_mask: cortex split in three -- three fragments closing toward the middle...")
+    print("12. paint_mask: cortex split in three -- three fragments closing toward the middle...")
     import numpy as np
     import tifffile
     import paint_mask as pm
@@ -1102,7 +1102,7 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
 
 
 def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
-    print("12. paint_mask: no voxel_size_um -> the panel opens but will not export a plan...")
+    print("13. paint_mask: no voxel_size_um -> the panel opens but will not export a plan...")
     import numpy as np
     import paint_mask as pm
     from pathlib import Path
@@ -1140,7 +1140,7 @@ def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
 
 
 def test_reposition_cut_brush_separates_touching_pieces(tmp, inputs):
-    print("13. paint_mask: a cut stroke gets a grab past a crack too tight to threshold...")
+    print("14. paint_mask: a cut stroke gets a grab past a crack too tight to threshold...")
     import numpy as np
     import tifffile
     from pathlib import Path
@@ -1201,7 +1201,7 @@ def test_reposition_cut_brush_separates_touching_pieces(tmp, inputs):
 
 
 def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
-    print("14. paint_mask: per-plane grab for pieces that overlap in xy at different z...")
+    print("15. paint_mask: per-plane grab for pieces that overlap in xy at different z...")
     import numpy as np
     import tifffile
     import paint_mask as pm
@@ -1257,7 +1257,7 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
 
 
 def test_reposition_draw_and_copy_segment_buttons(tmp, inputs):
-    print("15. paint_mask: the draw/copy segment buttons, and that a copy keeps its length...")
+    print("16. paint_mask: the draw/copy segment buttons, and that a copy keeps its length...")
     import numpy as np
     import paint_mask as pm
     from shared import atlas_reference
@@ -1301,7 +1301,7 @@ def test_reposition_draw_and_copy_segment_buttons(tmp, inputs):
 
 
 def test_reposition_export_stays_sparse(tmp, inputs):
-    print("16. paint_mask: the exported outline keeps the grabbed planes, and reopens as them...")
+    print("17. paint_mask: the exported outline keeps the grabbed planes, and reopens as them...")
     import numpy as np
     import SimpleITK as sitk
     from pathlib import Path
@@ -1397,6 +1397,66 @@ def test_reposition_grab_is_armed_then_clicked(tmp, inputs):
     print("   OK")
 
 
+
+def test_reposition_grab_prefers_the_painted_mask(tmp, inputs):
+    print("19. paint_mask: a grab takes the painted outline, not a threshold of the image...")
+    import numpy as np
+    import tifffile
+    import paint_mask as pm
+    from shared import atlas_reference
+
+    # The image and the painted outline DISAGREE on purpose: the bright region
+    # is wider than what was traced. A grab that reads the image comes back
+    # with the wide shape, one that reads the paint comes back with the traced
+    # one, and only the second is what someone who painted it expects.
+    stack = np.full((8, 200, 220), 50, dtype=np.uint16)
+    stack[:, 90:180, 20:200] = 3000
+    stack[2:6, 20:70, 40:180] = 3000              # bright: x 40..180
+    raw = tmp / "disagree.tif"
+    tifffile.imwrite(str(raw), stack)
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "painted.nii.gz",
+                         image_path=str(raw), voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        paint = viewer.layers["guide outline (paint here)"]
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        painted = paint.data.copy()
+        painted[3, 20:70, 60:160] = 2             # traced narrower: x 60..160
+        paint.data = painted
+
+        switch = [c for c in tools.findChildren(pm.QCheckBox)
+                  if "painted mask" in c.text()][0]
+        assert switch.isChecked(), "the painted outline should be the default source"
+
+        viewer.dims.set_current_step(0, 3)
+        _grab_at(pm, viewer, tools, (3, 45, 110))
+        got = frag.data[3] == 1
+        assert got[45, 70] and not got[45, 45], \
+            "the grab took the image's shape, not the outline that was painted"
+        assert int(got.sum()) == int((painted[3] == 2).sum()), "the traced shape was not taken"
+
+        # Untick and it reads the image instead -- the fallback for a plane
+        # that was never painted, or an outline drawn across the crack.
+        switch.setChecked(False)
+        boxes["fragment"].setValue(2)
+        _grab_at(pm, viewer, tools, (3, 45, 110))
+        wide = frag.data[3] == 2
+        assert wide[45, 45], "unticking did not fall back to the image"
+
+        # And on a plane with no paint it falls back on its own, and says so.
+        switch.setChecked(True)
+        boxes["fragment"].setValue(3)
+        viewer.dims.set_current_step(0, 4)
+        _grab_at(pm, viewer, tools, (4, 45, 110))
+        assert (frag.data[4] == 3).any(), "an unpainted plane grabbed nothing"
+        assert any("nothing painted on plane 4" in w.text()
+                   for w in tools.findChildren(pm.QLabel)), "the fallback was silent"
+    finally:
+        viewer.close()
+    print("   OK")
+
+
 def main():
     print("=== tests/test_gui_smoke.py ===")
     if not _ensure_display():
@@ -1431,6 +1491,7 @@ def main():
         test_reposition_draw_and_copy_segment_buttons(tmp, inputs)
         test_reposition_export_stays_sparse(tmp, inputs)
         test_reposition_grab_is_armed_then_clicked(tmp, inputs)
+        test_reposition_grab_prefers_the_painted_mask(tmp, inputs)
         test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")
     return 0

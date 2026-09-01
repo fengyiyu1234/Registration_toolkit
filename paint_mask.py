@@ -1150,7 +1150,8 @@ def _export_reposition(state, output_path):
         return []
 
 
-def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=None):
+def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=None,
+                         paint_layer=None):
     """Build the Reposition section. Returns (widget, state), where state
     carries `export(output_path)` for the mode's own export to call and
     `plan()` for anything else that wants the current transforms."""
@@ -1246,6 +1247,18 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     for row in (tx_row, ty_row, th_row, dz_row):
         layout.addWidget(row)
 
+    # WHERE A GRAB LOOKS FOR TISSUE. The outline already painted is the better
+    # answer wherever it exists: it is a hand-drawn boundary, so it follows the
+    # anatomy and carries no debris, no specks and no threshold to tune. What
+    # it does not do is exist on every plane -- a guide is painted on keyframes
+    # -- so the raw stack, thresholded, is the fallback and stays selectable
+    # for a plane that was never painted, or for an outline drawn as one rough
+    # blob straight across the crack (a component cannot separate what was
+    # painted together).
+    from_painted = QCheckBox("grab from the painted mask (else image threshold)")
+    from_painted.setChecked(paint_layer is not None)
+    from_painted.setEnabled(paint_layer is not None)
+    layout.addWidget(from_painted)
     grab_row, grab_box = _slider_row("tissue", float(image_arr.min()), float(image_arr.max()),
                                      decimals=0, suffix="", name="reposition_threshold")
     grab_box.setValue(reposition.otsu_threshold(image_arr))
@@ -1548,19 +1561,32 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         grab replaces only THIS plane for this fragment, so the planes already
         grabbed for it survive and clicking a second one accumulates.
 
-        The threshold, not the guide layer, is what tissue means here: a guide
-        outline is sparse keyframes interpolated into a smooth blob, and that
-        interpolation closes the thin crack this depends on.
+        Where "tissue" comes from is the `grab from the painted mask` switch
+        above: the outline already painted on this plane when there is one, the
+        raw stack thresholded otherwise. Painted wins by default because it is
+        a boundary someone drew -- it follows the anatomy, has no specks in it
+        and needs no threshold tuned. It is not always available (a guide lives
+        on keyframe planes only) and not always usable (an outline drawn as one
+        blob across the crack has already joined what a component would have to
+        separate), which is what the fallback is for. The status line always
+        says which was used.
         """
         seed = tuple(int(round(position[axis] / (scale[axis] if scale else 1.0)))
                      for axis in (0, 1, 2))
         label = label_spin.value()
         try:
             cuts = frag_layer.data == _REPOSITION_CUT_LABEL
-            mask, note = reposition.grab_plane(
-                reposition.threshold_planes(image_arr, grab_box.value(),
-                                            exclude=cuts if cuts.any() else None),
-                seed)
+            excl = cuts if cuts.any() else None
+            painted = (paint_layer.data if (from_painted.isChecked() and paint_layer is not None)
+                       else None)
+            if painted is not None and painted[seed[0]].any():
+                source = "the painted mask"
+                tissue = reposition.threshold_planes(painted, 0, exclude=excl)
+            else:
+                source = ("the image threshold" if painted is None else
+                          f"the image threshold (nothing painted on plane {seed[0]})")
+                tissue = reposition.threshold_planes(image_arr, grab_box.value(), exclude=excl)
+            mask, note = reposition.grab_plane(tissue, seed)
         except ValueError as exc:
             status.setText(str(exc))
             return
@@ -1573,13 +1599,14 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         # that did nothing.
         frag_layer.visible = True
         entry(label)["center_um"] = None         # the centroid moved with the new outline
-        print(f"Grabbed fragment {label} from (z={seed[0]}, y={seed[1]}, x={seed[2]}): {note}")
+        print(f"Grabbed fragment {label} at (z={seed[0]}, y={seed[1]}, x={seed[2]}) "
+              f"using {source}: {note}")
         planes_now = sorted(int(z) for z in np.unique(np.nonzero(data == label)[0]))
-        status.setText(f"Fragment {label}: {note}\n"
-                       f"now spans plane(s) {planes_now[0]}..{planes_now[-1]} "
-                       f"({len(planes_now)} grabbed)\n\nToo much or too little? The 'tissue' "
-                       f"slider decides what counts as tissue -- a crack only separates the "
-                       f"pieces while it sits above the gap. If they touch, use 'Draw a cut'.")
+        status.setText(f"Fragment {label}: {note}, from {source}.\n"
+                       f"Now spans plane(s) {planes_now[0]}..{planes_now[-1]} "
+                       f"({len(planes_now)} grabbed).\n\nWrong shape? Untick 'grab from the "
+                       f"painted mask' to use the image instead (the 'tissue' slider then "
+                       f"decides what counts). If the pieces touch either way, 'Draw a cut'.")
         refresh_roles()
         load_plane()
 
@@ -2590,7 +2617,7 @@ def _run_guide(args):
     reposition_section, reposition_state = _reposition_controls(
         viewer, arr, args.voxel_size_um,
         scale=display_scale_from_voxel_size(args.voxel_size_um),
-        resume=load_reposition_resume(args.output_path))
+        resume=load_reposition_resume(args.output_path), paint_layer=paint_layer)
 
     tools_dock = _add_tools_panel(viewer, [
         ("Export", _export_controls(export, "Export Outline")),
@@ -3586,7 +3613,7 @@ def _run_labels(args):
     reposition_section, reposition_state = _reposition_controls(
         viewer, sample_arr, raw_voxel_um,
         scale=display_scale_from_voxel_size(raw_voxel_um),
-        resume=load_reposition_resume(args.output_path))
+        resume=load_reposition_resume(args.output_path), paint_layer=paint_layer)
 
     tools_dock = _add_tools_panel(viewer, [
         ("Export", _export_controls(export, "Export Guide + Atlas")),
