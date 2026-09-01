@@ -450,12 +450,21 @@ def test_labels_mode_window(tmp, inputs):
         on_move(viewer, SimpleNamespace(position=tuple(c * s for c, s in zip(zyx, scale))))
         assert "REPAINTED" in bar.text(), bar.text()
 
+        # A cracked piece, grabbed and left unposed -- test 4 reopens this
+        # export under new names and has to find it again.
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        frag_data = frag.data.copy()
+        frag_data[2, 20:40, 20:40] = 2
+        frag.data = frag_data
+
         _button(_widget(viewer, "Export & tools"), "Export Guide + Atlas").click()
 
         atlas_out = tmp / "corrected_guide_atlas.nii.gz"
         for path in (out, atlas_out, tmp / "corrected_guide.regions.json",
                      tmp / "corrected_guide.annotated_slices.json",
-                     tmp / "corrected_guide_atlas.keyframes.json"):
+                     tmp / "corrected_guide_atlas.keyframes.json",
+                     tmp / "corrected_guide.reposition.json",
+                     tmp / "corrected_guide_fragments.nii.gz"):
             assert path.exists(), f"Export wrote no {path.name}"
 
         guide = sitk.GetArrayFromImage(sitk.ReadImage(str(out)))
@@ -549,6 +558,12 @@ def test_labels_mode_resume_from(tmp, inputs):
             "resume_from must restore round 1's keyframes"
         assert _widget(viewer, "Partition").findChildren(pm.QListWidget)[0].count() > 2, \
             "resume_from must restore round 1's partition too"
+        # ...and the fragments, which are the case a new output name used to
+        # lose: round 1's plan sits next to round 1's GUIDE stem, and nothing
+        # in this config names it -- the dense file's sidecar does, via the
+        # guide_path it recorded when it was written.
+        assert (viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER].data == 2).any(), \
+            "the fragment grabbed in round 1 did not survive the new output names"
 
         _button(_widget(viewer, "Export & tools"), "Export Guide + Atlas").click()
         for path in (out2, dense2, tmp / "round2_atlas.keyframes.json",
@@ -913,6 +928,13 @@ def test_reposition_panel(tmp, inputs):
 
         _button(tools, "Boundary check").click()
 
+        # A couple of painted planes as well, so this export writes a guide
+        # volume too -- the next round below is opened ON it (existing_mask_
+        # path), which is how a real second round starts.
+        paint = viewer.layers["guide outline (paint here)"]
+        paint.data[1, 30:60, 30:60] = 1
+        paint.data[5, 30:60, 30:60] = 1
+        paint.refresh()
         _button(tools, "Export Outline").click()
     finally:
         viewer.close()
@@ -933,6 +955,53 @@ def test_reposition_panel(tmp, inputs):
         assert [k["z"] for k in resumed["fragments"][0]["keyframes"]] == [1, 5], resumed
         assert (viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER].data == 1).any(), \
             "the fragment outlines did not come back"
+    finally:
+        viewer.close()
+
+    # NEXT ROUND, NEW OUTPUT NAME -- how rounds are actually done (the config
+    # template says to keep each round's export as a snapshot). The paint layer
+    # is resumed from existing_mask_path, and the fragments have to follow it:
+    # keyed on output_path alone they were left behind at the old stem, so a
+    # second round opened with the pieces gone and a plan that moved nothing.
+    round2 = tmp / "repo_round2.nii.gz"
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, round2.name,
+                         existing_mask_path=str(out))
+    try:
+        _reposition_section(pm, viewer)
+        resumed = _viewer_plan(viewer, pm)
+        assert [k["z"] for k in resumed["fragments"][0]["keyframes"]] == [1, 5], resumed
+        assert (viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER].data == 1).any(), \
+            "the fragment outlines did not follow the guide into the next round"
+    finally:
+        viewer.close()
+
+    # GRABBED BUT NOT YET POSED. Separating the pieces is the slow half of the
+    # work; it used to export nothing at all until the first keyframe existed,
+    # so quitting after an afternoon of grabbing lost every one of them.
+    grabbed = tmp / "grabbed.nii.gz"
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, grabbed.name, voxel_size_um=RAW_UM)
+    try:
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        data = frag.data.copy()
+        data[2, 12:22, 12:22] = 3
+        data[2, 30:40, 30:40] = pm._REPOSITION_CUT_LABEL
+        frag.data = data
+        _button(_reposition_section(pm, viewer)[0], "Export Outline").click()
+    finally:
+        viewer.close()
+    stem = pm._output_stem(str(grabbed))
+    assert Path(f"{stem}.reposition.json").exists(), \
+        "grabbed fragments with no keyframe yet exported nothing"
+    saved = rp.read_plan(Path(f"{stem}.reposition.json"))
+    assert [f["label"] for f in saved["fragments"]] == [3], saved["fragments"]
+    assert saved["fragments"][0]["keyframes"] == [], "a grab is not a move"
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, grabbed.name, voxel_size_um=RAW_UM)
+    try:
+        back = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER].data
+        assert (back == 3).any(), "the grabbed-but-unposed fragment did not come back"
+        assert not (back == pm._REPOSITION_CUT_LABEL).any(), \
+            "cuts steer a grab and must not be shipped or restored"
     finally:
         viewer.close()
 

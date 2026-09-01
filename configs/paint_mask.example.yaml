@@ -48,6 +48,10 @@ common:
 # guide —— 只有 mode: guide 读
 # =====================================================================================
 guide:
+  # 接着上一轮画：指向上一轮导出的 outline（连同它的 .regions.json）。
+  # Reposition 的碎片（<stem>_fragments.nii.gz + <stem>.reposition.json）也跟着
+  # 这个路径回来：本轮换了新的 output_path 时，先在 output_path 旁边找，找不到
+  # 再到这里指的上一轮 stem 旁边找。
   existing_mask_path:
 
 # =====================================================================================
@@ -75,6 +79,9 @@ labels:
   #   output_path:        .../tsc12t_guide2.nii.gz
   # 恢复回来的只有记录在案的手画平面；中间的插值平面每次都从 labels_path 重算，
   # 所以 labels_path 永远指向最初的配准输出，绝不要改成这里的稠密文件。
+  # Reposition 的碎片也跟着一起回来：稠密文件的 .keyframes.json 里记着它当初是
+  # 和哪个 guide 一起导出的，碎片和 plan 就在那个 stem 旁边（换了新的
+  # output_path 也不会丢）。
   resume_from:
 
   partition_path: /home/fyu7/My_project/Registration_ants/atlas/mask/s12t_DeMBAguide7.regions.json

@@ -1152,6 +1152,18 @@ VOXEL_SIZE_UM_NOTE = (
 #   Set keyframe           records the current sliders for this plane. Planes
 #                          between keyframes interpolate; outside them nothing
 #                          moves, and nothing tapers to identity on its own.
+#
+# WHAT SURVIVES A REOPEN. Two files, written next to the mode's own export:
+# <stem>_fragments.nii.gz (the outlines, sparse -- the planes with voxels ARE
+# the grabbed planes) and <stem>.reposition.json (the plan). Both go out as
+# soon as anything has been GRABBED, keyframes or not, because separating the
+# pieces is the slow half of the work and losing it to "nothing has moved yet"
+# is losing the afternoon. Coming back the other way, the plan is looked for
+# next to output_path AND next to the file this session is resuming from
+# (load_reposition_resume) -- rounds are normally given new output names, and
+# keying only on the new one left every fragment behind at the old stem. Cuts
+# are the exception and do not survive: they steer a grab, the pipeline has no
+# fragment for them, and redrawing one takes a second.
 
 _REPOSITION_FRAGMENTS_LAYER = "fragments to reposition (paint here)"
 _REPOSITION_SEGMENTS_LAYER = "reposition segments (draw 2 lines)"
@@ -1251,6 +1263,13 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     fragments = {}          # label -> {"name": str, "center_um": [x, y], "keyframes": {z: kf}}
     pending_segments = {}   # label -> the pair last fitted from, until it is keyframed
     resumed_segments = []   # (label, pair) recovered from a previous session's plan
+    if resume is not None and tuple(resume["plan"]["image_shape_zyx"]) != tuple(image_arr.shape):
+        # A plan found next to a previous round's stem is not necessarily this
+        # sample's (see load_reposition_resume): plane numbers and micron
+        # offsets only mean anything on the grid they were drawn on.
+        print(f"WARNING: the reposition plan was drawn on a {tuple(resume['plan']['image_shape_zyx'])} "
+              f"volume but this sample is {tuple(image_arr.shape)} -- not resuming it.")
+        resume = None
     if resume is not None:
         for frag in resume.get("plan", {}).get("fragments", []):
             label = int(frag["label"])
@@ -1831,12 +1850,39 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
 
     def export(output_path):
         """Write the fragment outlines and the plan next to the mode's own
-        export, and return the paths. Nothing is written when no fragment
-        moves: an empty plan next to every guide would be one more file to
-        decide about on samples that never cracked."""
+        export, and return the paths.
+
+        Written as soon as anything has been GRABBED, not only once something
+        moves. Separating the pieces is the slow half of the work and the
+        keyframes are the quick half, so a session that grabbed three
+        fragments and stopped before posing them used to export NOTHING --
+        and reopened with a blank fragments layer, the grabs gone. A plan with
+        no keyframes is meaningful in its own right (see
+        reposition.make_fragment: a fragment without them does not move), so
+        there is one to write.
+
+        A sample that never cracked still writes nothing, which is what that
+        rule was protecting: its fragments layer is empty, so there is nothing
+        to describe and no file to decide about later."""
+        # Cuts steer the grab and nothing else: leaving them in would ship a
+        # label the pipeline has no fragment for, sitting exactly on the seam.
+        # They are therefore not in what comes back on a reopen either -- a
+        # cut is redrawn in the second it takes, and the pieces it separated
+        # are already separate in the outlines.
+        outlines = np.where(frag_layer.data == _REPOSITION_CUT_LABEL, 0, frag_layer.data)
+        drawn = [int(v) for v in np.unique(outlines) if v]
         plan = build_plan()
-        if not any(f["keyframes"] for f in plan["fragments"]):
+        if not drawn and not any(f["keyframes"] for f in plan["fragments"]):
             return []
+        # Every label ON THE CANVAS gets a fragment entry, keyframes or not:
+        # that entry is what carries the number (and the name) back into next
+        # session's panel. build_plan only knows the labels the panel has an
+        # entry for, which a label painted straight onto the layer with the
+        # brush, rather than grabbed, never gets.
+        described = {int(f["label"]) for f in plan["fragments"]}
+        plan["fragments"] += [reposition.make_fragment(label, [], "")
+                              for label in drawn if label not in described]
+        plan["fragments"].sort(key=lambda f: int(f["label"]))
         if not has_voxel_size:
             raise ValueError(
                 "Reposition needs voxel_size_um in the paint_mask config -- it is optional "
@@ -1846,14 +1892,11 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                 "pipeline's sample.voxel_size_um) and export again.")
         stem = _output_stem(output_path)
         fragments_path = f"{stem}_fragments.nii.gz"
-        # Cuts steer the grab and nothing else: leaving them in would ship a
-        # label the pipeline has no fragment for, sitting exactly on the seam.
         # Written SPARSE, exactly as grabbed. The planes carrying voxels are
         # the keyframes, and that is the only record of which planes were
         # decided rather than inferred -- filling here would erase it, and a
         # reopened session could not tell the two apart. The pipeline and
         # scripts/apply_reposition.py fill it on load instead.
-        outlines = np.where(frag_layer.data == _REPOSITION_CUT_LABEL, 0, frag_layer.data)
         sitk.WriteImage(sitk.GetImageFromArray(outlines.astype(np.uint8)), fragments_path)
         plan["labels_path"] = fragments_path
         plan_path = f"{stem}.reposition.json"
@@ -2086,23 +2129,38 @@ def write_guide_sidecars(output_path, image_path, result, region_labels, total_z
     return regions_path, slices_path
 
 
-def load_reposition_resume(output_path):
-    """Re-open last session's reposition work, from the files its export wrote
-    next to `output_path`: {"plan": ..., "fragments": array} or None.
+def load_reposition_resume(output_path, *previous_paths):
+    """Re-open last session's reposition work -- the plan and the fragment
+    outlines its export wrote -- as {"plan": ..., "fragments": array}, or None.
 
-    Keyed off the OUTPUT path rather than a config key of its own, because the
-    plan is not a separate document -- it is part of what this session exports,
-    and pointing the two at different stems is a way to silently pair a plan
-    with the wrong outlines. A missing or unreadable pair is not an error:
-    most samples never cracked, and the first session on one that did has
-    nothing to resume from.
+    Keyed off a PATH rather than a config key of its own, because the plan is
+    not a separate document: it is part of what a session exports, and
+    pointing the two at different stems is a way to silently pair a plan with
+    the wrong outlines.
+
+    Which path, though, is the whole reason this takes several.
+    `output_path` is where THIS session will write, and looking only there was
+    wrong for the way rounds are actually done: each round is given a new
+    output name so the last one survives as a snapshot (configs/
+    paint_mask.example.yaml says to do exactly that for mode: labels), and the
+    previous round is named by a different key -- existing_mask_path in guide
+    mode, the resumed dense file's own record of its guide in labels mode. So
+    the paint layer came back and the fragments did not: their plan was next
+    to a stem nothing was looking at. `previous_paths` are those keys, tried
+    in order after `output_path`.
+
+    A missing or unreadable set is not an error: most samples never cracked,
+    and the first session on one that did has nothing to resume from.
     """
-    if not output_path:
-        return None
-    stem = _output_stem(output_path)
-    plan_path = Path(f"{stem}.reposition.json")
-    fragments_path = Path(f"{stem}_fragments.nii.gz")
-    if not plan_path.exists():
+    for candidate in (output_path,) + previous_paths:
+        if not candidate:
+            continue
+        stem = _output_stem(candidate)
+        plan_path = Path(f"{stem}.reposition.json")
+        fragments_path = Path(f"{stem}_fragments.nii.gz")
+        if plan_path.exists():
+            break
+    else:
         return None
     try:
         plan = reposition.read_plan(plan_path)
@@ -2119,6 +2177,17 @@ def load_reposition_resume(output_path):
     n = sum(len(f["keyframes"]) for f in plan["fragments"])
     print(f"[resume] restored {n} reposition keyframe(s) across "
           f"{len(plan['fragments'])} fragment(s) from {plan_path.name}.")
+    if output_path and _output_stem(output_path) != stem:
+        # Say it, because it is the one thing about this that can surprise:
+        # the plan just read belongs to the PREVIOUS round's stem, and this
+        # session will write its own next to the new output rather than back
+        # into the file it came from.
+        print(f"[resume]   (read from {plan_path}, which is last round's stem; this "
+              f"session's plan will be written next to {output_path})")
+    if fragments is None:
+        print(f"WARNING: {fragments_path} is missing, so the fragment OUTLINES could not be "
+              f"restored -- only the keyframes above. Grab the pieces again before exporting, "
+              f"or the plan will move nothing.")
     return {"plan": plan, "fragments": fragments}
 
 
@@ -2725,7 +2794,8 @@ def _run_guide(args):
     reposition_section, reposition_state = _reposition_controls(
         viewer, arr, args.voxel_size_um,
         scale=display_scale_from_voxel_size(args.voxel_size_um),
-        resume=load_reposition_resume(args.output_path), paint_layer=paint_layer)
+        resume=load_reposition_resume(args.output_path, args.existing_mask_path),
+        paint_layer=paint_layer)
 
     tools_dock = _add_tools_panel(viewer, [
         ("Export", _export_controls(export, "Export Outline")),
@@ -3002,6 +3072,10 @@ def load_labels_resume(dense_path, structures, expected_shape):
         hand_drawn_slices=sorted(planes),
         planes={int(z): arr[int(z)].astype(np.uint8) for z in planes},
         baseline_labels_path=meta.get("baseline_labels_path"),
+        # The guide this dense file was exported alongside -- i.e. the stem
+        # last round's reposition plan was written next to, which a new
+        # output_path would otherwise leave behind (load_reposition_resume).
+        guide_path=meta.get("guide_path"),
         sidecar=sidecar,
     )
 
@@ -3726,7 +3800,9 @@ def _run_labels(args):
     reposition_section, reposition_state = _reposition_controls(
         viewer, sample_arr, raw_voxel_um,
         scale=display_scale_from_voxel_size(raw_voxel_um),
-        resume=load_reposition_resume(args.output_path), paint_layer=paint_layer)
+        resume=load_reposition_resume(args.output_path,
+                                      resume.guide_path if resume is not None else None),
+        paint_layer=paint_layer)
 
     tools_dock = _add_tools_panel(viewer, [
         ("Export", _export_controls(export, "Export Guide + Atlas")),
