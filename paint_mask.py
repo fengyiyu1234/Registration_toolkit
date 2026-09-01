@@ -1118,8 +1118,10 @@ VOXEL_SIZE_UM_NOTE = (
 # that is what a crack is -- so one click takes it. A grab is ONE PLANE: the
 # extent along z is whichever planes get clicked, filled between when the plan
 # is applied, so nothing infers how far a piece goes and several pieces sharing
-# an xy footprint at different z stay separate by construction. "Draw a cut"
-# is the fallback for a crack too tight to separate at any threshold.
+# an xy footprint at different z stay separate by construction. A crack too
+# tight to separate at any threshold is painted in by hand on the fragments
+# layer instead -- a grab takes ONE connected component, and two pieces still
+# touching are one of them.
 #
 # WHAT THE CONTROLS ARE
 # Per fragment, per z plane: an in-plane rigid transform (tx, ty, theta) plus
@@ -1127,18 +1129,27 @@ VOXEL_SIZE_UM_NOTE = (
 # shared/reposition.py's module docstring for why 3 measurable degrees of
 # freedom beat 6 where three of them are decided by noise.
 #
-#   Draw two segments      the coarse pose. Draw a line across a feature on
-#                          the fragment, copy it, drag/rotate the copy onto
-#                          where that feature belongs. Because the copy cannot
-#                          be stretched, the fit is exact and has no residual
-#                          to read; what gets checked instead is the boundary
-#                          report. Which line is the source is decided by
-#                          which one lies on the fragment outline, so drawing
-#                          them in either order gives the same answer, and a
-#                          pair that cannot be told apart is refused rather
-#                          than guessed at. Lines are tagged and coloured by
-#                          the fragment showing in the spin box, so several
-#                          flaps' pairs can sit on the canvas at once.
+#   Drag the outline       the coarse pose, the quick way. Copy this
+#                          fragment's own silhouette on this plane and drag
+#                          and rotate the copy onto where the tissue belongs.
+#                          The pose is read back from where every vertex ended
+#                          up (reposition.fit_from_points, an orthogonal
+#                          Procrustes fit) AS THE SHAPE MOVES -- the drag is
+#                          the input, there is nothing to press after it, and
+#                          the numbers it produces are what the plan holds: a
+#                          drawing cannot be interpolated between planes,
+#                          applied to cells on a finer grid, or inverted.
+#                          napari's selection box will RESIZE if a corner
+#                          handle is dragged; a resize is not a rigid move, so
+#                          it is measured and reported instead of absorbed.
+#                          (There was a second way in: draw a line across a
+#                          feature on the piece, drag a copy onto where that
+#                          feature belongs, fit from the pair. Exact, and it
+#                          needed no shape -- but it asked for "this piece goes
+#                          there" to be restated as two abstract endpoints
+#                          first, which was the whole of the fiddliness. Plans
+#                          from then record the pair each keyframe was fitted
+#                          from; it is dropped on load and not written again.)
 #   The four sliders       the fine pose. There is deliberately no live image
 #                          preview here: judging a reposition means looking at
 #                          every plane it touches, which is a batch job with
@@ -1149,9 +1160,18 @@ VOXEL_SIZE_UM_NOTE = (
 #   Rotation centre        put it ON the hinge. The tear a rigid move opens is
 #                          exactly the displacement at the still-attached
 #                          point, so pivoting there makes it zero.
-#   Set keyframe           records the current sliders for this plane. Planes
-#                          between keyframes interpolate; outside them nothing
-#                          moves, and nothing tapers to identity on its own.
+#   (no Set button)        the pose is recorded as soon as it is set: fitting,
+#                          dragging a slider or typing a number records this
+#                          plane, and so does touching a control and putting it
+#                          back, which is how a plane is pinned at identity.
+#                          There was a "Set keyframe on this plane" button and
+#                          it was a step that could only be forgotten -- a pose
+#                          fitted, looked at and scrolled away from reverted to
+#                          the interpolation without saying so. Planes between
+#                          keyframes interpolate; outside them nothing moves,
+#                          and nothing tapers to identity on its own, so the
+#                          plane a piece stops moving on is one to pin.
+#                          "Delete keyframe on this plane" takes one back off.
 #
 # WHAT SURVIVES A REOPEN. Two files, written next to the mode's own export:
 # <stem>_fragments.nii.gz (the outlines, sparse -- the planes with voxels ARE
@@ -1166,17 +1186,17 @@ VOXEL_SIZE_UM_NOTE = (
 # fragment for them, and redrawing one takes a second.
 
 _REPOSITION_FRAGMENTS_LAYER = "fragments to reposition (paint here)"
-_REPOSITION_SEGMENTS_LAYER = "reposition segments (draw 2 lines)"
+_REPOSITION_GHOST_LAYER = "fragment ghost (drag and rotate)"
 # Cycled over the `fragment` feature so a line's colour says which flap it
 # belongs to. Distinct at a glance against grayscale tissue, and enough of
 # them that the samples with several cracks do not wrap round.
 _FRAGMENT_COLOURS = ("#ffd166", "#06d6a0", "#ef476f", "#118ab2", "#c77dff", "#f78c6b")
-# The one brush number on the fragments layer that is not a fragment: voxels
-# painted with it are taken OUT of the tissue before a grab walks it. That is
-# the answer to a crack too tight for any threshold to separate -- a few
-# strokes across the join, rather than tracing the whole piece by hand. Kept
-# out of the fragment numbering (the spin box stops one below it) and stripped
-# from the export, so it can never be mistaken for something that moves.
+# Reserved: the one brush number on the fragments layer that is never a
+# fragment. It used to be painted by a "Draw a cut" button, to take voxels out
+# of the tissue before a grab walked it; that button is gone, and the number
+# stays reserved so a stray 255 -- hand-painted, or in a file from back then --
+# can never become a piece that moves. The spin box stops one below it and the
+# export strips it.
 _REPOSITION_CUT_LABEL = 255
 
 
@@ -1224,6 +1244,11 @@ def _slider_row(text, lo, hi, decimals=1, suffix=" um", name=None):
     box.valueChanged.connect(from_box)
     layout.addWidget(slider, 1)
     layout.addWidget(box)
+    # The slider hangs off the box rather than being returned beside it: every
+    # caller wants the box, one caller (the pose controls, which record a plane
+    # as soon as it is touched) also needs sliderReleased, and widening the
+    # return would touch six call sites to serve one.
+    box.slider = slider
     return row, box
 
 
@@ -1261,8 +1286,6 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     n_planes = image_arr.shape[0]
 
     fragments = {}          # label -> {"name": str, "center_um": [x, y], "keyframes": {z: kf}}
-    pending_segments = {}   # label -> the pair last fitted from, until it is keyframed
-    resumed_segments = []   # (label, pair) recovered from a previous session's plan
     if resume is not None and tuple(resume["plan"]["image_shape_zyx"]) != tuple(image_arr.shape):
         # A plan found next to a previous round's stem is not necessarily this
         # sample's (see load_reposition_resume): plane numbers and micron
@@ -1273,13 +1296,16 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     if resume is not None:
         for frag in resume.get("plan", {}).get("fragments", []):
             label = int(frag["label"])
-            kfs = {int(k["z"]): dict(k) for k in frag["keyframes"]}
+            # `segments` is dropped rather than read: plans written before the
+            # two-line fit was removed carry the pair each keyframe was fitted
+            # from, and there is no longer a layer to draw it on. Stripping it
+            # here also keeps it out of anything this session exports -- the
+            # transform itself was always the record, the pair only provenance.
+            kfs = {int(k["z"]): {key: value for key, value in k.items() if key != "segments"}
+                   for k in frag["keyframes"]}
             centre = (kfs[min(kfs)]["center_um"] if kfs else [0.0, 0.0])
             fragments[label] = {"name": frag.get("name", ""), "center_um": list(centre),
                                 "keyframes": kfs}
-            for kf in kfs.values():
-                if kf.get("segments"):
-                    resumed_segments.append((label, kf["segments"]))
 
     prefill = np.zeros(image_arr.shape, dtype=np.uint8)
     if resume is not None and resume.get("fragments") is not None:
@@ -1293,39 +1319,28 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     # read as fragment 1's, and the fit would be a plausible number computed
     # from the wrong pair, with nothing to notice it. Colouring by the same
     # feature makes the grouping visible instead of only enforced.
-    segments = viewer.add_shapes(
-        name=_REPOSITION_SEGMENTS_LAYER, ndim=3, visible=False,
-        features={"fragment": np.zeros(0, dtype=int), "role": np.array([], dtype=object)},
-        feature_defaults={"fragment": 1, "role": "?"},
+    # HOW A POSE IS ENTERED: drag the piece's own silhouette.
+    #
+    # There was a second way -- draw a line across a feature on the fragment,
+    # drag a copy of it onto where that feature belongs, fit from the pair. It
+    # was exact and needed no shape at all, but it asked for the judgement
+    # "this piece goes there" to be re-expressed as two abstract endpoints
+    # before it could be entered, and that re-expression was the whole of the
+    # fiddliness. A copy of the OUTLINE is the same three degrees of freedom
+    # entered directly: put the shape where the tissue goes.
+    #
+    # The ghost is scratch: replaced every time the outline is copied, never
+    # leaving the window. What gets exported is the label volume and the
+    # numbers the drag produced.
+    ghost = viewer.add_shapes(
+        name=_REPOSITION_GHOST_LAYER, ndim=3, visible=False,
+        features={"fragment": np.zeros(0, dtype=int)},
+        feature_defaults={"fragment": 1},
         edge_color="fragment", edge_color_cycle=list(_FRAGMENT_COLOURS),
         face_color="transparent", edge_width=2, **scale_kwargs)
-    # WHICH FRAGMENT, AND WHICH END -- both written on the canvas.
-    #
-    # The colour cycle groups lines by fragment but cannot name one: napari
-    # assigns cycle colours in order of first appearance, so fragment 2 is
-    # green only if it happened to be drawn second. Good enough for "these two
-    # go together", useless for "this one is fragment 2", which is the question
-    # actually asked once several pieces have lines on the canvas at once. So
-    # the number is printed.
-    #
-    # The role is printed for a different reason: Shapes has no dashed edge to
-    # spend on source-vs-target, and a second colour would collide with the
-    # first. It is recomputed from the outline as the lines move, so what is
-    # written is the answer the fit will use, visible before the fit is asked
-    # for.
-    segments.text = {"string": "f{fragment} {role}", "size": 9, "color": "white",
-                     "anchor": "upper_left"}
-    for label, pair in resumed_segments:
-        # Back into the layer in microns -> voxels, tagged with their fragment,
-        # so reopening shows what each keyframe was fitted from rather than an
-        # empty canvas next to a transform with no visible origin.
-        segments.feature_defaults = {"fragment": int(label), "role": "?"}
-        for key, plane in (("source", "source_z"), ("target", "target_z")):
-            (x0, y0), (x1, y1) = pair[key]
-            z = pair.get(plane, 0)
-            segments.add([[[z, y0 / voxel_um[1], x0 / voxel_um[0]],
-                           [z, y1 / voxel_um[1], x1 / voxel_um[0]]]], shape_type="line")
-
+    ghost.text = {"string": "f{fragment} ghost", "size": 9, "color": "white",
+                  "anchor": "upper_left"}
+    ghost_source = {}       # label -> {"z": int, "xy_um": (N, 2) as copied}
 
     section = QWidget()
     layout = QVBoxLayout(section)
@@ -1439,27 +1454,53 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             for z, kf in sorted(e["keyframes"].items()):
                 built = reposition.make_keyframe(z, kf["tx_um"], kf["ty_um"], kf["theta_deg"],
                                                  kf["dz_planes"], kf["center_um"])
-                if kf.get("segments"):
-                    built["segments"] = kf["segments"]
                 kfs.append(built)
             frags.append(reposition.make_fragment(label, kfs, e["name"]))
         return reposition.make_plan(image_arr.shape, voxel_um, frags,
                                     interpolate=interpolate_box.isChecked(),
                                     feather_um=feather_box.value())
 
-    def refresh_list(*_):
+    # Which planes each fragment is on, cached. Recomputing it is a pass over
+    # the whole fragments volume -- 1.4e9 voxels on a raw grid -- and the
+    # summary below wants it every time a keyframe changes, which is now every
+    # time a pose control is touched. One pass on demand, thrown away whenever
+    # the layer is edited, instead of one pass PER LABEL per refresh.
+    plane_cache = {"by_label": None}
+
+    def invalidate_planes(*_):
+        plane_cache["by_label"] = None
+
+    frag_layer.events.data.connect(invalidate_planes)
+    frag_layer.events.paint.connect(invalidate_planes)
+
+    def grabbed_planes(label):
+        if plane_cache["by_label"] is None:
+            found = {}
+            for z, plane in enumerate(frag_layer.data):
+                for value in np.unique(plane):
+                    if value and int(value) != _REPOSITION_CUT_LABEL:
+                        found.setdefault(int(value), []).append(int(z))
+            plane_cache["by_label"] = found
+        return plane_cache["by_label"].get(int(label), [])
+
+    def refresh_keyframes():
+        """The keyframe list only -- cheap, and runs on every pose edit."""
         keyframes_list.clear()
         for label, e in sorted(fragments.items()):
             for z, kf in sorted(e["keyframes"].items()):
                 item = QListWidgetItem(
                     f"label {label}  z={z}  tx={kf['tx_um']:.0f} ty={kf['ty_um']:.0f} "
-                    f"rot={kf['theta_deg']:.1f}  dz={kf['dz_planes']:+d}"
-                    + ("  \u25c0\u25b6" if kf.get("segments") else ""))
+                    f"rot={kf['theta_deg']:.1f}  dz={kf['dz_planes']:+d}")
                 item.setData(Qt.UserRole, (label, z))
                 keyframes_list.addItem(item)
+
+    def refresh_summary():
+        """...and the per-fragment tally under it, which has to look at the
+        volume (see grabbed_planes) and so runs only when the SET of planes or
+        keyframes changes, not on every value."""
         rows = []
         for lab, e in sorted(fragments.items()):
-            planes = sorted(int(z) for z in np.unique(np.nonzero(frag_layer.data == lab)[0]))
+            planes = grabbed_planes(lab)
             if not planes and not e["keyframes"]:
                 continue
             rows.append(f"{lab}{' ' + e['name'] if e['name'] else ''}: "
@@ -1469,14 +1510,17 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         status.setText("\n".join(rows) if rows else
                        "No fragments yet: pick a number, Grab this plane, then click a piece.")
 
+    def refresh_list(*_):
+        refresh_keyframes()
+        refresh_summary()
+
     def load_plane(*_):
         """Sliders follow the plane being looked at, so scrolling through a
         fragment shows what each plane is actually set to instead of leaving
         the last edited pose on screen next to a different section."""
         e = entry(label_spin.value())
-        # Only the transform fields: a stored keyframe also carries `segments`,
-        # the pair it was fitted from, which is provenance rather than part of
-        # the motion and is not something make_keyframe takes.
+        # Only the transform fields: an old keyframe read back from a plan can
+        # still carry keys make_keyframe does not take (see the resume above).
         tf = reposition.plane_transform(
             reposition.make_fragment(
                 label_spin.value(),
@@ -1484,17 +1528,23 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                     z, kf["tx_um"], kf["ty_um"], kf["theta_deg"], kf["dz_planes"], kf["center_um"])
                  for z, kf in sorted(e["keyframes"].items())]),
             current_z(), interpolate_box.isChecked()) if e["keyframes"] else None
-        for box, key in ((tx_box, "tx_um"), (ty_box, "ty_um"), (th_box, "theta_deg")):
-            box.blockSignals(True)
-            box.setValue(tf[key] if tf else 0.0)
-            box.blockSignals(False)
-        dz_box.blockSignals(True)
-        dz_box.setValue(tf["dz_planes"] if tf else 0)
-        dz_box.blockSignals(False)
-        # The name follows the fragment too. It is only READ on Set keyframe,
-        # so leaving the previous fragment's name in the box means the next one
-        # silently inherits it -- two pieces called the same thing, in the plan
-        # and in every QC line that quotes it.
+        # `posing`, not blockSignals: the box's own valueChanged is what drags
+        # the slider along with it (see _slider_row), so silencing the box
+        # leaves the slider parked at the previous plane's pose while the
+        # number next to it reads the new one. The flag stops the pose being
+        # RECORDED (commit_pose) without stopping the two halves of one control
+        # from staying in step.
+        posing["busy"] = True
+        try:
+            for box, key in ((tx_box, "tx_um"), (ty_box, "ty_um"), (th_box, "theta_deg")):
+                box.setValue(tf[key] if tf else 0.0)
+            dz_box.setValue(tf["dz_planes"] if tf else 0)
+        finally:
+            posing["busy"] = False
+        # The name follows the fragment too, and is stored as it is typed
+        # (name_edit.editingFinished) -- leaving the previous fragment's name in
+        # the box would mean the next one silently inherits it: two pieces
+        # called the same thing, in the plan and in every QC line quoting it.
         name_edit.blockSignals(True)
         name_edit.setText(e.get("name", ""))
         name_edit.blockSignals(False)
@@ -1503,122 +1553,50 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
 
     # ---------------------------------------------------------------- actions
 
-    role_guard = {"busy": False}
+    # Set while the panel is writing the pose controls itself (scrolling to a
+    # plane, or filling them from a fit), so those writes are not read back as
+    # somebody posing this plane. See commit_pose.
+    posing = {"busy": False}
 
-    def refresh_roles(*_):
-        """Re-read source/target off the fragment outline and show it.
+    def commit_pose(*_):
+        """Record the pose showing for the plane showing -- automatically.
 
-        Live rather than only on Fit: the pair is drawn and dragged for a while
-        before anyone presses a button, and "which of these is the one that
-        moves" is exactly the question being asked during that time.
+        There used to be a "Set keyframe on this plane" button and this was
+        behind it. It is now wired to the pose controls themselves (the four
+        sliders and their boxes, and both Fit buttons), because the button was
+        a step that could only be FORGOTTEN: a pose that is fitted, looked at
+        and then scrolled away from silently reverts to the interpolation, and
+        nothing says so.
+
+        Touching a control counts, not only changing its value: that is how a
+        plane gets pinned at identity -- click a slider handle and release, or
+        press Enter in its box, on a plane the piece must NOT move on, and the
+        zeros are recorded like any other pose. Interpolation runs BETWEEN
+        keyframes, so a piece that has to ramp in from an unmoved plane needs
+        that plane said out loud.
+
+        Silent on a plane the fragment is not on: a transform there would move
+        nothing, and there is no reason to write one down.
         """
-        if role_guard["busy"] or not len(segments.data):
-            return
-        role_guard["busy"] = True
-        try:
-            features = segments.features.copy()
-            roles = ["?"] * len(segments.data)
-            widths = list(np.atleast_1d(segments.edge_width))
-            widths += [2.0] * (len(segments.data) - len(widths))
-            for label in sorted({int(v) for v in features["fragment"]}):
-                indices = [i for i in range(len(segments.data))
-                           if int(features["fragment"].iloc[i]) == label
-                           and len(segments.data[i]) == 2]
-                if len(indices) < 2:
-                    continue
-                first, second = indices[-2], indices[-1]
-                try:
-                    source, _, _ = reposition.orient_segments(
-                        segments.data[first], segments.data[second], frag_layer.data, label)
-                except ValueError:
-                    continue          # ambiguous: leave both as "?" rather than guess
-                on_first = np.allclose(source, np.asarray(segments.data[first], dtype=float))
-                src_i, dst_i = (first, second) if on_first else (second, first)
-                roles[src_i], roles[dst_i] = "source", "target"
-                widths[src_i], widths[dst_i] = 4.0, 2.0
-            features["role"] = roles
-            # Assigning `features` rebuilds the feature table and resets
-            # feature_defaults with it, which would silently re-tag every line
-            # drawn afterwards as whichever fragment the defaults fell back to.
-            # Saved and put back, since this runs on every shape edit.
-            defaults = dict(segments.feature_defaults.iloc[0])
-            segments.features = features
-            segments.feature_defaults = defaults
-            segments.edge_width = widths
-        finally:
-            role_guard["busy"] = False
-
-    segments.events.data.connect(refresh_roles)
-
-    def fragment_lines(label):
-        """This fragment's line segments, oldest first."""
-        tags = segments.features.get("fragment")
-        return [np.asarray(shape, dtype=float)
-                for index, shape in enumerate(segments.data)
-                if len(shape) == 2 and (tags is None or int(tags.iloc[index]) == int(label))]
-
-    def fit_from_segments():
+        if posing["busy"]:
+            return                        # the panel is loading a plane, not being posed
         label = label_spin.value()
-        lines = fragment_lines(label)
-        if len(lines) < 2:
-            status.setText(f"Fragment {label} has {len(lines)} line(s). Draw TWO: one across a "
-                           f"feature on the fragment, then a copy of it dragged onto where that "
-                           f"feature belongs. (Line tool, then select + Ctrl-C/Ctrl-V, then drag "
-                           f"and rotate the copy.) Lines are tagged with the fragment number "
-                           f"showing above, so switch that first if this is the wrong one.")
-            return
-        # Which of the two is the source is read off the fragment outline, not
-        # off which was drawn first: getting it backwards yields a perfectly
-        # well-formed transform that carries the flap further from home at
-        # exactly the right magnitude, and nothing downstream would notice.
-        try:
-            a, b, orientation = reposition.orient_segments(
-                lines[-2], lines[-1], frag_layer.data, label)
-        except ValueError as exc:
-            status.setText(str(exc))
-            return
-        src = [[a[0][2] * voxel_um[0], a[0][1] * voxel_um[1]],
-               [a[1][2] * voxel_um[0], a[1][1] * voxel_um[1]]]
-        dst = [[b[0][2] * voxel_um[0], b[0][1] * voxel_um[1]],
-               [b[1][2] * voxel_um[0], b[1][1] * voxel_um[1]]]
-        e = entry(label)
-        pending_segments[label] = {"source": src, "target": dst,
-                                   "source_z": int(round(a[0][0])), "target_z": int(round(b[0][0]))}
-        tx, ty, theta, centre = reposition.fit_from_segments(src, dst, e.get("center_um"))
-        e["center_um"] = list(centre)
-        dz = int(round(b[0][0] - a[0][0]))
-        for box, value in ((tx_box, tx), (ty_box, ty), (th_box, theta), (dz_box, dz)):
-            box.setValue(value)
-        length = np.hypot(src[1][0] - src[0][0], src[1][1] - src[0][1])
-        drift = abs(np.hypot(dst[1][0] - dst[0][0], dst[1][1] - dst[0][1]) - length)
-        centre_label.setText(f"rotation centre: x={centre[0]:.0f} y={centre[1]:.0f} um")
-        refresh_roles()
-        status.setText(
-            f"Fitted: tx={tx:.0f} ty={ty:.0f} um, rot={theta:.1f} deg, dz={dz:+d}.\n{orientation}."
-            + (f"\nWARNING: the second line is {drift:.0f} um longer/shorter than the first, so "
-               f"it is not a rigid copy -- that difference is absorbed silently. Copy the line "
-               f"rather than drawing a second one by hand."
-               if drift > max(0.02 * length, voxel_um[0]) else ""))
-
-    def set_keyframe():
-        label = label_spin.value()
-        e = entry(label)
-        e["name"] = name_edit.text().strip()
         if not (frag_layer.data[current_z()] == label).any():
-            status.setText(f"Plane {current_z()} has no fragment {label} on it, so a keyframe "
-                           f"here would move nothing. Grab the fragment on this plane first -- "
-                           f"the planes you grab are the outline's keyframes, and the planes "
-                           f"between them are filled when the plan is applied.")
+            status.setText(f"Plane {current_z()} has no fragment {label} on it, so nothing was "
+                           f"recorded. Grab the fragment on this plane first -- the planes you "
+                           f"grab are the outline's keyframes, and the planes between them are "
+                           f"filled when the plan is applied.")
             return
+        e = entry(label)
+        was_new = current_z() not in e["keyframes"]
         e["keyframes"][current_z()] = dict(
             tx_um=tx_box.value(), ty_um=ty_box.value(), theta_deg=th_box.value(),
-            dz_planes=int(dz_box.value()), center_um=list(centre_for(label)),
-            # The pair that produced it, so a later session can see what this
-            # keyframe was fitted from and adjust it rather than guess at it
-            # again from scratch. Provenance only -- nothing reads it back to
-            # recompute the transform, which is already recorded above.
-            segments=pending_segments.get(label))
-        refresh_list()
+            dz_planes=int(dz_box.value()), center_um=list(centre_for(label)))
+        refresh_keyframes()
+        if was_new:
+            # Only when the SET changed: the tally counts planes, which costs a
+            # pass over the volume, and this runs on every slider tick.
+            refresh_summary()
 
     def delete_keyframe():
         e = entry(label_spin.value(), create=False)
@@ -1631,12 +1609,35 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
 
     def centre_from_cursor():
         """Pin the pivot to the hinge. The cursor rather than a typed number
-        because the hinge is a place you can see and cannot name."""
+        because the hinge is a place you can see and cannot name.
+
+        Moving the pivot must not move the tissue. The same rigid map written
+        about a different fixed point needs a different translation -- leaving
+        tx/ty alone would swing the piece by (R - I)(c_new - c_old), i.e. the
+        moment you pin the hinge on a piece already posed, it jumps. So tx/ty
+        are re-expressed here: where the tissue lands is unchanged, only the
+        two numbers it is written down as.
+        """
         pos = viewer.cursor.position
-        c = [float(pos[2] / (scale[2] if scale else 1.0) * voxel_um[0]),
-             float(pos[1] / (scale[1] if scale else 1.0) * voxel_um[1])]
-        entry(label_spin.value())["center_um"] = c
-        centre_label.setText(f"rotation centre: x={c[0]:.0f} y={c[1]:.0f} um  (from cursor)")
+        label = label_spin.value()
+        new_centre = [float(pos[2] / (scale[2] if scale else 1.0) * voxel_um[0]),
+                      float(pos[1] / (scale[1] if scale else 1.0) * voxel_um[1])]
+        # The new pivot's own image under the pose as it stands: about a pivot,
+        # the translation IS where that pivot goes (R(c - c) = 0).
+        landed = reposition.transform_points_um(
+            [new_centre],
+            reposition.make_keyframe(current_z(), tx_box.value(), ty_box.value(),
+                                     th_box.value(), int(dz_box.value()), centre_for(label)))[0]
+        entry(label)["center_um"] = new_centre
+        posing["busy"] = True
+        try:
+            tx_box.setValue(float(landed[0] - new_centre[0]))
+            ty_box.setValue(float(landed[1] - new_centre[1]))
+        finally:
+            posing["busy"] = False
+        centre_label.setText(f"rotation centre: x={new_centre[0]:.0f} y={new_centre[1]:.0f} um  "
+                             f"(from cursor)")
+        commit_pose()
 
     def arm_grab():
         """Wait for a click ON THE IMAGE, then grab what is under it.
@@ -1701,24 +1702,22 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                      for axis in (0, 1, 2))
         label = label_spin.value()
         try:
-            cuts = frag_layer.data == _REPOSITION_CUT_LABEL
-            excl = cuts if cuts.any() else None
             painted = (paint_layer.data if (from_painted.isChecked() and paint_layer is not None)
                        else None)
             if painted is not None and painted[seed[0]].any():
                 source = "the painted mask"
-                tissue = reposition.threshold_planes(painted, 0, exclude=excl)
+                tissue = reposition.threshold_planes(painted, 0)
             else:
                 source = ("the image threshold" if painted is None else
                           f"the image threshold (nothing painted on plane {seed[0]})")
-                tissue = reposition.threshold_planes(image_arr, grab_box.value(), exclude=excl)
+                tissue = reposition.threshold_planes(image_arr, grab_box.value())
             mask, note = reposition.grab_plane(tissue, seed)
         except ValueError as exc:
             status.setText(str(exc))
             return
         data = frag_layer.data.copy()
         data[seed[0]][data[seed[0]] == label] = 0    # this plane only; other planes survive
-        data[mask & (data != _REPOSITION_CUT_LABEL)] = label
+        data[mask] = label
         frag_layer.data = data
         # Shown, not just filled: the layer starts hidden (most samples never
         # cracked) and a grab whose result cannot be seen reads as a button
@@ -1732,70 +1731,116 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                        f"Now spans plane(s) {planes_now[0]}..{planes_now[-1]} "
                        f"({len(planes_now)} grabbed).\n\nWrong shape? Untick 'grab from the "
                        f"painted mask' to use the image instead (the 'tissue' slider then "
-                       f"decides what counts). If the pieces touch either way, 'Draw a cut'.")
-        refresh_roles()
+                       f"decides what counts). If the pieces touch on this plane either way, "
+                       f"paint the piece in by hand on the fragments layer -- a grab takes one "
+                       f"connected component, and two pieces that touch are one.")
         load_plane()
 
-    def draw_segment():
-        """Put the line tool in your hand on the segments layer.
+    def ghost_index(label):
+        """The index of this fragment's ghost polygon, or None."""
+        tags = ghost.features.get("fragment")
+        if tags is None:
+            return None
+        found = [i for i in range(len(ghost.data)) if int(tags.iloc[i]) == int(label)]
+        return found[-1] if found else None
 
-        The layer starts hidden and is one of five in the list; finding it,
-        showing it, selecting it and picking the line tool is four steps of
-        fumbling before the first useful one. The fragment number is stamped
-        on here too, so a line cannot be drawn before it has an owner."""
-        label = label_spin.value()
-        segments.visible = True
-        segments.feature_defaults = {"fragment": label, "role": "?"}
-        viewer.layers.selection = {segments}
-        segments.mode = "add_line"
-        status.setText(
-            f"Line tool ready, tagged fragment {label}. Draw ONE line across a feature you "
-            f"can recognise ON the fragment -- a corner of the break, a vessel, a texture "
-            f"edge. Then use 'Copy the segment to its target' and drag the copy onto where "
-            f"that feature belongs.")
+    def drop_ghost(label):
+        index = ghost_index(label)
+        if index is not None:
+            ghost.selected_data = {index}
+            ghost.remove_selected()
+        ghost_source.pop(int(label), None)
 
-    def copy_segment():
-        """Duplicate this fragment's last line and hand back the copy, selected.
+    def copy_outline():
+        """Copy this fragment's outline on this plane, ready to be dragged.
 
-        A copy rather than a second freehand line, because a copy cannot be
-        stretched: the length is the one degree of freedom an in-plane rigid
-        move does not have, and drawing the second line by hand is the only
-        way to introduce a length change the fit would then absorb silently.
-        Offset a little so it does not sit invisibly on top of the original.
+        The alternative to the two-line fit, and usually the quicker one: the
+        thing being positioned is the piece, so hand over the piece's own
+        shape rather than asking for two endpoints that stand in for it.
+        Dropped exactly on top of the fragment, not offset like the line copy
+        -- it IS the fragment, and where it starts is where the tissue is.
         """
         label = label_spin.value()
-        lines = fragment_lines(label)
-        if not lines:
-            status.setText(f"Fragment {label} has no line yet -- draw one on the fragment first.")
+        z = current_z()
+        try:
+            poly = reposition.outline_polygon(frag_layer.data, label, z)
+        except ValueError as exc:
+            status.setText(str(exc))
             return
-        source = np.asarray(lines[-1], dtype=float)
-        offset = np.array([0.0, max(4.0, 0.25 * np.linalg.norm(source[1, 1:] - source[0, 1:])), 0.0])
-        segments.visible = True
-        segments.feature_defaults = {"fragment": label, "role": "?"}
-        segments.add([source + offset], shape_type="line")
-        viewer.layers.selection = {segments}
-        segments.mode = "select"
-        segments.selected_data = {len(segments.data) - 1}
+        drop_ghost(label)                    # one ghost per fragment, always the latest
+        vertices = np.column_stack([np.full(len(poly), float(z)), poly[:, 0], poly[:, 1]])
+        ghost.feature_defaults = {"fragment": int(label)}
+        ghost.visible = True
+        ghost.add([vertices], shape_type="polygon")
+        ghost_source[int(label)] = {
+            "z": int(z),
+            "xy_um": np.column_stack([poly[:, 1] * voxel_um[0], poly[:, 0] * voxel_um[1]]),
+        }
+        viewer.layers.selection = {ghost}
+        ghost.mode = "select"
+        ghost.selected_data = {len(ghost.data) - 1}
         status.setText(
-            "Copy made and selected, in select mode. Drag it onto where that feature belongs; "
-            "the handle at its corner rotates it. Its length is fixed, which is what makes the "
-            "fit exact. Then press 'Fit from the 2 drawn lines'.")
+            f"Fragment {label}'s outline copied on plane {z} ({len(poly)} vertices) and "
+            f"selected. Drag it onto where the tissue belongs; the handle above the box "
+            f"rotates it. The pose follows the drag and is recorded as you go -- there is "
+            f"nothing to press. Do NOT drag a corner of the box: that resizes, and a resize "
+            f"is not a rigid move (it is reported, never applied).")
 
-    def cut_brush():
-        """Hand the brush the cut number and get out of the way.
+    def fit_from_outline(*_):
+        """Read the pose back off the dragged ghost -- as it is dragged.
 
-        Reachable as a button rather than left to be typed into the layer's own
-        label box, because it is the one number on this layer that does not
-        mean a fragment, and nothing on screen would otherwise say so."""
-        frag_layer.selected_label = _REPOSITION_CUT_LABEL
-        frag_layer.mode = "paint"
-        viewer.layers.selection = {frag_layer}
-        frag_layer.visible = True
+        Wired to the ghost's own data event rather than to a button, for the
+        same reason the Set-keyframe button went: a drawing moved and not
+        converted is a pose that LOOKS set and is not. The plan does not
+        contain shapes, it contains numbers -- tx/ty/theta per plane, in
+        microns -- because those are what interpolate between planes, what
+        apply_to_cells uses on a grid four times finer than this one, and what
+        invert_plan takes back. This is where the drawing becomes them.
+
+        Vertex-for-vertex against the copy that was made, so the answer is the
+        rigid move that best explains where every point went -- not a match of
+        two shapes, which is a harder problem with a worse answer.
+        """
+        if posing["busy"]:
+            return
+        label = label_spin.value()
+        source = ghost_source.get(int(label))
+        index = ghost_index(label)
+        if source is None or index is None:
+            return
+        moved = np.asarray(ghost.data[index], dtype=float)
+        if (len(moved) == len(source["xy_um"])
+                and np.allclose(moved[:, 2] * voxel_um[0], source["xy_um"][:, 0])
+                and np.allclose(moved[:, 1] * voxel_um[1], source["xy_um"][:, 1])):
+            return                        # sitting where it was copied: nothing said yet
+        dst = np.column_stack([moved[:, 2] * voxel_um[0], moved[:, 1] * voxel_um[1]])
+        e = entry(label)
+        try:
+            tx, ty, theta, centre, scale = reposition.fit_from_points(
+                source["xy_um"], dst, e.get("center_um"))
+        except ValueError as exc:
+            status.setText(str(exc))
+            return
+        e["center_um"] = list(centre)
+        posing["busy"] = True
+        try:
+            for box, value in ((tx_box, tx), (ty_box, ty), (th_box, theta)):
+                box.setValue(value)
+        finally:
+            posing["busy"] = False
+        commit_pose()                     # a fit IS the pose, recorded as one edit
+        # dz is deliberately left alone: dragging in the canvas is in-plane by
+        # construction, so the ghost can never report a z move, and zeroing the
+        # box would silently undo one that was set on the slider.
+        centre_label.setText(f"rotation centre: x={centre[0]:.0f} y={centre[1]:.0f} um")
         status.setText(
-            f"Brush set to {_REPOSITION_CUT_LABEL} = CUT. Draw a short stroke across the join "
-            f"on the planes where the pieces touch, then Grab again: cut voxels are taken out "
-            f"of the tissue, which makes the two sides separate components. Cuts are stripped "
-            f"from the export -- they only steer the grab, they never move.")
+            f"Fitted from {len(dst)} outline vertices: tx={tx:.0f} ty={ty:.0f} um, "
+            f"rot={theta:.1f} deg (dz left as it was -- the drag is in-plane)."
+            + (f"\nWARNING: the outline was also resized {100 * (scale - 1):+.1f}% on the way. "
+               f"A reposition is rigid, so that resize is NOT in the numbers above and the "
+               f"tissue will not land where the ghost is. Copy the outline again and move it "
+               f"without touching the box corners."
+               if abs(scale - 1.0) > 0.01 else ""))
 
     def check_boundaries():
         plan = build_plan()
@@ -1814,12 +1859,8 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     # ---------------------------------------------------------------- wiring
 
     buttons = [("Grab this plane: then click the piece", arm_grab),
-               ("Draw a cut (for pieces that touch)", cut_brush),
-               ("1. Draw a segment on the fragment", draw_segment),
-               ("2. Copy the segment to its target", copy_segment),
-               ("3. Fit from the 2 drawn lines", fit_from_segments),
+               ("Copy this outline -- then drag and rotate it", copy_outline),
                ("Rotation centre <- cursor", centre_from_cursor),
-               ("Set keyframe on this plane", set_keyframe),
                ("Delete keyframe on this plane", delete_keyframe),
                ("Boundary check", check_boundaries)]
     for text, handler in buttons:
@@ -1835,14 +1876,35 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
 
     def fragment_selected(*_):
         frag_layer.selected_label = label_spin.value()
-        # Set BEFORE the next line is drawn, not read after: napari tags a new
-        # shape from feature_defaults at the moment it is added, so this is the
-        # only place the association can be established.
-        segments.feature_defaults = {"fragment": label_spin.value(), "role": "?"}
         load_plane()
 
     label_spin.valueChanged.connect(fragment_selected)
-    segments.feature_defaults = {"fragment": label_spin.value(), "role": "?"}
+    # Dragging the ghost IS setting the pose: napari emits this on every move,
+    # rotate and resize of a shape, so the sliders and the keyframe follow the
+    # drag instead of waiting for a button that could be forgotten. Connected
+    # down here rather than beside the layer, because the handler is defined
+    # further down and a connect runs immediately.
+    ghost.events.data.connect(fit_from_outline)
+    for pose_box in (tx_box, ty_box, th_box, dz_box):
+        # valueChanged for a drag or a typed number; editingFinished and
+        # sliderReleased for a control that was touched and put back where it
+        # was, which is how a plane is pinned at identity (see commit_pose).
+        pose_box.valueChanged.connect(commit_pose)
+        pose_box.editingFinished.connect(commit_pose)
+        pose_box.slider.sliderReleased.connect(commit_pose)
+
+    def name_typed(*_):
+        """The name belongs to the fragment, not to a keyframe, and is stored
+        AS IT IS TYPED -- there is no longer a button that reads it, and
+        editingFinished alone would lose a name typed into a field that never
+        got a chance to lose focus. load_plane blocks this box's signals while
+        it fills it in, so following a fragment around does not count as
+        renaming it."""
+        entry(label_spin.value())["name"] = name_edit.text().strip()
+
+    name_edit.textChanged.connect(name_typed)
+    # The tally is only worth redrawing once the typing stops.
+    name_edit.editingFinished.connect(refresh_summary)
     viewer.dims.events.current_step.connect(load_plane)
     refresh_list()
 
@@ -1864,11 +1926,8 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         A sample that never cracked still writes nothing, which is what that
         rule was protecting: its fragments layer is empty, so there is nothing
         to describe and no file to decide about later."""
-        # Cuts steer the grab and nothing else: leaving them in would ship a
-        # label the pipeline has no fragment for, sitting exactly on the seam.
-        # They are therefore not in what comes back on a reopen either -- a
-        # cut is redrawn in the second it takes, and the pieces it separated
-        # are already separate in the outlines.
+        # The reserved number is never shipped: it is not a fragment, and the
+        # pipeline has nothing to move it with (see _REPOSITION_CUT_LABEL).
         outlines = np.where(frag_layer.data == _REPOSITION_CUT_LABEL, 0, frag_layer.data)
         drawn = [int(v) for v in np.unique(outlines) if v]
         plan = build_plan()

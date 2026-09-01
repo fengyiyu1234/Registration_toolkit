@@ -229,7 +229,7 @@ def test_guide_mode_window(tmp, inputs):
         names = [l.name for l in viewer.layers]
         assert names[:2] == ["sample", "guide outline (paint here)"], names
         assert set(names[2:]) == {pm._REPOSITION_FRAGMENTS_LAYER,
-                                  pm._REPOSITION_SEGMENTS_LAYER}, names
+                                  pm._REPOSITION_GHOST_LAYER}, names
         assert not any(viewer.layers[n].visible for n in names[2:]), \
             "reposition layers must start hidden -- most samples never cracked"
         assert viewer.layers.selection == {viewer.layers["guide outline (paint here)"]}, \
@@ -866,6 +866,19 @@ def _viewer_plan(viewer, pm):
     return viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER].metadata["reposition_state"].plan()
 
 
+def _pin_pose(tools):
+    """Record the current pose on the current plane.
+
+    There is no Set-keyframe button any more: the pose controls record as they
+    are used. Pressing Enter in a box is the gesture that records a plane whose
+    numbers did NOT change -- i.e. how an identity keyframe is pinned -- and it
+    is also the deterministic one to drive from a test, since setValue with an
+    unchanged value emits nothing at all.
+    """
+    import paint_mask as pm
+    tools.findChild(pm.QDoubleSpinBox, "reposition_tx").editingFinished.emit()
+
+
 def _reposition_section(pm, viewer):
     """The Reposition section's widget, and its four named pose controls."""
     tools = viewer.window._dock_widgets["Export & tools"].widget()
@@ -905,15 +918,34 @@ def test_reposition_panel(tmp, inputs):
             "the fragments layer densified itself; the keyframes would be unrecoverable"
         assert (rp.densify_plane(frag.data, 3) == 1).any(), "the fill is not reachable on demand"
 
-        # Pose plane 10, keyframe it; pose plane 14 differently, keyframe that.
+        # THE POSE RECORDS ITSELF. Plane 1 is pinned unmoved by touching a
+        # control and putting it back (nothing to change: it is already 0), and
+        # plane 5 by simply moving the sliders -- no Set-keyframe button, which
+        # was a step that could only be forgotten.
+        assert not [b for b in tools.findChildren(pm.QPushButton)
+                    if "Set keyframe" in b.text()], "the Set keyframe button is still there"
+        def posed():
+            return sorted(k["z"] for f in _viewer_plan(viewer, pm)["fragments"]
+                          for k in f["keyframes"])
+
         viewer.dims.set_current_step(0, 1)
         boxes["tx"].setValue(0.0)
         boxes["rot"].setValue(0.0)
-        _button(tools, "Set keyframe on this plane").click()
+        assert posed() == [], "setValue with an unchanged value is not a pose being set"
+        _pin_pose(tools)
+        assert posed() == [1], "touching a control must pin this plane, identity included"
+
         viewer.dims.set_current_step(0, 5)
         boxes["tx"].setValue(50.0)
         boxes["rot"].setValue(6.0)
-        _button(tools, "Set keyframe on this plane").click()
+        assert posed() == [1, 5], "moving a slider must record the plane it was moved on"
+
+        # ...and scrolling does NOT: the panel writes the interpolated pose into
+        # the sliders on every plane change, and reading that back as an edit
+        # would turn every plane looked at into a keyframe.
+        viewer.dims.set_current_step(0, 3)
+        viewer.dims.set_current_step(0, 5)
+        assert posed() == [1, 5], "scrolling through the planes recorded one"
 
         plan = _viewer_plan(viewer, pm)
         assert len(plan["fragments"]) == 1, plan["fragments"]
@@ -1063,91 +1095,6 @@ def test_reposition_grab_from_click(tmp, inputs):
 
 
 
-def test_reposition_segments_belong_to_a_fragment(tmp, inputs):
-    print("10. paint_mask: line pairs are tagged per fragment, and survive a reopen...")
-    import numpy as np
-    import paint_mask as pm
-    from shared import atlas_reference
-    from registration_ants import reposition as rp
-
-    out = tmp / "pairs.nii.gz"
-    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name, voxel_size_um=RAW_UM)
-    try:
-        tools, boxes = _reposition_section(pm, viewer)
-        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
-        segments = viewer.layers[pm._REPOSITION_SEGMENTS_LAYER]
-
-        data = frag.data.copy()
-        data[2, 5:25, 5:25] = 1
-        data[2, 45:65, 5:25] = 2
-        frag.data = data
-
-        def draw(label, first_x, second_x, y):
-            """One pair for `label`, the way a hand would: pick the fragment
-            first, then draw -- napari tags a shape from the layer's defaults
-            at the moment it is added."""
-            boxes["fragment"].setValue(label)
-            for x in (first_x, second_x):
-                segments.add([[[2, y, x], [2, y, x + 20]]], shape_type="line")
-
-        # The line ON the fragment is drawn SECOND for fragment 2, to prove the
-        # fit reads the outline rather than the drawing order.
-        draw(1, 10, 60, 10)        # fragment 1: on-fragment line first,  moves +50
-        draw(2, 20, 10, 50)        # fragment 2: on-fragment line second, moves +10
-
-        assert list(segments.features["fragment"]) == [1, 1, 2, 2], segments.features
-        # Roles are worked out from the outline as the lines land, not on Fit,
-        # and they follow the outline rather than the drawing order: fragment
-        # 1's on-fragment line was drawn first, fragment 2's second.
-        assert list(segments.features["role"]) == ["source", "target", "target", "source"], \
-            segments.features
-        # Both facts are written on the canvas, because neither is recoverable
-        # from the colour: the cycle groups by fragment but names none of them.
-        assert segments.text.string.format == "f{fragment} {role}", segments.text.string
-        widths = list(np.atleast_1d(segments.edge_width))
-        assert widths[0] > widths[1] and widths[3] > widths[2], widths
-
-        # Back on fragment 1, the fit must use FRAGMENT 1's pair -- not simply
-        # the last two lines in the layer, which now belong to fragment 2.
-        boxes["fragment"].setValue(1)
-        viewer.dims.set_current_step(0, 2)
-        _button(tools, "3. Fit from the 2 drawn lines").click()
-        assert abs(boxes["tx"].value() - 50 * RAW_UM[0]) < 0.5, \
-            f"fit picked up the wrong fragment's lines: tx={boxes['tx'].value()}"
-        _button(tools, "Set keyframe on this plane").click()
-
-        boxes["fragment"].setValue(2)
-        _button(tools, "3. Fit from the 2 drawn lines").click()
-        assert abs(boxes["tx"].value() - 10 * RAW_UM[0]) < 0.5, boxes["tx"].value()
-        _button(tools, "Set keyframe on this plane").click()
-
-        plan = _viewer_plan(viewer, pm)
-        by_label = {f["label"]: f for f in plan["fragments"]}
-        assert set(by_label) == {1, 2}, by_label
-        for label, expect in ((1, 50 * RAW_UM[0]), (2, 10 * RAW_UM[0])):
-            kf = by_label[label]["keyframes"][0]
-            assert abs(kf["tx_um"] - expect) < 0.5, (label, kf)
-            assert kf.get("segments"), f"fragment {label} kept no record of its pair"
-
-        _button(tools, "Export Outline").click()
-    finally:
-        viewer.close()
-
-    written = rp.read_plan(f"{pm._output_stem(str(out))}.reposition.json")
-    assert all(f["keyframes"][0].get("segments") for f in written["fragments"]), written
-
-    # Reopening puts each pair back on the canvas, still tagged.
-    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name)
-    try:
-        _reposition_section(pm, viewer)
-        segments = viewer.layers[pm._REPOSITION_SEGMENTS_LAYER]
-        assert sorted(segments.features["fragment"]) == [1, 1, 2, 2], segments.features
-    finally:
-        viewer.close()
-    print("   OK")
-
-
-
 def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
     print("11. paint_mask: cortex split in three -- three fragments closing toward the middle...")
     import numpy as np
@@ -1189,7 +1136,7 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
         for label, tx in ((1, 6.0), (2, -6.0)):
             boxes["fragment"].setValue(label)
             boxes["tx"].setValue(tx)
-            _button(tools, "Set keyframe on this plane").click()
+            _pin_pose(tools)
         plan = _viewer_plan(viewer, pm)
         moves = {f["label"]: f["keyframes"][0]["tx_um"] for f in plan["fragments"]}
         assert moves == {1: 6.0, 2: -6.0}, moves
@@ -1223,7 +1170,7 @@ def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
         frag.data = data
         viewer.dims.set_current_step(0, 2)
         boxes["tx"].setValue(5.0)
-        _button(tools, "Set keyframe on this plane").click()
+        _pin_pose(tools)
 
         # Exporting reports the refusal and writes the guide anyway -- the two
         # are independent, and an exception out of a Qt handler would abort the
@@ -1233,67 +1180,6 @@ def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
     finally:
         viewer.close()
     assert not Path(f"{pm._output_stem(str(out))}.reposition.json").exists()
-    print("   OK")
-
-
-
-def test_reposition_cut_brush_separates_touching_pieces(tmp, inputs):
-    print("13. paint_mask: a cut stroke gets a grab past a crack too tight to threshold...")
-    import numpy as np
-    import tifffile
-    from pathlib import Path
-    import paint_mask as pm
-    from shared import atlas_reference
-    from registration_ants import reposition as rp
-
-    # Flap and brain TOUCHING -- no gap for any threshold to find.
-    stack = np.full((8, 200, 220), 50, dtype=np.uint16)
-    stack[:, 20:70, 60:160] = 3000            # flap
-    stack[:, 70:140, 20:200] = 3000           # brain, flush against it
-    raw = tmp / "welded.tif"
-    tifffile.imwrite(str(raw), stack)
-
-    out = tmp / "cut.nii.gz"
-    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name,
-                         image_path=str(raw), voxel_size_um=RAW_UM)
-    try:
-        tools, boxes = _reposition_section(pm, viewer)
-        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
-
-        _grab_at(pm, viewer, tools, (3, 45, 110))
-        assert (frag.data == 1)[3, 100, 100], "the phantom does not leak; the test is void"
-
-        # A stroke along the join, in the cut number, and grab again.
-        data = frag.data.copy()
-        data[:, 68:72, 60:160] = pm._REPOSITION_CUT_LABEL
-        frag.data = data
-        _grab_at(pm, viewer, tools, (3, 45, 110))
-
-        got = frag.data == 1
-        assert got[3, 45, 110], "the flap was lost"
-        assert not got[3, 100, 100], "the cut did not stop the grab at the join"
-        # The cut is a steering mark, not a fragment: it must not be claimed.
-        assert (frag.data == pm._REPOSITION_CUT_LABEL).any(), "the grab overwrote the cut"
-
-        # The button exists and points the brush at the cut number.
-        _button(tools, "Draw a cut (for pieces that touch)").click()
-        assert frag.selected_label == pm._REPOSITION_CUT_LABEL, frag.selected_label
-
-        viewer.dims.set_current_step(0, 3)
-        boxes["tx"].setValue(20.0)
-        _button(tools, "Set keyframe on this plane").click()
-        _button(tools, "Export Outline").click()
-    finally:
-        viewer.close()
-
-    # Cuts steer the grab and are stripped on the way out.
-    import SimpleITK as sitk
-    stem = pm._output_stem(str(out))
-    written = sitk.GetArrayFromImage(sitk.ReadImage(f"{stem}_fragments.nii.gz"))
-    assert (written == 1).any(), "the fragment did not reach the export"
-    assert not (written == pm._REPOSITION_CUT_LABEL).any(), \
-        "the cut label was exported as if it were a fragment"
-    assert rp.read_plan(f"{stem}.reposition.json")["fragments"][0]["label"] == 1
     print("   OK")
 
 
@@ -1354,48 +1240,137 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
 
 
 
-def test_reposition_draw_and_copy_segment_buttons(tmp, inputs):
-    print("15. paint_mask: the draw/copy segment buttons, and that a copy keeps its length...")
+def test_old_plans_drop_their_line_pairs(tmp, inputs):
+    print("22. paint_mask: a plan written when lines existed loads and re-exports without them...")
+    import numpy as np
+    import SimpleITK as sitk
+    import paint_mask as pm
+    from shared import atlas_reference
+    from registration_ants import reposition as rp
+
+    out = tmp / "oldplan.nii.gz"
+    stem = pm._output_stem(str(out))
+    fragments = np.zeros(RAW_SHAPE, dtype=np.uint8)
+    fragments[2, 10:40, 10:60] = 1
+    fragments[5, 10:40, 10:60] = 1
+    sitk.WriteImage(sitk.GetImageFromArray(fragments), f"{stem}_fragments.nii.gz")
+
+    # The shape the two-line fit used to leave behind: provenance hung off each
+    # keyframe, recording the pair it was fitted from.
+    keyframes = []
+    for z, tx in ((2, 0.0), (5, 40.0)):
+        keyframe = rp.make_keyframe(z, tx_um=tx, center_um=(100.0, 100.0))
+        keyframe["segments"] = {"source": [[10.0, 10.0], [90.0, 10.0]],
+                                "target": [[50.0, 10.0], [130.0, 10.0]],
+                                "source_z": z, "target_z": z}
+        keyframes.append(keyframe)
+    plan = rp.make_plan(RAW_SHAPE, RAW_UM, [rp.make_fragment(1, keyframes, "old flap")],
+                        labels_path=f"{stem}_fragments.nii.gz")
+    rp.write_plan(f"{stem}.reposition.json", plan)
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name, voxel_size_um=RAW_UM)
+    try:
+        assert not [l for l in viewer.layers if "segment" in l.name], \
+            f"a segments layer came back: {[l.name for l in viewer.layers]}"
+        resumed = _viewer_plan(viewer, pm)["fragments"][0]
+        assert [k["z"] for k in resumed["keyframes"]] == [2, 5], resumed
+        assert resumed["name"] == "old flap", "the fragment's name did not survive the resume"
+        assert not any("segments" in k for k in resumed["keyframes"]), \
+            "the line pair was carried back into the plan this session holds"
+        _button(_widget(viewer, "Export & tools"), "Export Outline").click()
+    finally:
+        viewer.close()
+
+    written = rp.read_plan(f"{stem}.reposition.json")
+    assert [k["z"] for k in written["fragments"][0]["keyframes"]] == [2, 5], written
+    assert not any("segments" in k for k in written["fragments"][0]["keyframes"]), \
+        "the re-exported plan still carries the line pairs"
+    print("   OK")
+
+
+def test_reposition_drag_the_outline(tmp, inputs):
+    print("21. paint_mask: copy the fragment outline, drag it, read the pose back...")
     import numpy as np
     import paint_mask as pm
     from shared import atlas_reference
 
-    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "seg.nii.gz", voxel_size_um=RAW_UM)
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "ghost.nii.gz", voxel_size_um=RAW_UM)
     try:
         tools, boxes = _reposition_section(pm, viewer)
         frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
-        segments = viewer.layers[pm._REPOSITION_SEGMENTS_LAYER]
-        data = frag.data.copy()
-        data[2, 5:25, 5:25] = 2
-        frag.data = data
+        ghost = viewer.layers[pm._REPOSITION_GHOST_LAYER]
         boxes["fragment"].setValue(2)
+
+        # Nothing grabbed on this plane: it says so rather than copying air.
         viewer.dims.set_current_step(0, 2)
+        _button(tools, "Copy this outline").click()
+        assert len(ghost.data) == 0, "a ghost was made from an empty plane"
 
-        # With no line yet, Copy says so instead of duplicating nothing.
-        _button(tools, "2. Copy the segment to its target").click()
-        assert len(segments.data) == 0, "a copy was made from nothing"
+        data = frag.data.copy()
+        data[2, 10:40, 10:60] = 2
+        data[2, 10:20, 60:75] = 2          # asymmetric, so a rotation is identifiable
+        frag.data = data
 
-        _button(tools, "1. Draw a segment on the fragment").click()
-        assert segments.visible and segments.mode == "add_line", segments.mode
-        assert viewer.layers.selection == {segments}, "the line tool went to the wrong layer"
-        assert int(segments.feature_defaults["fragment"].iloc[0]) == 2, segments.feature_defaults
+        _button(tools, "Copy this outline").click()
+        assert len(ghost.data) == 1 and ghost.visible, "the outline was not copied"
+        assert ghost.mode == "select" and ghost.selected_data == {0}, \
+            "the ghost should come back selected, ready to drag"
+        assert int(ghost.features["fragment"].iloc[0]) == 2, ghost.features
+        before = np.asarray(ghost.data[0], dtype=float)
+        assert len(before) >= 3, f"a polygon needs 3+ vertices, got {len(before)}"
 
-        # Draw the source line by hand (the button only readies the tool).
-        segments.add([[[2, 10, 8], [2, 10, 22]]], shape_type="line")
-        _button(tools, "2. Copy the segment to its target").click()
-        assert len(segments.data) == 2, "the copy was not added"
-        assert segments.mode == "select" and segments.selected_data == {1}, \
-            "the copy should come back selected and draggable"
-        assert list(segments.features["fragment"]) == [2, 2], segments.features
+        # Move it exactly as a drag+rotate would, and read the pose back. The
+        # numbers have to come out as the ones that were applied -- this is the
+        # whole contract of the outline path.
+        tx_um, ty_um, deg = 130.0, -52.0, 11.0
+        rot = np.array([[np.cos(np.radians(deg)), -np.sin(np.radians(deg))],
+                        [np.sin(np.radians(deg)), np.cos(np.radians(deg))]])
+        xy = np.column_stack([before[:, 2] * RAW_UM[0], before[:, 1] * RAW_UM[1]])
+        pivot = xy.mean(axis=0)
+        moved = (xy - pivot) @ rot.T + pivot + [tx_um, ty_um]
+        ghost.data = [np.column_stack([before[:, 0],
+                                       moved[:, 1] / RAW_UM[1], moved[:, 0] / RAW_UM[0]])]
 
-        a, b = (np.asarray(d, dtype=float) for d in segments.data)
-        assert abs(np.linalg.norm(a[1] - a[0]) - np.linalg.norm(b[1] - b[0])) < 1e-9, \
-            "the copy changed length -- that is the one thing a rigid move cannot absorb"
-        assert not np.allclose(a, b), "the copy sits exactly on the original and cannot be seen"
+        # No button: moving the ghost is what sets the pose.
+        assert not [b for b in tools.findChildren(pm.QPushButton)
+                    if "Fit from the dragged" in b.text()], "the Fit button is still there"
+        assert abs(boxes["rot"].value() - deg) < 0.2, boxes["rot"].value()
+        # tx/ty are written down about the fitted centre, so check the MOTION
+        # rather than the two numbers it is expressed as: the drag has already
+        # recorded the keyframe, so ask the plan itself where the outline lands.
+        from registration_ants import reposition as rp
+        keyframe = _viewer_plan(viewer, pm)["fragments"][0]["keyframes"][0]
+        assert np.abs(rp.transform_points_um(xy, keyframe) - moved).max() < 0.5, \
+            "the fitted transform does not carry the outline where it was dragged"
+
+        # A resize is not a rigid move: reported, and NOT folded into the pose.
+        stretched = (moved - moved.mean(axis=0)) * 1.2 + moved.mean(axis=0)
+        ghost.data = [np.column_stack([before[:, 0],
+                                       stretched[:, 1] / RAW_UM[1], stretched[:, 0] / RAW_UM[0]])]
+        said = [w.text() for w in tools.findChildren(pm.QLabel) if "resized" in w.text()]
+        assert said, "a 20% resize of the ghost went unreported"
+        assert "+20" in said[0], said[0]
+
+        # Copying again replaces the ghost rather than piling them up.
+        _button(tools, "Copy this outline").click()
+        assert len(ghost.data) == 1, f"{len(ghost.data)} ghosts for one fragment"
+
+        # MOVING THE PIVOT MUST NOT MOVE THE TISSUE. Pinning the hinge on a
+        # piece already posed used to swing it by (R - I)(c_new - c_old), which
+        # is the whole width of the sample for a far-away pivot.
+        ghost.data = [np.column_stack([before[:, 0],
+                                       moved[:, 1] / RAW_UM[1], moved[:, 0] / RAW_UM[0]])]
+        landed = rp.transform_points_um(
+            xy, _viewer_plan(viewer, pm)["fragments"][0]["keyframes"][0])
+        viewer.cursor.position = tuple(np.array([2.0, 400.0, 900.0]) * np.array(RAW_UM[::-1]))
+        _button(tools, "Rotation centre <- cursor").click()
+        keyframe = _viewer_plan(viewer, pm)["fragments"][0]["keyframes"][0]
+        assert abs(keyframe["center_um"][0] - 900.0 * RAW_UM[0]) < 1.0, keyframe["center_um"]
+        assert np.abs(rp.transform_points_um(xy, keyframe) - landed).max() < 0.5, \
+            "re-pivoting moved the tissue instead of only renaming the numbers"
     finally:
         viewer.close()
     print("   OK")
-
 
 
 def test_reposition_export_stays_sparse(tmp, inputs):
@@ -1419,7 +1394,7 @@ def test_reposition_export_stays_sparse(tmp, inputs):
         for z in (1, 5):
             viewer.dims.set_current_step(0, z)
             boxes["tx"].setValue(0.0 if z == 1 else 26.0)
-            _button(tools, "Set keyframe on this plane").click()
+            _pin_pose(tools)
         _button(tools, "Export Outline").click()
     finally:
         viewer.close()
@@ -1576,7 +1551,7 @@ def test_reposition_names_follow_their_fragment(tmp, inputs):
 
         boxes["fragment"].setValue(1)
         name_edit.setText("flap A")
-        _button(tools, "Set keyframe on this plane").click()
+        _pin_pose(tools)
 
         # Switching must reload the box, or fragment 2 inherits "flap A" the
         # moment its keyframe is set -- two pieces with one name, in the plan
@@ -1584,7 +1559,7 @@ def test_reposition_names_follow_their_fragment(tmp, inputs):
         boxes["fragment"].setValue(2)
         assert name_edit.text() == "", f"the previous fragment's name stayed: {name_edit.text()!r}"
         name_edit.setText("flap B")
-        _button(tools, "Set keyframe on this plane").click()
+        _pin_pose(tools)
 
         boxes["fragment"].setValue(1)
         assert name_edit.text() == "flap A", name_edit.text()
@@ -1622,16 +1597,15 @@ def main():
         test_assignment_panel_drops_one_region(tmp, inputs)
         test_reposition_panel(tmp, inputs)
         test_reposition_grab_from_click(tmp, inputs)
-        test_reposition_segments_belong_to_a_fragment(tmp, inputs)
         test_reposition_three_pieces_each_move_their_own_way(tmp, inputs)
         test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs)
-        test_reposition_cut_brush_separates_touching_pieces(tmp, inputs)
         test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs)
-        test_reposition_draw_and_copy_segment_buttons(tmp, inputs)
         test_reposition_export_stays_sparse(tmp, inputs)
         test_reposition_grab_is_armed_then_clicked(tmp, inputs)
         test_reposition_grab_prefers_the_painted_mask(tmp, inputs)
         test_reposition_names_follow_their_fragment(tmp, inputs)
+        test_reposition_drag_the_outline(tmp, inputs)
+        test_old_plans_drop_their_line_pairs(tmp, inputs)
         test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")
     return 0
