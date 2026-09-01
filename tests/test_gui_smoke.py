@@ -1355,6 +1355,33 @@ def test_reposition_drag_the_outline(tmp, inputs):
         _button(tools, "Copy this outline").click()
         assert len(ghost.data) == 1, f"{len(ghost.data)} ghosts for one fragment"
 
+        # TWO PIECES ON ONE PLANE, one ghost each. Copying fragment 3's outline
+        # leaves fragment 2's alone, and dragging either one is what picks it --
+        # the spin box follows, rather than the pose being read off whichever
+        # number was left showing.
+        data = frag.data.copy()
+        data[2, 60:80, 90:140] = 3
+        frag.data = data
+        boxes["fragment"].setValue(3)
+        _button(tools, "Copy this outline").click()
+        assert len(ghost.data) == 2, "the second fragment did not get its own ghost"
+        assert sorted(int(v) for v in ghost.features["fragment"]) == [2, 3], ghost.features
+        three = np.asarray(ghost.data[-1], dtype=float)
+        assert three[:, 1].min() >= 59 and three[:, 2].min() >= 89, \
+            "fragment 3's outline picked up fragment 2's voxels"
+
+        boxes["fragment"].setValue(2)          # left pointing at the wrong piece on purpose
+        shifted = three.copy()
+        shifted[:, 2] += 20.0
+        ghost.data = list(ghost.data[:-1]) + [shifted]
+        assert boxes["fragment"].value() == 3, \
+            "dragging fragment 3's ghost must select fragment 3, not fit fragment 2"
+        posed3 = [f for f in _viewer_plan(viewer, pm)["fragments"] if f["label"] == 3]
+        assert posed3 and posed3[0]["keyframes"], "dragging the second ghost recorded nothing"
+        assert abs(posed3[0]["keyframes"][0]["tx_um"] - 20.0 * RAW_UM[0]) < 0.5, \
+            posed3[0]["keyframes"][0]
+        boxes["fragment"].setValue(2)
+
         # MOVING THE PIVOT MUST NOT MOVE THE TISSUE. Pinning the hinge on a
         # piece already posed used to swing it by (R - I)(c_new - c_old), which
         # is the whole width of the sample for a far-away pivot.

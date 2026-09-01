@@ -1786,6 +1786,24 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             f"nothing to press. Do NOT drag a corner of the box: that resizes, and a resize "
             f"is not a rigid move (it is reported, never applied).")
 
+    def moved_ghost():
+        """The fragment whose ghost is no longer where it was copied, as
+        (label, shape index, vertices) -- (None, None, None) if none has been
+        dragged. Which one MOVED is the question, not which one is selected:
+        two pieces on one plane have two ghosts on screen at once.
+        """
+        for label, source in ghost_source.items():
+            index = ghost_index(label)
+            if index is None:
+                continue                  # its polygon was dropped, entry not yet cleaned up
+            poly = np.asarray(ghost.data[index], dtype=float)
+            if (len(poly) == len(source["xy_um"])
+                    and np.allclose(poly[:, 2] * voxel_um[0], source["xy_um"][:, 0])
+                    and np.allclose(poly[:, 1] * voxel_um[1], source["xy_um"][:, 1])):
+                continue                  # sitting where it was copied: nothing said yet
+            return label, index, poly
+        return None, None, None
+
     def fit_from_outline(*_):
         """Read the pose back off the dragged ghost -- as it is dragged.
 
@@ -1803,16 +1821,16 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         """
         if posing["busy"]:
             return
-        label = label_spin.value()
-        source = ghost_source.get(int(label))
-        index = ghost_index(label)
-        if source is None or index is None:
-            return
-        moved = np.asarray(ghost.data[index], dtype=float)
-        if (len(moved) == len(source["xy_um"])
-                and np.allclose(moved[:, 2] * voxel_um[0], source["xy_um"][:, 0])
-                and np.allclose(moved[:, 1] * voxel_um[1], source["xy_um"][:, 1])):
-            return                        # sitting where it was copied: nothing said yet
+        label, index, moved = moved_ghost()
+        if label is None:
+            return              # nothing dragged yet, or a ghost was just replaced
+        if label != label_spin.value():
+            # Dragging a ghost IS picking that fragment. Several pieces on one
+            # plane each carry their own ghost, and reading the pose off
+            # whichever number the spin box happened to be left on would fit
+            # the wrong piece -- or, more often, silently fit nothing.
+            label_spin.setValue(int(label))
+        source = ghost_source[label]
         dst = np.column_stack([moved[:, 2] * voxel_um[0], moved[:, 1] * voxel_um[1]])
         e = entry(label)
         try:
