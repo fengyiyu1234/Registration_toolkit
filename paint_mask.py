@@ -1031,14 +1031,14 @@ VOXEL_SIZE_UM_NOTE = (
 # out of the region it is part of. So fragments get a second Labels layer,
 # whose numbers mean fragments rather than regions.
 #
-# BUT IT IS NOT NORMALLY PAINTED. Tracing every flap a second time, after the
+# BUT IT IS NOT NORMALLY PAINTED. Tracing every piece a second time, after the
 # guide outline already covers that tissue, is work with nothing in it. On the
-# planes where a flap is open it is ALREADY its own connected component --
-# that is what a crack is -- so "Grab fragment under the cursor" clicks one
-# out, walks it along z, and stops where it stops being separate, which is the
-# hinge. The z extent comes out of the same walk instead of being judged by
-# eye. The brush and "Fill outlines between painted planes" stay as the
-# fallback for a crack too tight to separate at any threshold.
+# planes where a piece is open it is ALREADY its own connected component --
+# that is what a crack is -- so one click takes it. A grab is ONE PLANE: the
+# extent along z is whichever planes get clicked, filled between when the plan
+# is applied, so nothing infers how far a piece goes and several pieces sharing
+# an xy footprint at different z stay separate by construction. "Draw a cut"
+# is the fallback for a crack too tight to separate at any threshold.
 #
 # WHAT THE CONTROLS ARE
 # Per fragment, per z plane: an in-plane rigid transform (tx, ty, theta) plus
@@ -1256,15 +1256,6 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #ffd166;")
         layout.addWidget(warning)
-    # A flap is normally a minority of its plane, and the walk stops when the
-    # component stops being one -- but cortex split into three leaves pieces
-    # that are a third of the tissue each, and near the top of the brain a
-    # single piece can be most of it. So the backstop is a control rather than
-    # a constant; the grab always says which rule stopped it.
-    share_row, share_box = _slider_row("max share", 0.1, 0.95, decimals=2, suffix="",
-                                       name="reposition_share")
-    share_box.setValue(0.5)
-    layout.addWidget(share_row)
 
     centre_label = QLabel("rotation centre: fragment centroid")
     centre_label.setWordWrap(True)
@@ -1508,7 +1499,40 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         entry(label_spin.value())["center_um"] = c
         centre_label.setText(f"rotation centre: x={c[0]:.0f} y={c[1]:.0f} um  (from cursor)")
 
-    def grab_fragment(follow_z=False):
+    def arm_grab():
+        """Wait for a click ON THE IMAGE, then grab what is under it.
+
+        The button cannot read the cursor when it is pressed: to press it the
+        mouse has to leave the image, so "hover the fragment, then press the
+        button" is an ordering the interaction actively fights, and pressing
+        first grabs whatever the cursor last happened to be over -- usually
+        nothing, which looks exactly like a button that does not work.
+        Arming a one-shot canvas click puts the two in the order they are
+        thought in: say what you want, then point at it.
+
+        The fragments layer is selected in pan_zoom while armed, so the click
+        lands as a click and not as a brush stroke on whatever layer happened
+        to be active.
+        """
+        previous = (set(viewer.layers.selection), frag_layer.mode)
+        frag_layer.visible = True
+        viewer.layers.selection = {frag_layer}
+        frag_layer.mode = "pan_zoom"
+
+        def on_click(_source, event):
+            try:
+                viewer.mouse_drag_callbacks.remove(on_click)
+            except ValueError:
+                pass
+            viewer.layers.selection, frag_layer.mode = previous
+            grab_fragment(event.position)
+
+        viewer.mouse_drag_callbacks.append(on_click)
+        status.setText(f"Now click the piece in the image, on this plane, as fragment "
+                       f"{label_spin.value()}.")
+        return on_click
+
+    def grab_fragment(position):
         """Take the fragment from a click instead of a traced outline.
 
         On the planes where it is open, a flap is already its own connected
@@ -1518,47 +1542,36 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         which is the hinge; the z extent falls out of the same walk rather
         than being another thing to judge by eye.
 
-        THIS PLANE ONLY by default, and following it through z is the option
-        rather than the other way round. Not because the walk goes wrong on
-        several pieces -- it stops cleanly at each one's ends, and a phantom
-        of two pieces sharing an xy footprint at different z does NOT run them
-        together -- but because it DECIDES the extent, and a sample with
-        several pieces is one where that decision is already known and worth
-        stating rather than inferring. Grabbing the first and last plane of a
-        piece and filling between them is the same sparse-keyframe idiom the
-        guide outlines use, keeps each piece's extent exactly where it was put,
-        and matches the keyframes that have to bracket it anyway.
-
-        The walk is still the quicker route for a single flap whose extent is
-        genuinely unknown, and it is the only thing that finds the hinge.
-
-        A single-plane grab replaces only THAT plane for this fragment, so the
-        planes already grabbed for it survive; the z walk replaces the whole
-        fragment, since it produces a whole extent in one go.
+        ONE PLANE, always. The extent along z comes from grabbing each piece's
+        planes and letting the fill between them happen when the plan is
+        applied -- the same sparse-keyframe idiom the guide outlines use. A
+        grab replaces only THIS plane for this fragment, so the planes already
+        grabbed for it survive and clicking a second one accumulates.
 
         The threshold, not the guide layer, is what tissue means here: a guide
         outline is sparse keyframes interpolated into a smooth blob, and that
         interpolation closes the thin crack this depends on.
         """
-        pos = viewer.cursor.position
-        seed = tuple(int(round(pos[axis] / (scale[axis] if scale else 1.0))) for axis in (0, 1, 2))
+        seed = tuple(int(round(position[axis] / (scale[axis] if scale else 1.0)))
+                     for axis in (0, 1, 2))
         label = label_spin.value()
         try:
             cuts = frag_layer.data == _REPOSITION_CUT_LABEL
-            mask, planes, note = reposition.grab_fragment(
+            mask, note = reposition.grab_plane(
                 reposition.threshold_planes(image_arr, grab_box.value(),
                                             exclude=cuts if cuts.any() else None),
-                seed, max_fraction=share_box.value(), follow_z=follow_z)
+                seed)
         except ValueError as exc:
             status.setText(str(exc))
             return
         data = frag_layer.data.copy()
-        if follow_z:
-            data[data == label] = 0              # replace, so a re-grab is not a union
-        else:
-            data[seed[0]][data[seed[0]] == label] = 0        # this plane only
+        data[seed[0]][data[seed[0]] == label] = 0    # this plane only; other planes survive
         data[mask & (data != _REPOSITION_CUT_LABEL)] = label
         frag_layer.data = data
+        # Shown, not just filled: the layer starts hidden (most samples never
+        # cracked) and a grab whose result cannot be seen reads as a button
+        # that did nothing.
+        frag_layer.visible = True
         entry(label)["center_um"] = None         # the centroid moved with the new outline
         print(f"Grabbed fragment {label} from (z={seed[0]}, y={seed[1]}, x={seed[2]}): {note}")
         planes_now = sorted(int(z) for z in np.unique(np.nonzero(data == label)[0]))
@@ -1566,9 +1579,7 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
                        f"now spans plane(s) {planes_now[0]}..{planes_now[-1]} "
                        f"({len(planes_now)} grabbed)\n\nToo much or too little? The 'tissue' "
                        f"slider decides what counts as tissue -- a crack only separates the "
-                       f"pieces while it sits above the gap -- and 'max share' is how big a "
-                       f"piece may get before the walk calls it the hinge. Raise it for a "
-                       f"cortex split into a few large pieces.")
+                       f"pieces while it sits above the gap. If they touch, use 'Draw a cut'.")
         refresh_roles()
         load_plane()
 
@@ -1649,8 +1660,7 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
 
     # ---------------------------------------------------------------- wiring
 
-    buttons = [("Grab this plane under the cursor", grab_fragment),
-               ("Grab and follow through z", lambda: grab_fragment(follow_z=True)),
+    buttons = [("Grab this plane: then click the piece", arm_grab),
                ("Draw a cut (for pieces that touch)", cut_brush),
                ("1. Draw a segment on the fragment", draw_segment),
                ("2. Copy the segment to its target", copy_segment),

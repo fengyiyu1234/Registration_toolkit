@@ -89,8 +89,8 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
   Both modes also carry a **Reposition** section, for a sample that cracked and
   has flaps of tissue swung out of place. The flaps are not traced a second
   time: on the planes where one is open it is already its own connected
-  component, so clicking it grabs it and walks it along z until it stops being
-  separate — which is the hinge, and which is also how far it goes. Pose each
+  component, so one click takes it, one plane at a time, and the planes between
+  the ones you click are filled when the plan is applied. Pose each
   one per plane with two drawn segments and four sliders against a live
   preview — which segment is the source is read off the fragment outline, not
   off drawing order — and the export writes `<stem>.reposition.json` +

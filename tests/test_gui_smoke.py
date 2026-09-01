@@ -743,7 +743,7 @@ def test_assignment_panel_drops_one_region(tmp, inputs):
 
 
 def test_panels_are_tabbed_and_short(tmp, inputs):
-    print("17. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
+    print("19. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
     import paint_mask as pm
     from PyQt5.QtWidgets import QScrollArea
     from shared import atlas_reference
@@ -805,6 +805,20 @@ def test_panels_are_tabbed_and_short(tmp, inputs):
 
 
 
+def _grab_at(pm, viewer, tools, zyx):
+    """Press the grab button, then click the image -- the real two-step path.
+
+    The button only ARMS the grab; the click that decides what to take lands on
+    the canvas afterwards. Driving it any other way would test a code path the
+    hand never uses.
+    """
+    from types import SimpleNamespace
+    _button(tools, "Grab this plane").click()
+    scale = viewer.layers["sample"].scale
+    armed = viewer.mouse_drag_callbacks[-1]
+    armed(viewer, SimpleNamespace(position=tuple(c * s for c, s in zip(zyx, scale))))
+
+
 def _viewer_plan(viewer, pm):
     """The reposition plan the panel currently holds, via the fragments
     layer's metadata."""
@@ -821,7 +835,6 @@ def _reposition_section(pm, viewer):
     boxes = {key: tools.findChild(pm.QDoubleSpinBox, f"reposition_{key}")
              for key in ("tx", "ty", "rot", "dz", "feather")}
     boxes["fragment"] = tools.findChild(pm.QSpinBox, "reposition_fragment")
-    boxes["share"] = tools.findChild(pm.QDoubleSpinBox, "reposition_share")
     missing = [k for k, v in boxes.items() if v is None]
     assert not missing, f"reposition controls not found: {missing}"
     return tools, boxes
@@ -937,19 +950,17 @@ def test_reposition_grab_from_click(tmp, inputs):
         assert not frag.data.any(), "nothing should be outlined before the grab"
 
         scale = viewer.layers["sample"].scale
-        viewer.cursor.position = tuple(c * s for c, s in zip((3, 45, 110), scale))
-        _button(tools, "Grab and follow through z").click()
+        _grab_at(pm, viewer, tools, (3, 45, 110))
 
         got = frag.data == 1
         planes = sorted(int(z) for z in np.unique(np.nonzero(got)[0]))
-        assert planes == [0, 1, 2, 3, 4, 5], f"the walk should stop at the hinge, got {planes}"
-        assert got[3, 20:70, 60:160].all(), "the flap itself was not filled"
+        assert planes == [3], f"a grab takes exactly the plane clicked, got {planes}"
+        assert got[3, 20:70, 60:160].all(), "the flap itself was not taken"
         assert not got[3, 80:180, 20:200].any(), "the grab leaked across the crack into the brain"
 
         # Clicking off tissue is a mistake worth naming, and must not wipe the
         # outline already grabbed.
-        viewer.cursor.position = tuple(c * s for c, s in zip((3, 2, 2), scale))
-        _button(tools, "Grab and follow through z").click()
+        _grab_at(pm, viewer, tools, (3, 2, 2))
         assert (frag.data == 1).any(), "a bad click destroyed the previous grab"
     finally:
         viewer.close()
@@ -1047,8 +1058,8 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
     from shared import atlas_reference
 
     # One band of "cortex" cut into three by two gaps. Each piece is a third of
-    # the tissue on its plane, which is why the grab's share-of-plane backstop
-    # has to be a control and not a constant.
+    # the tissue on its plane -- fine, since a grab takes the component clicked
+    # and asks no question about how big a piece is allowed to be.
     stack = np.full((8, 200, 220), 50, dtype=np.uint16)
     for x0, x1 in ((10, 70), (76, 136), (142, 202)):
         stack[:, 60:140, x0:x1] = 3000
@@ -1060,7 +1071,6 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
     try:
         tools, boxes = _reposition_section(pm, viewer)
         frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
-        boxes["share"].setValue(0.5)
         scale = viewer.layers["sample"].scale
 
         # Left and right pieces move inward; the middle one is the anchor and
@@ -1068,8 +1078,7 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
         # has to hold still or closing the gaps just makes the cortex smaller.
         for label, x in ((1, 40), (2, 172)):
             boxes["fragment"].setValue(label)
-            viewer.cursor.position = tuple(c * s for c, s in zip((3, 100, x), scale))
-            _button(tools, "Grab and follow through z").click()
+            _grab_at(pm, viewer, tools, (3, 100, x))
 
         got = frag.data
         assert (got == 1)[3, 100, 40] and (got == 2)[3, 100, 172], "a piece was not grabbed"
@@ -1152,17 +1161,15 @@ def test_reposition_cut_brush_separates_touching_pieces(tmp, inputs):
     try:
         tools, boxes = _reposition_section(pm, viewer)
         frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
-        scale = viewer.layers["sample"].scale
-        viewer.cursor.position = tuple(c * s for c, s in zip((3, 45, 110), scale))
 
-        _button(tools, "Grab and follow through z").click()
+        _grab_at(pm, viewer, tools, (3, 45, 110))
         assert (frag.data == 1)[3, 100, 100], "the phantom does not leak; the test is void"
 
         # A stroke along the join, in the cut number, and grab again.
         data = frag.data.copy()
         data[:, 68:72, 60:160] = pm._REPOSITION_CUT_LABEL
         frag.data = data
-        _button(tools, "Grab and follow through z").click()
+        _grab_at(pm, viewer, tools, (3, 45, 110))
 
         got = frag.data == 1
         assert got[3, 45, 110], "the flap was lost"
@@ -1200,9 +1207,8 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
     import paint_mask as pm
     from shared import atlas_reference
 
-    # Two pieces at the SAME xy, far apart in z -- the geometry the z walk
-    # cannot handle, because it links planes by overlap and would step from
-    # one onto the other through the tissue between them.
+    # Two pieces at the SAME xy, far apart in z. Nothing infers an extent here:
+    # each piece's planes are the ones clicked, so the two cannot run together.
     stack = np.full((8, 200, 220), 50, dtype=np.uint16)
     stack[:, 90:180, 20:200] = 3000            # the brain, on every plane
     stack[1:3, 20:70, 60:160] = 3000           # piece A, low z
@@ -1217,11 +1223,10 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
         frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
         scale = viewer.layers["sample"].scale
 
-        def grab(label, z, button="Grab this plane under the cursor"):
+        def grab(label, z):
             boxes["fragment"].setValue(label)
             viewer.dims.set_current_step(0, z)
-            viewer.cursor.position = tuple(c * s for c, s in zip((z, 45, 110), scale))
-            _button(tools, button).click()
+            _grab_at(pm, viewer, tools, (z, 45, 110))
 
         # Fragment 1 is piece A: grab its first and last plane. The second grab
         # must NOT wipe the first -- per-plane grabs accumulate.
@@ -1238,17 +1243,13 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
         assert not (frag.data == 1)[5].any(), "piece B was claimed by fragment 1"
         assert not (frag.data == 2)[1].any(), "piece A was claimed by fragment 2"
 
-        # The walk is not broken on this geometry -- it stops at the piece's
-        # own ends rather than stepping onto the other one. What per-plane
-        # grabbing buys is that the extent is stated instead of inferred, so
-        # the difference worth pinning down is that the two agree here and the
-        # per-plane route never had to be trusted to.
+        # A third fragment seeded on piece A's own plane: same xy as the other
+        # two, and still nobody else's. A grab's extent is exactly the plane
+        # clicked -- nothing here infers how far a piece goes.
         boxes["fragment"].setValue(3)
         viewer.dims.set_current_step(0, 1)
-        viewer.cursor.position = tuple(c * s for c, s in zip((1, 45, 110), scale))
-        _button(tools, "Grab and follow through z").click()
-        walked = sorted(int(z) for z in np.unique(np.nonzero(frag.data == 3)[0]))
-        assert walked == [1, 2], f"the walk should stop at piece A's own ends, got {walked}"
+        _grab_at(pm, viewer, tools, (1, 45, 110))
+        assert sorted(int(z) for z in np.unique(np.nonzero(frag.data == 3)[0])) == [1]
     finally:
         viewer.close()
     print("   OK")
@@ -1345,6 +1346,57 @@ def test_reposition_export_stays_sparse(tmp, inputs):
     print("   OK")
 
 
+
+def test_reposition_grab_is_armed_then_clicked(tmp, inputs):
+    print("18. paint_mask: the grab button arms a click, and the result becomes visible...")
+    import numpy as np
+    import tifffile
+    from types import SimpleNamespace
+    import paint_mask as pm
+    from shared import atlas_reference
+
+    stack = np.full((8, 200, 220), 50, dtype=np.uint16)
+    stack[:, 90:180, 20:200] = 3000
+    stack[2:6, 20:70, 60:160] = 3000
+    raw = tmp / "armed.tif"
+    tifffile.imwrite(str(raw), stack)
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, "armed.nii.gz",
+                         image_path=str(raw), voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        assert not frag.visible, "the fragments layer should start hidden"
+
+        before = len(viewer.mouse_drag_callbacks)
+        _button(tools, "Grab this plane").click()
+        # Pressing the button must NOT grab anything yet -- it arms a click.
+        assert not frag.data.any(), "the button grabbed before anything was pointed at"
+        assert len(viewer.mouse_drag_callbacks) == before + 1, "no click was armed"
+        assert frag.visible and frag.mode == "pan_zoom", \
+            "while armed the click must land as a click, not a brush stroke"
+
+        viewer.dims.set_current_step(0, 3)
+        scale = viewer.layers["sample"].scale
+        armed = viewer.mouse_drag_callbacks[-1]
+        armed(viewer, SimpleNamespace(position=tuple(c * s for c, s in zip((3, 45, 110), scale))))
+
+        assert (frag.data == 1)[3, 45, 110], "the click did not grab"
+        assert frag.visible, "a grab whose result cannot be seen reads as a dead button"
+        assert len(viewer.mouse_drag_callbacks) == before, "the armed click was not one-shot"
+
+        # A click on background says so, and leaves the previous grab alone.
+        _button(tools, "Grab this plane").click()
+        viewer.mouse_drag_callbacks[-1](
+            viewer, SimpleNamespace(position=tuple(c * s for c, s in zip((3, 5, 5), scale))))
+        assert (frag.data == 1).any(), "a bad click destroyed the previous grab"
+        assert any("not on tissue" in w.text() for w in tools.findChildren(pm.QLabel)), \
+            "a click on background said nothing"
+    finally:
+        viewer.close()
+    print("   OK")
+
+
 def main():
     print("=== tests/test_gui_smoke.py ===")
     if not _ensure_display():
@@ -1378,6 +1430,7 @@ def main():
         test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs)
         test_reposition_draw_and_copy_segment_buttons(tmp, inputs)
         test_reposition_export_stays_sparse(tmp, inputs)
+        test_reposition_grab_is_armed_then_clicked(tmp, inputs)
         test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")
     return 0
