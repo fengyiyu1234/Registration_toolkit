@@ -1660,6 +1660,92 @@ def test_old_plans_drop_their_line_pairs(tmp, inputs):
     print("   OK")
 
 
+def test_reposition_resume_redraws_the_ghosts(tmp, inputs):
+    print("25. paint_mask: a resumed plan comes back as draggable ghosts, not just numbers...")
+    import numpy as np
+    import SimpleITK as sitk
+    import paint_mask as pm
+    from shared import atlas_reference
+    from registration_ants import reposition as rp
+
+    out = tmp / "reghost.nii.gz"
+    stem = pm._output_stem(str(out))
+    fragments = np.zeros(RAW_SHAPE, dtype=np.uint8)
+    fragments[2, 10:40, 10:60] = 1
+    fragments[5, 10:40, 10:60] = 1
+    fragments[2, 60:90, 120:170] = 2         # a second piece sharing a plane with the first
+    sitk.WriteImage(sitk.GetImageFromArray(fragments), f"{stem}_fragments.nii.gz")
+
+    posed = {(1, 2): rp.make_keyframe(2, tx_um=120.0, ty_um=-30.0, theta_deg=9.0,
+                                      center_um=(80.0, 80.0)),
+             (1, 5): rp.make_keyframe(5, tx_um=40.0, center_um=(80.0, 80.0)),
+             (2, 2): rp.make_keyframe(2, ty_um=55.0, center_um=(300.0, 200.0)),
+             # A keyframe whose fragment was never grabbed on that plane: it
+             # has no silhouette to hand back, and must not take the resume
+             # down with it.
+             (3, 7): rp.make_keyframe(7, tx_um=10.0, center_um=(50.0, 50.0))}
+    rp.write_plan(f"{stem}.reposition.json", rp.make_plan(
+        RAW_SHAPE, RAW_UM,
+        [rp.make_fragment(1, [posed[(1, 2)], posed[(1, 5)]], "flap"),
+         rp.make_fragment(2, [posed[(2, 2)]]),
+         rp.make_fragment(3, [posed[(3, 7)]])],
+        labels_path=f"{stem}_fragments.nii.gz"))
+
+    def outline_um(frag_layer, label, z):
+        poly = rp.outline_polygon(frag_layer.data, label, z)
+        return np.column_stack([poly[:, 1] * RAW_UM[0], poly[:, 0] * RAW_UM[1]])
+
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name, voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        ghost = viewer.layers[pm._REPOSITION_GHOST_LAYER]
+        assert ghost.visible, "the restored ghosts were left on a hidden layer"
+        at = {(int(f), int(z)): i for i, (f, z)
+              in enumerate(zip(ghost.features["fragment"], ghost.features["plane"]))}
+        assert sorted(at) == [(1, 2), (1, 5), (2, 2)], \
+            f"one ghost per resumed keyframe that has a fragment under it, got {sorted(at)}"
+
+        # Each one is its keyframe, drawn: the outline this session traces off
+        # the resumed voxels, carried through the pose that was recorded for it.
+        for (label, z), i in at.items():
+            drawn = np.asarray(ghost.data[i], dtype=float)
+            assert set(drawn[:, 0].astype(int)) == {z}, \
+                f"fragment {label}'s ghost was drawn on plane(s) {set(drawn[:, 0])}, not {z}"
+            landed = np.column_stack([drawn[:, 2] * RAW_UM[0], drawn[:, 1] * RAW_UM[1]])
+            want = rp.transform_points_um(outline_um(frag, label, z), posed[(label, z)])
+            assert np.abs(landed - want).max() < 0.5, \
+                f"fragment {label}'s ghost on plane {z} is not where its keyframe put it"
+
+        # Drawing them must not RE-record them: adding a shape is a data event,
+        # and a refit would rewrite every resumed pose (about a different
+        # pivot, off a re-traced outline) before the sample was even looked at.
+        resumed = {(f["label"], k["z"]): k
+                   for f in _viewer_plan(viewer, pm)["fragments"] for k in f["keyframes"]}
+        assert resumed == posed, "restoring the ghosts changed the plan it restored them from"
+
+        # And the point of all this: a resumed pose can be corrected by DRAGGING
+        # it further, and what comes back is the whole pose -- the ghost is
+        # measured against the outline it is a copy of, not against where the
+        # last session left it, so the correction does not compound.
+        viewer.dims.set_current_step(0, 2)
+        nudge_voxels = 20.0
+        data = list(ghost.data)
+        nudged = np.asarray(data[at[(1, 2)]], dtype=float).copy()
+        nudged[:, 2] += nudge_voxels
+        data[at[(1, 2)]] = nudged
+        ghost.data = data
+        assert boxes["fragment"].value() == 1, "dragging fragment 1's ghost did not select it"
+        keyframe = _viewer_plan(viewer, pm)["fragments"][0]["keyframes"][0]
+        source = outline_um(frag, 1, 2)
+        want = rp.transform_points_um(source, posed[(1, 2)]) + [nudge_voxels * RAW_UM[0], 0.0]
+        assert np.abs(rp.transform_points_um(source, keyframe) - want).max() < 0.5, \
+            "the nudged ghost was read as a correction to the resumed pose, not as the pose"
+    finally:
+        viewer.close()
+    print("   OK")
+
+
 def test_reposition_drag_the_outline(tmp, inputs):
     print("21. paint_mask: copy the fragment outline, drag it, read the pose back...")
     import numpy as np
@@ -1772,6 +1858,44 @@ def test_reposition_drag_the_outline(tmp, inputs):
         assert posed3 and posed3[0]["keyframes"], "dragging the second ghost recorded nothing"
         assert abs(posed3[0]["keyframes"][0]["tx_um"] - 20.0 * RAW_UM[0]) < 0.5, \
             posed3[0]["keyframes"][0]
+
+        # AND AGAIN WITH BOTH PIECES ALREADY POSED, which is the case that was
+        # silently broken. Once a ghost has been dragged it sits off its copy
+        # for good, so "which one moved" cannot mean "which one is off its
+        # copy": on a plane with two posed pieces that question answered with
+        # whichever was posed FIRST, every time. Dragging the other piece
+        # re-fitted the first one -- from its own unmoved ghost, so the same
+        # numbers went back in and nothing looked wrong -- while the piece
+        # under the mouse got no keyframe on that plane at all, in that session
+        # or any later one (a resume redraws posed ghosts, trap included).
+        def ghost_at(label, z):
+            return [i for i, (f, zz) in enumerate(zip(ghost.features["fragment"],
+                                                      ghost.features["plane"]))
+                    if (int(f), int(zz)) == (label, z)][0]
+
+        here2 = ghost_at(2, 2)
+        shifted2 = np.asarray(ghost.data[here2], dtype=float).copy()
+        shifted2[:, 1] += 12.0                 # in y, so it cannot be mistaken for 3's move
+        data = list(ghost.data)
+        data[here2] = shifted2
+        ghost.data = data                      # fragment 2 is now posed AND off its copy
+        assert boxes["fragment"].value() == 2, "dragging fragment 2's ghost did not select it"
+        posed2 = [f for f in _viewer_plan(viewer, pm)["fragments"]
+                  if f["label"] == 2][0]["keyframes"][0]
+
+        boxes["fragment"].setValue(2)          # left pointing at the wrong piece on purpose
+        again3 = np.asarray(ghost.data[ghost_at(3, 2)], dtype=float).copy()
+        again3[:, 2] += 7.0
+        data = list(ghost.data)
+        data[ghost_at(3, 2)] = again3
+        ghost.data = data
+        assert boxes["fragment"].value() == 3, \
+            "with both pieces posed, fragment 3's drag was read as fragment 2's"
+        plan_now = {f["label"]: f["keyframes"] for f in _viewer_plan(viewer, pm)["fragments"]}
+        assert abs(plan_now[3][0]["tx_um"] - 27.0 * RAW_UM[0]) < 0.5, \
+            f"fragment 3's second drag was not recorded: {plan_now[3][0]}"
+        assert plan_now[2][0] == posed2, \
+            "dragging fragment 3 rewrote fragment 2's keyframe"
         boxes["fragment"].setValue(2)
 
         # MOVING THE PIVOT MUST NOT MOVE THE TISSUE. Pinning the hinge on a
@@ -2026,6 +2150,7 @@ def main():
         test_reposition_names_follow_their_fragment(tmp, inputs)
         test_reposition_drag_the_outline(tmp, inputs)
         test_old_plans_drop_their_line_pairs(tmp, inputs)
+        test_reposition_resume_redraws_the_ghosts(tmp, inputs)
         test_export_is_what_the_pipeline_reads(tmp, inputs)
         test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")

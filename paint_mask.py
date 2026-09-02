@@ -1178,7 +1178,10 @@ VOXEL_SIZE_UM_NOTE = (
 # the grabbed planes) and <stem>.reposition.json (the plan). Both go out as
 # soon as anything has been GRABBED, keyframes or not, because separating the
 # pieces is the slow half of the work and losing it to "nothing has moved yet"
-# is losing the afternoon. Coming back the other way, the plan is looked for
+# is losing the afternoon. The ghosts are not written and do not need to be:
+# reopening redraws one per resumed keyframe, at the pose that keyframe holds,
+# so a plan comes back as something to keep DRAGGING rather than as numbers to
+# type at (restore_ghosts). Coming back the other way, the plan is looked for
 # next to output_path AND next to the file this session is resuming from
 # (load_reposition_resume) -- rounds are normally given new output names, and
 # keying only on the new one left every fragment behind at the old stem. Cuts
@@ -1331,7 +1334,9 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     #
     # The ghost is scratch: replaced every time the outline is copied, never
     # leaving the window. What gets exported is the label volume and the
-    # numbers the drag produced.
+    # numbers the drag produced -- and because those numbers say exactly where
+    # the ghost was, a resumed plan gets its ghosts drawn back onto their
+    # keyframe planes (restore_ghosts) rather than saved.
     ghost = viewer.add_shapes(
         name=_REPOSITION_GHOST_LAYER, ndim=3, visible=False,
         features={"fragment": np.zeros(0, dtype=int), "plane": np.zeros(0, dtype=int)},
@@ -1341,6 +1346,11 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
     ghost.text = {"string": "f{fragment} ghost", "size": 9, "color": "white",
                   "anchor": "upper_left"}
     ghost_source = {}       # (label, z) -> (N, 2) xy microns, as copied
+    # (label, z) -> the same ghost's vertices as they were last READ, in
+    # voxels. ghost_source answers "what pose is this ghost showing"; this one
+    # answers "which ghost did the hand just move", and they cannot be the
+    # same dict -- see moved_ghosts.
+    ghost_seen = {}
     dropping = {"busy": False}   # set while a ghost is being removed, not dragged
 
     section = QWidget()
@@ -1763,6 +1773,39 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
             finally:
                 dropping["busy"] = False
         ghost_source.pop((int(label), int(z)), None)
+        ghost_seen.pop((int(label), int(z)), None)
+
+    def place_ghost(label, z, tf=None):
+        """Draw a ghost of fragment `label` on plane `z`, and register the
+        outline it is a copy of. Returns its vertex count; raises ValueError
+        (from outline_polygon) if the fragment has nothing on that plane.
+
+        `tf`, when given, is a pose to put it AT rather than on the tissue --
+        the shared half of copying an outline (dropped on the piece, tf None)
+        and rebuilding one from a keyframe (dropped where that keyframe sends
+        the piece). What gets REGISTERED is the unmoved outline either way,
+        because that is what a later drag is fitted against: the fit answers
+        "where did this piece go", not "how much further did it go", so a
+        restored ghost nudged a millimetre reports the whole pose, not the
+        nudge.
+        """
+        poly = reposition.outline_polygon(frag_layer.data, label, z)
+        drop_ghost(label, z)                 # this plane's ghost only, replaced by the new one
+        source = np.column_stack([poly[:, 1] * voxel_um[0], poly[:, 0] * voxel_um[1]])
+        if tf is None:
+            at = poly                        # on the tissue: the copy starts where it is
+        else:
+            moved = reposition.transform_points_um(source, tf)
+            at = np.column_stack([moved[:, 1] / voxel_um[1], moved[:, 0] / voxel_um[0]])
+        ghost.feature_defaults = {"fragment": int(label), "plane": int(z)}
+        ghost.add([np.column_stack([np.full(len(poly), float(z)), at[:, 0], at[:, 1]])],
+                  shape_type="polygon")
+        ghost_source[(int(label), int(z))] = source
+        # Where it was PUT is where it was last seen: a ghost dropped on the
+        # tissue, and a resumed one dropped where its keyframe sends the piece,
+        # have both said nothing yet.
+        ghost_seen[(int(label), int(z))] = np.asarray(ghost.data[-1], dtype=float)
+        return len(poly)
 
     def copy_outline():
         """Copy this fragment's outline on this plane, ready to be dragged.
@@ -1776,57 +1819,103 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         label = label_spin.value()
         z = current_z()
         try:
-            poly = reposition.outline_polygon(frag_layer.data, label, z)
+            n_vertices = place_ghost(label, z)
         except ValueError as exc:
             status.setText(str(exc))
             return
-        drop_ghost(label, z)                 # this plane's ghost only, replaced by the new one
-        vertices = np.column_stack([np.full(len(poly), float(z)), poly[:, 0], poly[:, 1]])
-        ghost.feature_defaults = {"fragment": int(label), "plane": int(z)}
         ghost.visible = True
-        ghost.add([vertices], shape_type="polygon")
-        ghost_source[(int(label), int(z))] = np.column_stack(
-            [poly[:, 1] * voxel_um[0], poly[:, 0] * voxel_um[1]])
         viewer.layers.selection = {ghost}
         ghost.mode = "select"
         ghost.selected_data = {len(ghost.data) - 1}
         status.setText(
-            f"Fragment {label}'s outline copied on plane {z} ({len(poly)} vertices) and "
+            f"Fragment {label}'s outline copied on plane {z} ({n_vertices} vertices) and "
             f"selected. Drag it onto where the tissue belongs; the handle above the box "
             f"rotates it. The pose follows the drag and is recorded as you go -- there is "
             f"nothing to press. Do NOT drag a corner of the box: that resizes, and a resize "
             f"is not a rigid move (it is reported, never applied).")
 
-    def moved_ghost():
-        """The fragment whose ghost ON THIS PLANE is no longer where it was
-        copied, as (label, vertices) -- (None, None) if none has been dragged.
+    def restore_ghosts():
+        """Rebuild a draggable ghost for every keyframe resumed from a plan.
 
-        Which one MOVED is the question, not which one is selected: two pieces
-        on one plane have two ghosts on screen at once and either may be the
-        one being dragged.
+        A pose that comes back as four numbers can only be edited as four
+        numbers -- but the way it was ENTERED was by dragging the piece's own
+        silhouette onto where it belongs, so without this the second session
+        on a sample is a worse tool than the first, for exactly the poses that
+        are hardest to get right by typing. The ghosts themselves are still
+        scratch (nothing writes them to disk; the plan holds the transforms),
+        and scratch that can be regenerated exactly should be: this session's
+        outline of the tissue, mapped through the keyframe that was recorded
+        for it, IS where last session left the ghost.
+
+        Registered against the UNMOVED outline (see place_ghost), so nudging a
+        restored ghost re-fits the whole pose rather than composing a second
+        one on top of it.
+
+        Quiet about the planes it cannot draw: a keyframe whose fragment has
+        no voxels there -- a plan resumed without its _fragments.nii.gz, or
+        one hand-edited -- still applies and is still editable on the sliders,
+        it just has no silhouette to make a handle out of.
+        """
+        drawn, missing = 0, 0
+        for label, e in sorted(fragments.items()):
+            for z, kf in sorted(e["keyframes"].items()):
+                try:
+                    place_ghost(label, z, kf)
+                except ValueError:
+                    missing += 1
+                else:
+                    drawn += 1
+        if drawn:
+            ghost.visible = True
+            print(f"[resume] redrew {drawn} fragment ghost(s) on their keyframe planes -- drag "
+                  f"one to re-pose that plane, no need to type into the sliders.")
+        if missing:
+            print(f"[resume] {missing} resumed keyframe(s) have no fragment voxels on their "
+                  f"plane, so no ghost was drawn for them (the sliders still edit them).")
+
+    def moved_ghosts():
+        """Every ghost ON THIS PLANE that has been dragged since it was last
+        read, as [(label, vertices), ...].
+
+        Measured against ghost_seen -- where each ghost was when this last ran
+        -- and NOT against ghost_source, the unmoved outline it is a copy of.
+        The two are the same only until a ghost is posed; after that it sits
+        off its copy FOR GOOD, and for good was the bug. Read against the copy,
+        "has this been dragged" meant "has this ever been dragged", so on a
+        plane carrying two pieces the first one posed answered for everything
+        that happened there afterwards: dragging the second piece re-fitted the
+        first (invisibly -- its ghost had not moved, so the same numbers were
+        written again) and the piece actually under the mouse got NO keyframe,
+        not that session and not any later one, because a resume redraws the
+        ghosts already posed and puts the trap straight back. Copying the
+        second outline was enough on its own: ghost.add emits a data event too,
+        and the fragment selector jumped to the other piece on the spot.
 
         Restricted to the plane on screen, and that restriction is the whole
-        point of keying ghosts by plane. Every plane already posed still has
-        its ghost sitting off its copy, so a search across all of them would
-        answer "which was dragged" with a plane nobody is looking at -- and
-        then record ITS pose against the plane on screen.
+        point of keying ghosts by plane. A ghost on a plane nobody is looking
+        at is not being dragged, and reading one would record its pose against
+        the plane on screen.
+
+        A list rather than one: napari moves every SELECTED shape together, so
+        two ghosts can change on a single event.
         """
-        for (label, z), source in ghost_source.items():
+        moved = []
+        for label, z in list(ghost_source):
             if z != current_z():
                 continue
             index = ghost_index(label, z)
             if index is None:
                 continue                  # its polygon was dropped, entry not yet cleaned up
             poly = np.asarray(ghost.data[index], dtype=float)
-            if (len(poly) == len(source)
-                    and np.allclose(poly[:, 2] * voxel_um[0], source[:, 0])
-                    and np.allclose(poly[:, 1] * voxel_um[1], source[:, 1])):
-                continue                  # sitting where it was copied: nothing said yet
-            return label, poly
-        return None, None
+            seen = ghost_seen.get((label, z))
+            if seen is not None and poly.shape == seen.shape and np.allclose(poly, seen):
+                continue                  # where it was left: nothing new said
+            ghost_seen[(label, z)] = poly
+            moved.append((label, poly))
+        return moved
 
     def fit_from_outline(*_):
-        """Read the pose back off the dragged ghost -- as it is dragged.
+        """Read the pose back off each dragged ghost -- as it is dragged.
 
         Wired to the ghost's own data event rather than to a button, for the
         same reason the Set-keyframe button went: a drawing moved and not
@@ -1842,9 +1931,11 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         """
         if posing["busy"] or dropping["busy"]:
             return
-        label, moved = moved_ghost()
-        if label is None:
-            return              # nothing dragged yet, or a ghost was just replaced
+        for label, moved in moved_ghosts():
+            fit_one_ghost(label, moved)
+
+    def fit_one_ghost(label, moved):
+        """One dragged ghost -> that fragment's keyframe on this plane."""
         if label != label_spin.value():
             # Dragging a ghost IS picking that fragment. Several pieces on one
             # plane each carry their own ghost, and reading the pose off
@@ -1918,6 +2009,12 @@ def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=No
         load_plane()
 
     label_spin.valueChanged.connect(fragment_selected)
+    # BEFORE the data event below is connected, deliberately: adding a shape
+    # emits it, and fit_from_outline would read each restored ghost back as a
+    # drag -- refitting the pose it was just drawn from, and dragging the spin
+    # box, the keyframe list and the status line along with it.
+    if resume is not None:
+        restore_ghosts()
     # Dragging the ghost IS setting the pose: napari emits this on every move,
     # rotate and resize of a shape, so the sliders and the keyframe follow the
     # drag instead of waiting for a button that could be forgotten. Connected
