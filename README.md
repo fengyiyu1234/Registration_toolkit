@@ -157,10 +157,17 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
   plan's own raw tiff and off when it is the pipeline's (already repositioned)
   resample. The plan is found through the config snapshot `run_pipeline.sh`
   leaves in the output directory, so nothing has to name it twice; a sample
-  with no fragments gets no second layer. Note that the cell points stay in the
-  registered (closed) geometry — that is where their `cell_registration.csv`
-  coordinates are — so this layer answers "which region is this bit of flap",
-  not "which cells are on it".
+  with no fragments gets no second layer.
+
+  The cell points follow the same switch. Their original positions are already
+  in `cell_registration.csv` — columns 0-2 are the raw pixel coordinates the
+  pipeline deliberately never moves — so this is a unit conversion through
+  `cells.voxel_size_um` (read from the same config), not a second reposition,
+  and the cells that never moved land bit-exactly on the resample-space columns
+  the pipeline itself wrote. That equality is checked at load: if the voxel size
+  does not reproduce them, the cells are left alone and the reason is printed
+  rather than a few hundred thousand points being drawn in the wrong place.
+  Flagged pins are re-projected onto their own cell too.
 - **`registration_eval.py`** — Dice/HD95, landmark TRE, Jacobian and
   inverse-consistency metrics across samples and groups.
   `python registration_eval.py configs/eval_config.yaml`.

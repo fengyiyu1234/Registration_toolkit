@@ -87,6 +87,12 @@ view_rotate_k: 0
 #    "Fragments moved back" 开关切哪一层可见 —— hover / 点击 / 搜索高亮读的都是
 #    当前选中的那一层。显示的正是 plan 里记的那张原图时默认打开，否则默认关闭。
 #
+#    细胞点跟着一起走：碎片上的细胞在原图里的位置本来就存在 cell_registration.csv
+#    的第 1-3 列（没被 reposition 动过），换算到标签图网格要知道细胞检测网格的体素
+#    尺寸 —— 默认从同一份 pipeline 配置的 cells.voxel_size_um 读。那一项缺了的话
+#    图谱层照给、细胞点不跟着换（会打印一行说明），也可以在这里写死：
+# cells_voxel_size_um: [0.65, 0.65, 8.0]   # [x, y, z] µm，细胞检测时的网格
+#
 #    plan 的路径默认从样本目录里那份 pipeline 配置快照读（run_pipeline.sh 会把跑
 #    这一次用的 config 拷进 output_dir），所以一般什么都不用写。没有碎片就不会多
 #    这一层。快照出现之前跑的老结果没有那个文件，用下面两条之一指过去：

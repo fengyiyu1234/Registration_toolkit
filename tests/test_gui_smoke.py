@@ -678,13 +678,38 @@ def _repositioned_sample(tmp, inputs):
     labels_img.SetSpacing(grid_voxel)
     sitk.WriteImage(labels_img, str(d / "flap_labels_in_sample.nii.gz"))
 
+    # A cell table in cell_points.py's own column layout, on a detection grid
+    # FINER than the painted one (as a real one is): columns 0-2 are the
+    # original raw pixel positions, which reposition deliberately leaves alone,
+    # while 3-5 are the resample-space index of where the cell ENDED UP.
+    cells_um = np.array([RAW_UM[0] / 2, RAW_UM[1] / 2, RAW_UM[2] / 2])   # (x, y, z)
+    rows, on_flap_rows = [], []
+    for i, (z, y, x, on_flap) in enumerate([(3, 40, 40, True), (5, 30, 50, True),
+                                            (3, 120, 100, False), (5, 150, 150, False)]):
+        um = np.array([x * RAW_UM[0], y * RAW_UM[1], z * RAW_UM[2]])
+        moved_um = um + [shift_um if on_flap else 0.0, 0.0, 0.0]
+        raw_px = um / cells_um
+        fine = moved_um / grid_um
+        rows.append(list(raw_px) + list(fine) + [0.0, 0.0, 0.0, 315 if on_flap else 1129,
+                                                 "Isocortex" if on_flap else "Interbrain",
+                                                 "", "", 0.9])
+        if on_flap:
+            on_flap_rows.append(i)
+    cells_dir = d / "cell_registration" / "flapclass"
+    cells_dir.mkdir(parents=True, exist_ok=True)
+    with open(cells_dir / "cell_registration.csv", "w") as handle:
+        for row in rows:
+            handle.write(",".join(str(v) for v in row) + "\n")
+
     # The config snapshot run_pipeline.sh leaves in output_dir -- the only
     # thing that says this sample was repositioned at all.
     (d / "pipeline.yaml").write_text(yaml.safe_dump(
         {"sample": {"name": "flap", "raw_tiff": str(inputs.raw),
-                    "voxel_size_um": RAW_UM, "reposition_plan": str(plan_path)}}))
+                    "voxel_size_um": RAW_UM, "reposition_plan": str(plan_path)},
+         "cells": {"cell_centroids_dir": str(d), "voxel_size_um": [float(v) for v in cells_um]}}))
     return SimpleNamespace(dir=d, plan=plan_path, labels=labels, here=here, moves=moves,
-                           frag_raw=frag_raw, grid_voxel=grid_voxel)
+                           frag_raw=frag_raw, grid_voxel=grid_voxel, cells_um=cells_um,
+                           on_flap_rows=on_flap_rows)
 
 
 def _centroid_um(mask, voxel_zyx_um):
@@ -746,20 +771,35 @@ def test_single_sample_fragments_moved_back(tmp, inputs):
         elsewhere = ~on_flap & ~socket
         assert np.array_equal(restored[elsewhere], labels[elsewhere])
 
-        # 6. No plan -> no layer. A sample with no fragments must not grow a
-        #    second atlas volume that is a copy of the first.
-        (sample.dir / "pipeline.yaml").write_text("sample:\n  name: flap\n")
-        assert ss.find_reposition_plan(str(sample.dir)) == (None, None)
-        assert ss.MainController._build_restored_labels(
-            stub, labels, paths["labels"], paths["pipeline"]) is None
-
-        # 7. The default follows which stack is on screen: the plan's own raw
+        # 6. The default follows which stack is on screen: the plan's own raw
         #    tiff (not repositioned) wants this layer, the pipeline's own
         #    resample (already repositioned) does not.
         stub._restored_plan_image = str(inputs.raw)
         assert ss.MainController._restored_layer_default(stub, stub._restored_plan_image)
         ss.CONFIG["native_image_path"] = str(sample.dir / "flap_fine_25um.nii.gz")
         assert not ss.MainController._restored_layer_default(stub, stub._restored_plan_image)
+
+        # 7. The cells on a flap follow it back. Their original positions are
+        #    already in the table (columns 0-2, which reposition leaves alone),
+        #    so this is a unit conversion, not a second reposition -- and the
+        #    cells that never moved must land exactly on the resample-space
+        #    columns the pipeline itself wrote, which is what proves the units.
+        ontology = ss.OntologyManager(str(inputs.ontology))
+        cells = ss.DataLoader.load_cells_from_registration(
+            str(sample.dir / "cell_registration"), ontology, coord_start=3)
+        assert len(cells) == 4, cells
+        assert ss.MainController._add_original_geometry_coords(stub, cells, paths["labels"])
+        drift = np.abs(cells[["z_orig", "y_orig", "x_orig"]].values
+                       - cells[["z", "y", "x"]].values).max(axis=1)
+        stayed = np.ones(len(cells), bool)
+        stayed[sample.on_flap_rows] = False
+        assert (drift[stayed] < 1e-9).all(), \
+            f"cells off a fragment must be where the pipeline put them: {drift[stayed]}"
+        assert (drift[~stayed] > 1).all(), "cells on the fragment have to move"
+        # ...and they land ON the flap, not merely somewhere else.
+        for row in sample.on_flap_rows:
+            z, y, x = (int(round(v)) for v in cells.loc[row, ["z_orig", "y_orig", "x_orig"]])
+            assert here[z, y, x], f"restored cell {row} at {(z, y, x)} is off the flap outline"
 
         # 8. The switch swaps the volume hover/click/search READ, not just what
         #    is drawn -- a visible layer the hover does not read is exactly the
@@ -769,15 +809,21 @@ def test_single_sample_fragments_moved_back(tmp, inputs):
         try:
             viewer.add_labels(labels, name="Atlas Regions")
             viewer.add_labels(restored, name=ss.MainController.RESTORED_LAYER_NAME)
-            viewer.add_points(np.empty((0, 3)), ndim=3, name="pins")
+            cells[["z_moved", "y_moved", "x_moved"]] = cells[["z", "y", "x"]].values
+            points = viewer.add_points(cells[["z", "y", "x"]].values, ndim=3, name="Cell: flap")
+            points.metadata["cell_rows"] = cells.index.values
+            viewer.add_points(np.empty((0, 3)), ndim=3, name="pins")   # stands in for 🚩
             switch = ss.QCheckBox(holder)
             searched = []
             ctl = SimpleNamespace(
                 viewer=viewer, cb_restored=switch, _restored_choice_made=False,
-                current_atlas_labels=None, last_hover_val=7,
+                current_atlas_labels=None, last_hover_val=7, current_cells_df=cells,
+                mode="Native", flagged_cells=[], flag_layer=None,
                 RESTORED_LAYER_NAME=ss.MainController.RESTORED_LAYER_NAME,
+                setup_flag_layer=lambda: None,
                 perform_search=lambda: searched.append(True))
-            ctl._sync_restored_layer = ss.MainController._sync_restored_layer.__get__(ctl)
+            for name in ("_sync_restored_layer", "_apply_cell_geometry", "_reproject_pins"):
+                setattr(ctl, name, getattr(ss.MainController, name).__get__(ctl))
             switch.stateChanged.connect(lambda _s: ctl._sync_restored_layer())   # as setup_ui does
 
             ctl._sync_restored_layer(default_on=True)
@@ -789,23 +835,50 @@ def test_single_sample_fragments_moved_back(tmp, inputs):
             assert ctl.current_atlas_labels is restored
             assert ctl.last_hover_val == -1 and searched, \
                 "swapping the volume must drop the hover cache and redo the highlight"
+            assert np.allclose(points.data, cells[["z_orig", "y_orig", "x_orig"]].values), \
+                "the cell points must follow the atlas, or the mismatch just moves house"
+
+            # A pin follows its own cell: it is stored at the display position
+            # it was made at, and its raw coordinates are what find it again.
+            pinned = cells.iloc[sample.on_flap_rows[0]]
+            ctl.flagged_cells.append({
+                "mode": "Native", "raw_x": pinned["raw_x"], "raw_y": pinned["raw_y"],
+                "raw_z": pinned["raw_z"], "z": pinned["z_moved"], "y": pinned["y_moved"],
+                "x": pinned["x_moved"]})
 
             # The pair stays put and stays together: whichever is showing sits
             # directly on the other, and neither climbs over the layer above
             # them -- 🚩 Flagged Cells is up there, and pins under a
             # half-opaque labels layer are not pins.
-            names = [l.name for l in viewer.layers]
-            assert names[-1] == "pins" and names[-2] == ss.MainController.RESTORED_LAYER_NAME \
-                and names[-3] == "Atlas Regions", names
+            def order():
+                names = [l.name for l in viewer.layers]
+                return names, names.index("Atlas Regions"), \
+                    names.index(ss.MainController.RESTORED_LAYER_NAME)
+
+            names, i_complete, i_restored = order()
+            assert i_restored == i_complete + 1, names
+            assert names[-1] == "pins", names
 
             switch.setChecked(False)
             assert viewer.layers["Atlas Regions"].visible
             assert ctl.current_atlas_labels is labels
-            assert [l.name for l in viewer.layers][-1] == "pins", "the top slot is not ours"
+            assert np.allclose(points.data, cells[["z_moved", "y_moved", "x_moved"]].values)
+            names, i_complete, i_restored = order()
+            assert i_complete == i_restored + 1, names
+            assert names[-1] == "pins", "the top slot is not ours"
+            pin = ctl.flagged_cells[0]
+            assert np.allclose([pin["z"], pin["y"], pin["x"]],
+                               pinned[["z_moved", "y_moved", "x_moved"]].values.astype(float)), \
+                "a pin left behind by the switch no longer marks the cell it was put on"
+            switch.setChecked(True)
+            assert np.allclose([ctl.flagged_cells[0][k] for k in "zyx"],
+                               pinned[["z_orig", "y_orig", "x_orig"]].values.astype(float))
 
-            # A later view reload must not overwrite what the user just chose.
-            ctl._sync_restored_layer(default_on=True)
-            assert not switch.isChecked(), "the default must only be applied once"
+            # A later view reload must not overwrite what the user just chose,
+            # whichever way round that choice went.
+            chosen = switch.isChecked()
+            ctl._sync_restored_layer(default_on=not chosen)
+            assert switch.isChecked() == chosen, "the default must only be applied once"
 
             # Atlas Space View has no such volume: the switch goes away rather
             # than sitting there doing nothing.
@@ -815,6 +888,14 @@ def test_single_sample_fragments_moved_back(tmp, inputs):
         finally:
             viewer.close()
             holder.deleteLater()
+
+        # 9. No plan -> no layer. A sample with no fragments must not grow a
+        #    second atlas volume that is a copy of the first. Last, because it
+        #    rewrites the snapshot the rest of the test reads.
+        (sample.dir / "pipeline.yaml").write_text("sample:\n  name: flap\n")
+        assert ss.find_reposition_plan(str(sample.dir)) == (None, None)
+        assert ss.MainController._build_restored_labels(
+            stub, labels, paths["labels"], paths["pipeline"]) is None
     finally:
         ss.CONFIG.clear()
         ss.CONFIG.update(saved)

@@ -388,6 +388,26 @@ class DataLoader:
             return None
 
     @staticmethod
+    def volume_origin(path):
+        """只读 header 拿到 (z, y, x) 原点（µm），拿不到就返回 None。
+
+        和 volume_spacing 成一对：把物理微米换成这张网格的下标要
+        (point − origin) / spacing 两个量，正是 cell_points._physical_to_index
+        用的式子。本流程产出的图基本都是 origin 0，但裁过的那些不是，写死 0
+        会让细胞点整体偏掉裁掉的那一截。
+        """
+        if not path or not os.path.exists(path): return None
+        if path.lower().endswith(('.tif', '.tiff')): return None
+        try:
+            reader = sitk.ImageFileReader()
+            reader.SetFileName(path)
+            reader.ReadImageInformation()
+            return tuple(float(v) for v in reversed(reader.GetOrigin()))
+        except Exception as e:
+            print(f"⚠️ Could not read the origin ({type(e).__name__}: {e}): {path}")
+            return None
+
+    @staticmethod
     def estimate_contrast(arr, percentiles=(0.5, 95.5), max_planes=64, max_pixels=4_000_000):
         """抽样估计显示用的对比度，返回 (contrast_limits, 采样到的 (min, max))。
 
@@ -638,18 +658,32 @@ def _read_yaml(path):
         return None
 
 
+def find_pipeline_config(sample_dir):
+    """跑出这个样本的那份 pipeline 配置，返回 (dict, 来源说明) 或 (None, None)。
+
+    默认就在样本目录里找：run_pipeline 会把跑这一次用的 config 原样拷进
+    output_dir（pipeline.py 的 shutil.copy2），所以样本目录自己就记着它是怎么跑
+    出来的，不用在本工具的配置里再维护一份路径。快照出现之前跑的老结果没有这个
+    文件，那时在配置里写 registration_config 指过去。
+    """
+    if CONFIG.get('registration_config'):
+        candidates = [(CONFIG['registration_config'], "the config's registration_config")]
+    else:
+        candidates = [(path, f"the pipeline config snapshot {os.path.basename(path)}")
+                      for path in sorted(glob.glob(os.path.join(sample_dir, '*.yaml'))
+                                         + glob.glob(os.path.join(sample_dir, '*.yml')))]
+    for path, source in candidates:
+        cfg = _read_yaml(path)
+        if isinstance((cfg or {}).get('sample'), dict):
+            return cfg, source
+    return None, None
+
+
 def find_reposition_plan(sample_dir):
     """这个样本的 reposition plan 路径，没有就返回 None。返回 (path, 来源说明)。
 
-    优先级：配置里写死的 reposition_plan > 配置里指的 registration_config >
-    样本目录里那份 pipeline 配置快照。
-
-    最后这条是默认路径，也是最不会过期的一条：run_pipeline 会把跑这一次用的
-    config 原样拷进 output_dir（pipeline.py 的 shutil.copy2），所以样本目录自己
-    就记着它是怎么跑出来的，不用在本工具的配置里再维护一份路径。快照出现之前跑
-    的老结果没有这个文件，那时在配置里写 registration_config 指过去。
-
-    reposition_plan 显式写成空（`reposition_plan: ""`）= 明确不要这一层。
+    优先级：配置里写死的 reposition_plan > pipeline 配置里的
+    sample.reposition_plan。显式写成空（`reposition_plan: ""`）= 明确不要这一层。
     """
     explicit = CONFIG.get('reposition_plan')
     if explicit is not None:
@@ -657,23 +691,10 @@ def find_reposition_plan(sample_dir):
             return None, None
         return explicit, "the config's reposition_plan"
 
-    candidates = []
-    reg_cfg = CONFIG.get('registration_config')
-    if reg_cfg:
-        candidates.append((reg_cfg, "the config's registration_config"))
-    else:
-        for path in sorted(glob.glob(os.path.join(sample_dir, '*.yaml'))
-                           + glob.glob(os.path.join(sample_dir, '*.yml'))):
-            candidates.append((path, f"the pipeline config snapshot {os.path.basename(path)}"))
-
-    for path, source in candidates:
-        cfg = _read_yaml(path)
-        sample = (cfg or {}).get('sample')
-        if not isinstance(sample, dict):
-            continue
-        plan = sample.get('reposition_plan')
-        if plan:
-            return os.path.expanduser(os.path.expandvars(str(plan))), source
+    cfg, source = find_pipeline_config(sample_dir)
+    plan = ((cfg or {}).get('sample') or {}).get('reposition_plan')
+    if plan:
+        return os.path.expanduser(os.path.expandvars(str(plan))), source
     return None, None
 
 
@@ -828,6 +849,10 @@ class MainController:
                     'RawY': sub_df['raw_y'].values,
                     'RawZ': sub_df['raw_z'].values,
                 })
+                # 这个图层画的是 current_cells_df 里的哪几行 —— 换坐标系时直接
+                # 按行号取新坐标，不用把背景细胞过滤那一套再推一遍（见
+                # _apply_cell_geometry）。
+                layer.metadata['cell_rows'] = sub_df.index.values
                 layer.events.highlight.connect(self.on_cell_layer_click)
 
     def perform_search(self, search_mode=None):
@@ -1083,6 +1108,61 @@ class MainController:
                     f"sample's label volume is {grid_shape} at {grid_voxel_um} um/voxel "
                     f"and spans {grid_extent:.0f} um -- these are not the same sample")
 
+    def _add_original_geometry_coords(self, df_cells, labels_path):
+        """给细胞表补一套"原图几何"的坐标（z_orig/y_orig/x_orig），补不上返回 False。
+
+        不用把 reposition 再跑一遍：细胞在【没合拢】的原图上的位置本来就存在
+        cell_registration.csv 的第 1-3 列里，cell_points.py 特意不动它们（"that
+        is where the cell really is in the data on disk, and the only way back
+        to it"）。剩下的只是换算到标签图那张网格上，用的是 cell_points 算第
+        4-6 列时的同一个式子：
+
+            fine_index = (raw_index × cells_voxel_um − origin) ÷ spacing
+
+        —— 区别只在于喂进去的是没被碎片搬动过的那一份坐标。
+
+        所以没坐在碎片上的细胞，两套坐标必须逐位相同；下面就拿这一点当自检，
+        对不上就说明 cells_voxel_size_um 取错了，宁可不换也不画一堆错位的点。
+        """
+        cells_um = CONFIG.get('cells_voxel_size_um')
+        source = "the config's cells_voxel_size_um"
+        if not cells_um:
+            cfg, cfg_source = find_pipeline_config(self.target_dir)
+            cells_um = ((cfg or {}).get('cells') or {}).get('voxel_size_um')
+            source = f"cells.voxel_size_um from {cfg_source}"
+        if not cells_um:
+            print("⚠️ The cell centroids' own voxel size is not known (no cells.voxel_size_um "
+                  "in the pipeline\n   config, no cells_voxel_size_um here), so the cell "
+                  "points cannot be put back on the\n   original geometry -- they stay in "
+                  "the registered one while the atlas layer switches.")
+            return False
+
+        spacing, origin = (DataLoader.volume_spacing(labels_path),
+                           DataLoader.volume_origin(labels_path))
+        if spacing is None or origin is None:
+            return False
+        cells_um = np.asarray([float(v) for v in cells_um])          # (x, y, z)
+        sp = np.asarray(spacing)[::-1]                               # (z,y,x) -> (x,y,z)
+        org = np.asarray(origin)[::-1]
+        raw = df_cells[['raw_x', 'raw_y', 'raw_z']].values.astype(float)
+        idx = (raw * cells_um - org) / sp                            # (x, y, z)
+        df_cells[['z_orig', 'y_orig', 'x_orig']] = idx[:, [2, 1, 0]]
+
+        drift = np.abs(idx[:, [2, 1, 0]] - df_cells[['z', 'y', 'x']].values).max(axis=1)
+        stayed = drift <= 0.5
+        if stayed.mean() < 0.2 or (stayed.any() and drift[stayed].max() > 1e-3):
+            print(f"⚠️ {source} = {list(cells_um)} does not reproduce the cell table's own "
+                  f"resample-space\n   columns for the cells that never moved "
+                  f"({100 * stayed.mean():.0f}% within half a voxel, worst "
+                  f"{drift[stayed].max() if stayed.any() else float('nan'):.3g}). That voxel "
+                  f"size is wrong for this\n   sample, so the cell points are left in the "
+                  f"registered geometry.")
+            df_cells.drop(columns=['z_orig', 'y_orig', 'x_orig'], inplace=True)
+            return False
+        print(f"   ↳ cell points: {int((~stayed).sum())} of {len(df_cells)} sit on a fragment "
+              f"and follow it back ({source})")
+        return True
+
     RESTORED_LAYER_NAME = "Atlas Regions (fragments moved back)"
 
     def _restored_layer_default(self, plan_image_path):
@@ -1157,6 +1237,10 @@ class MainController:
         # 图都还是文件里的原始轴序，转起来两卷用的是同一个 k。
         restored = (self._build_restored_labels(mhd, mhd_path, paths['pipeline'])
                     if mhd is not None else None)
+        # 图谱搬得回去，细胞点就也得搬得回去，否则只是把错位从一边挪到另一边。
+        # 补不上第二套坐标时图谱那一层照样给（它本身是对的），只是点不跟着换。
+        if restored is not None and not df_cells.empty:
+            self._add_original_geometry_coords(df_cells, mhd_path)
 
         scale = None
         if img is not None:
@@ -1179,6 +1263,10 @@ class MainController:
             if not df_cells.empty and grid_shape is not None:
                 df_cells[['z', 'y', 'x']] = DataLoader.rotate_pts(
                     df_cells[['z', 'y', 'x']].values, k, grid_shape)
+                # 第二套坐标跟着转同一个 k —— 漏掉它的话，一按开关点就整体转错。
+                if 'z_orig' in df_cells.columns:
+                    df_cells[['z_orig', 'y_orig', 'x_orig']] = DataLoader.rotate_pts(
+                        df_cells[['z_orig', 'y_orig', 'x_orig']].values, k, grid_shape)
             if grid_shape is not None and k % 2:
                 grid_shape = (grid_shape[0], grid_shape[2], grid_shape[1])
 
@@ -1227,6 +1315,10 @@ class MainController:
                   "   ClearMap writes this file from cellMap.py's transform_annotation_volume(); "
                   "re-run that to get it back.")
             self.setup_highlight_layers(None)
+
+        # 旋转之后再拍下"合拢几何"这一套，两套坐标才在同一个 k 下。
+        if 'z_orig' in df_cells.columns:
+            df_cells[['z_moved', 'y_moved', 'x_moved']] = df_cells[['z', 'y', 'x']].values
 
         self.current_cells_df = df_cells
         self.update_class_filter_ui(df_cells)
@@ -1344,7 +1436,54 @@ class MainController:
 
         self.current_atlas_labels = self.viewer.layers[active].data
         self.last_hover_val = -1          # 换了卷，上一次的取值不能再拿来去重
+        # 细胞点跟着一起走：图谱搬回原位而点还留在合拢后的位置，等于把"碎片上的
+        # 细胞去哪了"这个问题从图谱身上挪到了点身上，一点没解决。
+        self._apply_cell_geometry(original=self.cb_restored.isChecked())
         self.perform_search()             # 高亮是从 current_atlas_labels 算的，得重算
+
+    def _apply_cell_geometry(self, original):
+        """把细胞点摆进两套坐标里的一套：原图几何 / 配准时的合拢几何。
+
+        直接改已有图层的 data，而不是整个重画一遍：一个样本十几个 class、二十万
+        个点，重画会把颜色、features（钉细胞要用的 tile/slice 出处）和图层顺序全
+        重建一次，而这里要换的只有坐标。每个图层建出来时记下了自己那批点在
+        current_cells_df 里的行号（render_cells_from_df 里的 cell_rows），所以换
+        的是哪几行不用重新推一遍背景细胞过滤的逻辑。
+        """
+        df = self.current_cells_df
+        if df.empty or 'z_orig' not in df.columns:
+            return
+        src = ['z_orig', 'y_orig', 'x_orig'] if original else ['z_moved', 'y_moved', 'x_moved']
+        df[['z', 'y', 'x']] = df[src].values
+        for layer in self.viewer.layers:
+            rows = layer.metadata.get('cell_rows')
+            if rows is None:
+                continue
+            layer.data = df.loc[rows, ['z', 'y', 'x']].values
+        self._reproject_pins()
+
+    def _reproject_pins(self):
+        """钉住的细胞跟着它自己那颗点走。
+
+        flagged_cells 存的 z/y/x 是钉下去那一刻的显示坐标，几何一换就指不到那颗
+        细胞了 —— 而每条记录都带着原始像素坐标（raw_x/y/z，导出时回溯 tile 用的
+        就是它），拿它去当前的细胞表里查一次就能重新落位。查不到的（细胞表换了、
+        或那颗点被背景过滤掉了）保持原样，不去猜。
+        """
+        df = self.current_cells_df
+        matches = [f for f in self.flagged_cells if f['mode'] == self.mode]
+        if df.empty or not matches or 'z_orig' not in df.columns:
+            return
+        lookup = df.set_index(['raw_x', 'raw_y', 'raw_z'])[['z', 'y', 'x']]
+        lookup = lookup[~lookup.index.duplicated()]
+        for entry in matches:
+            try:
+                row = lookup.loc[(entry['raw_x'], entry['raw_y'], entry['raw_z'])]
+            except KeyError:
+                continue
+            entry['z'], entry['y'], entry['x'] = (float(row['z']), float(row['y']),
+                                                  float(row['x']))
+        self.setup_flag_layer()
 
     def _apply_grid_layout(self, atlas_layer_name):
         # 图谱图层移到最顶层：叠加模式下轮廓要压在原图上面才看得见。
