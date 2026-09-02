@@ -1240,6 +1240,90 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
 
 
 
+def test_export_is_what_the_pipeline_reads(tmp, inputs):
+    print("23. paint_mask -> Registration_ants: the exported plan loads and applies...")
+    import numpy as np
+    import paint_mask as pm
+    from shared import atlas_reference
+    from registration_ants import pipeline, reposition as rp
+
+    out = tmp / "e2e.nii.gz"
+    viewer = _open_guide(pm, tmp, inputs, atlas_reference, out.name, voxel_size_um=RAW_UM)
+    try:
+        tools, boxes = _reposition_section(pm, viewer)
+        frag = viewer.layers[pm._REPOSITION_FRAGMENTS_LAYER]
+        ghost = viewer.layers[pm._REPOSITION_GHOST_LAYER]
+        data = frag.data.copy()
+        data[2, 20:60, 20:80] = 1
+        data[5, 20:60, 20:80] = 1
+        data[3, 100:130, 120:170] = 3      # grabbed, never posed: legal, and must not move
+        frag.data = data
+
+        shift_voxels = 25.0
+        viewer.dims.set_current_step(0, 2)
+        _button(tools, "Copy this outline").click()
+        dragged = np.asarray(ghost.data[-1], dtype=float)
+        dragged[:, 2] += shift_voxels
+        ghost.data = list(ghost.data[:-1]) + [dragged]
+        viewer.dims.set_current_step(0, 5)
+        _button(tools, "Copy this outline").click()
+        _pin_pose(tools)                    # plane 5 pinned unmoved, so the move ramps out
+
+        paint = viewer.layers["guide outline (paint here)"]
+        paint.data[2, 40:120, 40:120] = 1
+        paint.data[6, 60:140, 60:140] = 1
+        paint.refresh()
+        _button(tools, "Export Outline").click()
+    finally:
+        viewer.close()
+
+    plan_path = f"{pm._output_stem(str(out))}.reposition.json"
+    written = rp.read_plan(plan_path)
+    assert not any(set(k) - set(rp.KEYFRAME_FIELDS)
+                   for f in written["fragments"] for k in f["keyframes"]), \
+        "a keyframe carries keys the plan format does not define"
+
+    # The pipeline's OWN loader, not a copy of its checks: it re-reads the
+    # fragments file the plan names, densifies it, and refuses a grid or a
+    # voxel size that does not match the sample it is being applied to.
+    plan, fragments = pipeline._load_reposition(
+        {"reposition_plan": plan_path, "voxel_size_um": RAW_UM})
+    assert sorted(int(v) for v in np.unique(fragments) if v) == [1, 3], np.unique(fragments)
+    labels = {int(f["label"]): len(f["keyframes"]) for f in plan["fragments"]}
+    assert labels == {1: 2, 3: 0}, labels
+
+    # ...and the three things it applies the plan to, which have to agree.
+    import ants
+    raw = np.zeros(tuple(plan["image_shape_zyx"]), dtype=np.float32)
+    raw[fragments == 1] = 1000.0
+    raw[fragments == 3] = 500.0
+    img = ants.from_numpy(np.transpose(raw, (2, 1, 0)))
+    moved = pipeline._reposition_volume(img, plan, fragments, "image", "the raw stack")
+    assert moved.shape == img.shape, moved.shape
+    out_zyx = np.transpose(moved.numpy(), (2, 1, 0))
+    assert (out_zyx != raw).any(), "the plan moved nothing at all"
+    # Fragment 1 was posed on 2 and 5, so it also moves on the planes between:
+    # _load_reposition densifies the sparse outline before applying it.
+    assert (out_zyx[3][fragments[3] == 1] != 1000.0).any(), \
+        "the planes between two keyframes were not filled in"
+    # Fragment 3 has no keyframes at all, which means "does not move": its
+    # voxels must come back bit-identical, not blurred by an identity warp.
+    assert (out_zyx[fragments == 3] == 500.0).all(), \
+        "the fragment that was only grabbed, never posed, was moved anyway"
+
+    # A cell sitting on the fragment moves by the drag, in microns, across the
+    # 4x finer grid cells are detected on. This is the one that silently
+    # corrupts counts if the two conventions ever drift apart.
+    cells_um = (0.65, 0.65, 8.0)
+    cx, cy, cz = np.array([150.0, 20.0]), np.array([150.0, 20.0]), np.array([8.0, 8.0])
+    new_cx, _, _, which = rp.apply_to_cells(cx, cy, cz, fragments, plan, cells_um)
+    assert list(which) == [1, 0], f"which cell moved: {list(which)}"
+    assert abs((new_cx[0] - cx[0]) * cells_um[0] - shift_voxels * RAW_UM[0]) < 0.5, \
+        f"the cell moved {(new_cx[0] - cx[0]) * cells_um[0]:.1f} um, the outline "\
+        f"{shift_voxels * RAW_UM[0]:.1f} um"
+    print("   OK")
+
+
 def test_old_plans_drop_their_line_pairs(tmp, inputs):
     print("22. paint_mask: a plan written when lines existed loads and re-exports without them...")
     import numpy as np
@@ -1653,6 +1737,7 @@ def main():
         test_reposition_names_follow_their_fragment(tmp, inputs)
         test_reposition_drag_the_outline(tmp, inputs)
         test_old_plans_drop_their_line_pairs(tmp, inputs)
+        test_export_is_what_the_pipeline_reads(tmp, inputs)
         test_panels_are_tabbed_and_short(tmp, inputs)
     print("\nALL GUI SMOKE TESTS PASSED")
     return 0
