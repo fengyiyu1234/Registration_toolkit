@@ -1008,6 +1008,17 @@ class MainController:
             return None          # reposition 是 ANTs 流程独有的，ClearMap 没有
         plan_path, source = find_reposition_plan(self.target_dir)
         if not plan_path:
+            # 说一句而不是静默：碎片图层不出现有两种原因（这个样本本来就没裂过 /
+            # 跑的那次配置没被拷进来），沉默的话两者长得一模一样，只能去翻代码。
+            print("🧩 No reposition plan for this sample, so there is no \"fragments moved "
+                  "back\" layer.\n"
+                  f"   ↳ looked in {self.target_dir} for the pipeline config snapshot "
+                  "run_pipeline.sh leaves\n"
+                  "     there, for a sample.reposition_plan in it. Runs from before that "
+                  "snapshot existed have\n"
+                  "     none -- point registration_config at the pipeline yaml (or "
+                  "reposition_plan at the json)\n"
+                  "     in the config if this sample really was repositioned.")
             return None
         if not os.path.exists(plan_path):
             print(f"⚠️ {source} points at a reposition plan that does not exist: {plan_path}")
