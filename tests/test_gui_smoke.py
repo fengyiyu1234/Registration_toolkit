@@ -614,6 +614,213 @@ def test_single_sample_fill_switch():
     print("   OK")
 
 
+def _repositioned_sample(tmp, inputs):
+    """A sample directory that looks like a run WITH a reposition plan.
+
+    The geometry is the real one in miniature: a flap grabbed on the raw stack
+    (2.6/2.6/32 um) and swung 250 um along x, and the label volume the
+    registration would have produced on the 25 um isotropic grid -- carrying
+    the flap's regions where the flap ENDS UP, which is exactly what leaves
+    them reading as background over the flap's real position in the raw stack.
+
+    The label volume is built by moving the outline FORWARD with the pipeline's
+    own `apply_to_labels`, so the fixture states the thing being undone rather
+    than a hand-typed guess at where it lands.
+    """
+    import SimpleITK as sitk
+    import yaml
+    from registration_ants import reposition as rp
+    import single_sample as ss
+
+    d = tmp / "repos_sample"
+    d.mkdir(exist_ok=True)
+
+    # The flap outline, SPARSE (only the grabbed planes carry voxels), on the
+    # raw grid -- exactly what paint_mask's Reposition panel exports.
+    frag_raw = np.zeros(RAW_SHAPE, dtype=np.uint8)
+    frag_raw[2, 20:70, 20:60] = 1
+    frag_raw[6, 20:70, 20:60] = 1
+    frag_path = d / "flap_fragments.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(frag_raw), str(frag_path))
+
+    # Far enough that the flap's two positions do not overlap: an overlapping
+    # pair is the harder case but a much weaker fixture, since a restore that
+    # did nothing at all would still look half right.
+    shift_um = 250.0
+    plan = rp.make_plan(RAW_SHAPE, RAW_UM,
+                        [rp.make_fragment(1, [rp.make_keyframe(2, tx_um=shift_um),
+                                              rp.make_keyframe(6, tx_um=shift_um)], "flap")],
+                        image_path=str(inputs.raw), labels_path=str(frag_path))
+    plan_path = d / "flap.reposition.json"
+    rp.write_plan(plan_path, plan)
+
+    # The 25 um isotropic grid the pipeline resamples that raw stack onto:
+    # round(size * spacing / target) per axis, the arithmetic
+    # ants.resample_image does.
+    grid_um = 25.0
+    grid_voxel = (grid_um,) * 3
+    shape = tuple(int(round(n * um / grid_um))
+                  for n, um in zip(RAW_SHAPE, (RAW_UM[2], RAW_UM[1], RAW_UM[0])))
+
+    plan_here = rp.rescale_plan(plan, grid_voxel, image_shape_zyx=shape)
+    here = ss.fragments_on_grid(frag_path, plan, shape, grid_voxel) == 1
+    moved = rp.apply_to_labels(here.astype(np.uint8), plan_here) == 1
+    # The planes the plan actually moves. Rounding the keyframe planes onto a
+    # grid with a different z spacing can leave the outline reaching one plane
+    # past the transform's span, and that plane stays put -- "outside the
+    # keyframe span, identity", the same rule as on the grid it was drawn on.
+    moves = np.zeros(shape[0], dtype=bool)
+    moves[rp.fragment_source_planes(plan_here["fragments"][0], shape[0])] = True
+    labels = np.zeros(shape, dtype=np.uint32)
+    labels[:, 15:, :] = 1129                       # tissue that never moves
+    labels[moved] = 315                            # the flap's regions, where it ended up
+    labels_img = sitk.GetImageFromArray(labels)
+    labels_img.SetSpacing(grid_voxel)
+    sitk.WriteImage(labels_img, str(d / "flap_labels_in_sample.nii.gz"))
+
+    # The config snapshot run_pipeline.sh leaves in output_dir -- the only
+    # thing that says this sample was repositioned at all.
+    (d / "pipeline.yaml").write_text(yaml.safe_dump(
+        {"sample": {"name": "flap", "raw_tiff": str(inputs.raw),
+                    "voxel_size_um": RAW_UM, "reposition_plan": str(plan_path)}}))
+    return SimpleNamespace(dir=d, plan=plan_path, labels=labels, here=here, moves=moves,
+                           frag_raw=frag_raw, grid_voxel=grid_voxel)
+
+
+def _centroid_um(mask, voxel_zyx_um):
+    return np.array(np.nonzero(mask), dtype=float).mean(axis=1) * np.asarray(voxel_zyx_um)
+
+
+def test_single_sample_fragments_moved_back(tmp, inputs):
+    print("24. single_sample: a repositioned sample gets its atlas back on the raw geometry...")
+    import napari
+    from registration_ants import reposition as rp
+    import single_sample as ss
+
+    sample = _repositioned_sample(tmp, inputs)
+    labels, here = sample.labels, sample.here
+    on_flap = here & sample.moves[:, None, None]      # where the plan has something to say
+    saved = dict(ss.CONFIG)
+    ss.CONFIG.clear()
+    ss.CONFIG.update({"sample_dir": str(sample.dir), "native_image_path": str(inputs.raw)})
+    try:
+        # 1. The plan is found through the run's own config snapshot -- nothing
+        #    in this tool's config had to name it.
+        plan_path, source = ss.find_reposition_plan(str(sample.dir))
+        assert plan_path == str(sample.plan), (plan_path, source)
+        assert "pipeline.yaml" in source, source
+
+        # 2. The outline crosses grids without drifting. Centroids rather than
+        #    bounding boxes: nearest-neighbour resampling grows an edge by up to
+        #    half a source voxel, and a 32 um source voxel against a 25 um
+        #    target one makes that the larger number of the two.
+        raw_dense = rp.densify_fragments(sample.frag_raw) == 1
+        drift = np.abs(_centroid_um(here, sample.grid_voxel)
+                       - _centroid_um(raw_dense, (RAW_UM[2], RAW_UM[1], RAW_UM[0])))
+        assert here.any() and (drift <= sample.grid_voxel).all(), \
+            f"the flap outline moved by {drift} um on the way to the label grid"
+
+        paths = ss.DataLoader.resolve_native_paths(str(sample.dir))
+        stub = SimpleNamespace(target_dir=str(sample.dir), _restored_plan_image=None,
+                               _check_plan_grid=ss.MainController._check_plan_grid)
+        restored = ss.MainController._build_restored_labels(
+            stub, labels, paths["labels"], paths["pipeline"])
+        assert restored is not None, "a sample with a plan must get the extra volume"
+
+        # 3. The flap's regions come back onto the flap's REAL position, which
+        #    is where the complete atlas has nothing at all -- that gap reading
+        #    as "background" is the whole reason this layer exists.
+        assert on_flap.any() and (labels[on_flap] == 0).all(), \
+            "the fixture is wrong: the complete atlas must NOT already cover the flap"
+        assert (restored[on_flap] == 315).mean() > 0.9, \
+            "the flap's regions did not come back onto the flap"
+
+        # 4. ...and the socket it was folded into is emptied, not left holding a
+        #    second copy of the same tissue.
+        socket = (labels == 315) & sample.moves[:, None, None] & ~here
+        assert socket.any() and (restored[socket] == 0).all(), \
+            "the position the flap was moved to must be cleared"
+
+        # 5. Everything off the flap is bit-identical: this is a display of the
+        #    same registration, not a different one.
+        elsewhere = ~on_flap & ~socket
+        assert np.array_equal(restored[elsewhere], labels[elsewhere])
+
+        # 6. No plan -> no layer. A sample with no fragments must not grow a
+        #    second atlas volume that is a copy of the first.
+        (sample.dir / "pipeline.yaml").write_text("sample:\n  name: flap\n")
+        assert ss.find_reposition_plan(str(sample.dir)) == (None, None)
+        assert ss.MainController._build_restored_labels(
+            stub, labels, paths["labels"], paths["pipeline"]) is None
+
+        # 7. The default follows which stack is on screen: the plan's own raw
+        #    tiff (not repositioned) wants this layer, the pipeline's own
+        #    resample (already repositioned) does not.
+        stub._restored_plan_image = str(inputs.raw)
+        assert ss.MainController._restored_layer_default(stub, stub._restored_plan_image)
+        ss.CONFIG["native_image_path"] = str(sample.dir / "flap_fine_25um.nii.gz")
+        assert not ss.MainController._restored_layer_default(stub, stub._restored_plan_image)
+
+        # 8. The switch swaps the volume hover/click/search READ, not just what
+        #    is drawn -- a visible layer the hover does not read is exactly the
+        #    "shows a region, says background" confusion this replaces.
+        viewer = napari.Viewer(show=False)
+        holder = ss.QWidget()
+        try:
+            viewer.add_labels(labels, name="Atlas Regions")
+            viewer.add_labels(restored, name=ss.MainController.RESTORED_LAYER_NAME)
+            viewer.add_points(np.empty((0, 3)), ndim=3, name="pins")
+            switch = ss.QCheckBox(holder)
+            searched = []
+            ctl = SimpleNamespace(
+                viewer=viewer, cb_restored=switch, _restored_choice_made=False,
+                current_atlas_labels=None, last_hover_val=7,
+                RESTORED_LAYER_NAME=ss.MainController.RESTORED_LAYER_NAME,
+                perform_search=lambda: searched.append(True))
+            ctl._sync_restored_layer = ss.MainController._sync_restored_layer.__get__(ctl)
+            switch.stateChanged.connect(lambda _s: ctl._sync_restored_layer())   # as setup_ui does
+
+            ctl._sync_restored_layer(default_on=True)
+            assert not switch.isHidden(), "a sample WITH fragments must show the switch"
+            assert switch.isChecked(), "default_on must be applied the first time"
+            assert viewer.layers[ss.MainController.RESTORED_LAYER_NAME].visible
+            assert not viewer.layers["Atlas Regions"].visible, \
+                "both at once draws the same atlas twice, once in each place"
+            assert ctl.current_atlas_labels is restored
+            assert ctl.last_hover_val == -1 and searched, \
+                "swapping the volume must drop the hover cache and redo the highlight"
+
+            # The pair stays put and stays together: whichever is showing sits
+            # directly on the other, and neither climbs over the layer above
+            # them -- 🚩 Flagged Cells is up there, and pins under a
+            # half-opaque labels layer are not pins.
+            names = [l.name for l in viewer.layers]
+            assert names[-1] == "pins" and names[-2] == ss.MainController.RESTORED_LAYER_NAME \
+                and names[-3] == "Atlas Regions", names
+
+            switch.setChecked(False)
+            assert viewer.layers["Atlas Regions"].visible
+            assert ctl.current_atlas_labels is labels
+            assert [l.name for l in viewer.layers][-1] == "pins", "the top slot is not ours"
+
+            # A later view reload must not overwrite what the user just chose.
+            ctl._sync_restored_layer(default_on=True)
+            assert not switch.isChecked(), "the default must only be applied once"
+
+            # Atlas Space View has no such volume: the switch goes away rather
+            # than sitting there doing nothing.
+            viewer.layers.remove(ss.MainController.RESTORED_LAYER_NAME)
+            ctl._sync_restored_layer()
+            assert switch.isHidden()
+        finally:
+            viewer.close()
+            holder.deleteLater()
+    finally:
+        ss.CONFIG.clear()
+        ss.CONFIG.update(saved)
+    print("   OK")
+
+
 # =====================================================================================
 # panel widths
 # =====================================================================================
@@ -1724,6 +1931,7 @@ def main():
         test_labels_mode_resume(tmp, inputs)
         test_labels_mode_resume_from(tmp, inputs)
         test_single_sample_fill_switch()
+        test_single_sample_fragments_moved_back(tmp, inputs)
         test_panels_are_resizable(tmp, inputs)
         test_assignment_panel_drops_one_region(tmp, inputs)
         test_reposition_panel(tmp, inputs)

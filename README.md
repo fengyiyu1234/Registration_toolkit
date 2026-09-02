@@ -142,6 +142,25 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
   disabling the view: with no sample-space label volume there is no region
   outline and no hover lookup, but the cell points, the region search and the
   per-region filter all still work, since those come from the CSV.
+
+  A sample that was **repositioned** (the pipeline config carried a
+  `sample.reposition_plan`) gets one extra layer, `Atlas Regions (fragments
+  moved back)`. Registration ran on a stack whose flaps had been swung shut, so
+  its label volume describes the closed brain: laid over the raw stack the
+  atlas is one complete piece and the flaps sit outside it, unlabelled, and
+  hover answers "background" over exactly the tissue whose cells *did* get
+  regions. The extra layer reads the same result back on the geometry the raw
+  stack actually has — each flap's regions where the flap really is, the socket
+  it was folded into left empty — and the `Fragments moved back` switch in the
+  control panel decides which of the two is showing and which one hover, click
+  and the region search read. It defaults on when the image on screen is the
+  plan's own raw tiff and off when it is the pipeline's (already repositioned)
+  resample. The plan is found through the config snapshot `run_pipeline.sh`
+  leaves in the output directory, so nothing has to name it twice; a sample
+  with no fragments gets no second layer. Note that the cell points stay in the
+  registered (closed) geometry — that is where their `cell_registration.csv`
+  coordinates are — so this layer answers "which region is this bit of flap",
+  not "which cells are on it".
 - **`registration_eval.py`** — Dice/HD95, landmark TRE, Jacobian and
   inverse-consistency metrics across samples and groups.
   `python registration_eval.py configs/eval_config.yaml`.

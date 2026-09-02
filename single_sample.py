@@ -10,6 +10,7 @@ import glob
 import json
 import re
 import html
+import yaml
 
 
 from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame,
@@ -20,6 +21,26 @@ from PyQt5.QtCore import Qt
 from shared import atlas_reference   # check_label_dtype (lossy label dtypes)
 from shared import local_config      # configs/<tool>.yaml
 from shared import ontology_tree_ui  # shrinkable / set_dock_width
+
+# Reposition 的数据模型住在 Registration_ants（pipeline 也用同一套），这里惰性
+# 绑定：没装那个 editable install 的机器照样能开这个 viewer，只是少一个图层。
+reposition = None
+
+
+def _import_reposition():
+    """绑上 registration_ants.reposition，装不上就返回 False。"""
+    global reposition
+    if reposition is None:
+        try:
+            from registration_ants import reposition as _reposition
+        except ImportError as e:
+            print(f"⚠️ registration_ants is not importable ({e}), so the "
+                  f"\"fragments moved back\" layer is unavailable. It lives in "
+                  f"../Registration_ants; install it with `pip install -e .` there.")
+            return False
+        reposition = _reposition
+    return True
+
 
 # ================= ⚙️ 用户配置区域 =================
 #
@@ -348,6 +369,25 @@ class DataLoader:
             return None
 
     @staticmethod
+    def volume_spacing(path):
+        """只读 header 拿到 (z, y, x) 体素尺寸（µm），拿不到就返回 None。
+
+        reposition plan 里的位移全是【物理微米】，套到哪张网格上都要先知道那张网格
+        一个体素多大。nii/mhd 的 header 里就记着（ITK 的 GetSpacing() 同样是
+        (x,y,z)，反过来才是 numpy 轴序）；tiff 没有可靠的体素尺寸，所以这里不猜。
+        """
+        if not path or not os.path.exists(path): return None
+        if path.lower().endswith(('.tif', '.tiff')): return None
+        try:
+            reader = sitk.ImageFileReader()
+            reader.SetFileName(path)
+            reader.ReadImageInformation()
+            return tuple(float(v) for v in reversed(reader.GetSpacing()))
+        except Exception as e:
+            print(f"⚠️ Could not read the voxel size ({type(e).__name__}: {e}): {path}")
+            return None
+
+    @staticmethod
     def estimate_contrast(arr, percentiles=(0.5, 95.5), max_planes=64, max_pixels=4_000_000):
         """抽样估计显示用的对比度，返回 (contrast_limits, 采样到的 (min, max))。
 
@@ -571,6 +611,112 @@ class DataLoader:
         return df
 
 
+# ================= 🧩 2.5 碎片复位（reposition）=================
+#
+# 有 sample.reposition_plan 的样本，配准跑的是"把裂开的组织瓣合拢之后"的那一版
+# 几何：Registration_ants 的 pipeline 在重采样之前就按 plan 把碎片挪回了原位
+# （pipeline._load_reposition / _reposition_volume），所以 *_fine_*um.nii.gz、
+# *_labels_in_sample.nii.gz、细胞表第 4-6 列全都在【合拢后】的坐标系里。
+#
+# 而 native_image_path 指向的原始 tiff 是【没合拢】的那一份 —— 碎片还甩在外面。
+# 两者叠在一起看时，图谱是一整块完整的脑，碎片所在的位置底下什么标签都没有，
+# hover 一律回答 background，尽管那块组织的细胞其实都好好地配准到了脑区上。
+#
+# 这一层就是把配准结果按同一个 plan 送回没合拢的几何：碎片落在哪、就把它在合拢
+# 后拿到的图谱标签搬回哪，合拢后被它填上的窟窿留空。完整的那一层原样保留，两层
+# 之间用控制面板上的开关切（切的同时也切 hover / 点击 / 搜索高亮读的是哪一卷）。
+
+
+def _read_yaml(path):
+    """读一个 yaml，读不动就返回 None（这条路上任何一步失败都只是少一个图层）。"""
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        print(f"⚠️ Could not read {path} ({type(e).__name__}: {e})")
+        return None
+
+
+def find_reposition_plan(sample_dir):
+    """这个样本的 reposition plan 路径，没有就返回 None。返回 (path, 来源说明)。
+
+    优先级：配置里写死的 reposition_plan > 配置里指的 registration_config >
+    样本目录里那份 pipeline 配置快照。
+
+    最后这条是默认路径，也是最不会过期的一条：run_pipeline 会把跑这一次用的
+    config 原样拷进 output_dir（pipeline.py 的 shutil.copy2），所以样本目录自己
+    就记着它是怎么跑出来的，不用在本工具的配置里再维护一份路径。快照出现之前跑
+    的老结果没有这个文件，那时在配置里写 registration_config 指过去。
+
+    reposition_plan 显式写成空（`reposition_plan: ""`）= 明确不要这一层。
+    """
+    explicit = CONFIG.get('reposition_plan')
+    if explicit is not None:
+        if not explicit:
+            return None, None
+        return explicit, "the config's reposition_plan"
+
+    candidates = []
+    reg_cfg = CONFIG.get('registration_config')
+    if reg_cfg:
+        candidates.append((reg_cfg, "the config's registration_config"))
+    else:
+        for path in sorted(glob.glob(os.path.join(sample_dir, '*.yaml'))
+                           + glob.glob(os.path.join(sample_dir, '*.yml'))):
+            candidates.append((path, f"the pipeline config snapshot {os.path.basename(path)}"))
+
+    for path, source in candidates:
+        cfg = _read_yaml(path)
+        sample = (cfg or {}).get('sample')
+        if not isinstance(sample, dict):
+            continue
+        plan = sample.get('reposition_plan')
+        if plan:
+            return os.path.expanduser(os.path.expandvars(str(plan))), source
+    return None, None
+
+
+def fragments_on_grid(fragments_path, plan, grid_shape, grid_voxel_um):
+    """画好的碎片轮廓，填成实心之后重采样到样本网格（= 标签图那张网格）。
+
+    轮廓是在原始 tiff 网格上画的、而且是稀疏的（只有真正抓过的那几层有体素，见
+    reposition.densify_fragments 的说明），标签图却在各向同性的 fine 网格上，所以
+    这里要跨一次网格。顺序是【先按 x/y 抽稀、再在原始 z 上填、最后按 z 抽稀】：
+    填充是在原始的层间隔上做的，和 pipeline 当初真正搬动组织时用的是同一批层，
+    只有平面内的分辨率降了 —— 反过来先抽 z 会把两个相邻关键层并到同一层上，那就
+    不是同一个碎片了。
+
+    平面内抽稀之后再插值，和"全分辨率插值完再抽稀"并不是逐体素相等的（SDF 插值
+    在离散网格上只是近似同变），差别在边界那一两个体素上。这一层是拿来看的，不
+    是拿来当配准输入的，为此把 3109×1375 的整卷填一遍（每个 label 一卷 700 MB
+    的 bool）不值当。
+    """
+    if not _import_reposition():
+        raise ImportError("registration_ants is required to fill fragment outlines")
+    raw_shape = tuple(int(v) for v in plan['image_shape_zyx'])
+    raw_um = [float(v) for v in plan['voxel_size_um']]        # (x, y, z)
+    raw_zyx_um = (raw_um[2], raw_um[1], raw_um[0])
+
+    img = sitk.ReadImage(str(fragments_path))
+    arr = sitk.GetArrayViewFromImage(img)
+    if tuple(arr.shape) != raw_shape:
+        raise ValueError(f"{fragments_path} is {tuple(arr.shape)} but the plan was drawn on "
+                         f"{raw_shape}")
+
+    # 每个轴独立的最近邻下标映射。ITK 重采样保留 origin，原图体素 0 的中心就是
+    # 降采样体素 0 的中心，所以样本网格下标 j 对应原始网格下标 j×(样本间距/原始
+    # 间距) —— 和 _native_image_placement 里高分辨率图不加 translate 是同一条前提。
+    def _index_map(n_out, out_um, in_um, n_in):
+        return np.clip(np.rint(np.arange(n_out) * out_um / in_um).astype(int), 0, n_in - 1)
+
+    iz, iy, ix = (_index_map(grid_shape[a], grid_voxel_um[a], raw_zyx_um[a], raw_shape[a])
+                  for a in range(3))
+    sub = np.ascontiguousarray(arr[np.ix_(np.arange(raw_shape[0]), iy, ix)])
+    del img, arr
+    return reposition.densify_fragments(sub)[iz]
+
+
 # ================= 🎮 3. 主控制器 =================
 
 class MainController:
@@ -594,6 +740,11 @@ class MainController:
         self.mode = None
         self.cell_checkboxes = {}
         self.last_search_mode = "Exact"
+
+        # 🧩 碎片复位：plan 里记的原始图路径（决定这一层默认要不要顶上去），以及
+        # 默认值有没有下过 —— 下过之后就归用户的勾选说了算，切视图不该把它重置。
+        self._restored_plan_image = None
+        self._restored_choice_made = False
 
         # 🚩 Flagging: click a cell -> pin it -> export tile/slice provenance
         # for suspicious cells so the user can pull up the raw TB-scale tile.
@@ -845,6 +996,100 @@ class MainController:
             return None
         return offset
 
+    def _build_restored_labels(self, labels, labels_path, pipeline):
+        """标签图的"碎片搬回原位"版本，这个样本没有碎片就返回 None。
+
+        任何一步不成立（没有 plan / 装不上 registration_ants / 轮廓文件没了 /
+        plan 和这个样本对不上）都只是打一行说明然后返回 None —— 少一个可选图层
+        不该让整个 viewer 起不来。
+        """
+        self._restored_plan_image = None
+        if pipeline != 'ants':
+            return None          # reposition 是 ANTs 流程独有的，ClearMap 没有
+        plan_path, source = find_reposition_plan(self.target_dir)
+        if not plan_path:
+            return None
+        if not os.path.exists(plan_path):
+            print(f"⚠️ {source} points at a reposition plan that does not exist: {plan_path}")
+            return None
+        if not _import_reposition():
+            return None
+
+        try:
+            plan = reposition.read_plan(plan_path)
+            self._restored_plan_image = plan.get('image_path')
+            print(f"🧩 Reposition plan ({source}): {plan_path}\n"
+                  f"   ↳ {len(plan['fragments'])} fragment(s), "
+                  f"{sum(len(f['keyframes']) for f in plan['fragments'])} keyframe(s)")
+            fragments_path = plan.get('labels_path')
+            if not fragments_path or not os.path.exists(fragments_path):
+                print(f"⚠️ The plan names labels_path={fragments_path!r}, which does not "
+                      f"exist -- that file is the fragment outlines the plan moves, so "
+                      f"without it there is nothing to move back. Layer skipped.")
+                return None
+
+            spacing = DataLoader.volume_spacing(labels_path)
+            if spacing is None:
+                print(f"⚠️ Could not read the voxel size of {labels_path}; without it the "
+                      f"plan (microns on the raw grid) cannot be put on this grid. "
+                      f"Layer skipped.")
+                return None
+            self._check_plan_grid(plan, labels.shape, spacing)
+
+            fragments = fragments_on_grid(fragments_path, plan, labels.shape, spacing)
+            plan_here = reposition.rescale_plan(
+                plan, (spacing[2], spacing[1], spacing[0]), image_shape_zyx=labels.shape)
+            restored = reposition.restore_labels_to_original(labels, fragments, plan_here)
+        except Exception as e:
+            print(f"⚠️ Could not put the registration result back on the un-repositioned "
+                  f"geometry ({type(e).__name__}: {e}). Layer skipped.")
+            return None
+
+        moved = int((restored != labels).sum())
+        print(f"   ↳ restored onto the original geometry: {moved} voxel(s) differ from the "
+              f"complete atlas ({100 * moved / labels.size:.2f}% of the volume)")
+        return restored
+
+    @staticmethod
+    def _check_plan_grid(plan, grid_shape, grid_voxel_um):
+        """plan 画的那张原始网格和这个样本网格是不是同一块物理空间。
+
+        两者体素尺寸不同是常态（原始 2.6/2.6/32 µm vs fine 20 µm 各向同性），所以
+        只能比物理尺寸：原始形状×原始体素 应该和 样本形状×样本体素 对得上，差得超过
+        一个样本体素就说明这份 plan 根本不是这个样本的 —— 那种情况下照样能算出一
+        个结果，只是把组织搬到了毫无道理的地方，而且不会有任何报错。
+        """
+        raw_um = [float(v) for v in plan['voxel_size_um']]          # (x, y, z)
+        raw_zyx_um = (raw_um[2], raw_um[1], raw_um[0])
+        raw_shape = tuple(int(v) for v in plan['image_shape_zyx'])
+        for axis, name in enumerate('zyx'):
+            raw_extent = raw_shape[axis] * raw_zyx_um[axis]
+            grid_extent = grid_shape[axis] * grid_voxel_um[axis]
+            if abs(raw_extent - grid_extent) > grid_voxel_um[axis]:
+                raise ValueError(
+                    f"the plan was drawn on a {raw_shape} grid at {raw_zyx_um} um/voxel "
+                    f"(z,y,x), which spans {raw_extent:.0f} um in {name}, while this "
+                    f"sample's label volume is {grid_shape} at {grid_voxel_um} um/voxel "
+                    f"and spans {grid_extent:.0f} um -- these are not the same sample")
+
+    RESTORED_LAYER_NAME = "Atlas Regions (fragments moved back)"
+
+    def _restored_layer_default(self, plan_image_path):
+        """这一层默认要不要顶上去。
+
+        取决于 Native 视图现在显示的是哪张图：显示的就是 plan 里记的那张原始
+        tiff（= 没合拢的那一份）时，能对上碎片的是这一层，默认就用它；显示的是
+        pipeline 自己产出的降采样图（已经合拢过）时，对得上的是完整那一层，这一
+        层建好但先不点亮。
+        """
+        native = CONFIG.get('native_image_path')
+        if not native or not plan_image_path:
+            return False
+        try:
+            return os.path.realpath(native) == os.path.realpath(plan_image_path)
+        except OSError:
+            return False
+
     def load_sample_native_view(self):
         self.viewer.layers.clear()
         # 图层清空后这些引用指向的都是已经被移除的图层，必须一起作废，
@@ -897,6 +1142,11 @@ class MainController:
             mhd = (DataLoader.pad_to_grid(mhd, offset, grid_shape, "sample-space labels")
                    if offset is not None else None)
 
+        # 碎片复位的样本多一层"配准结果搬回原图几何"。放在旋转之前算：plan 和标签
+        # 图都还是文件里的原始轴序，转起来两卷用的是同一个 k。
+        restored = (self._build_restored_labels(mhd, mhd_path, paths['pipeline'])
+                    if mhd is not None else None)
+
         scale = None
         if img is not None:
             ok, scale = self._native_image_placement(img.shape, grid_shape)
@@ -911,6 +1161,8 @@ class MainController:
                     scale = (scale[0], scale[2], scale[1])
             if mhd is not None:
                 mhd = DataLoader.rotate_vol(mhd, k)
+            if restored is not None:
+                restored = DataLoader.rotate_vol(restored, k)
             # 细胞点跟着世界坐标网格转，而不是跟着标签图转 —— 以前用的是标签图形状，
             # 标签图缺失时整段跳过，图转了点没转，无声错位。
             if not df_cells.empty and grid_shape is not None:
@@ -949,6 +1201,10 @@ class MainController:
             # 看边界偏了多少）仍然一键可切，见控制面板里的 cb_outline ——
             # 判断配准精度时切过去。
             labels_layer = self.viewer.add_labels(mhd, name="Atlas Regions", opacity=0.5)
+            if restored is not None:
+                # 两卷同一张网格、同一套 id，所以配色、highlight 层、hover 取值那
+                # 一整套逻辑一个字都不用改，只是换一卷读。
+                self.viewer.add_labels(restored, name=self.RESTORED_LAYER_NAME, opacity=0.5)
             self.setup_highlight_layers(mhd.shape)
         else:
             print("⚠️ No sample-space label volume found (or it could not be aligned) "
@@ -967,6 +1223,9 @@ class MainController:
         self._apply_grid_layout("Atlas Regions")
         self._apply_region_contour()
         self.setup_flag_layer()
+        # 最后调：它会把当选的那一卷挪到最顶上，得在 _apply_grid_layout 之后。
+        self._sync_restored_layer(
+            default_on=self._restored_layer_default(self._restored_plan_image))
 
     def load_sample_atlas_view(self):
         self.viewer.layers.clear()
@@ -1015,10 +1274,13 @@ class MainController:
         self._apply_grid_layout("Atlas Anatomy")
         self._apply_region_contour()
         self.setup_flag_layer()
+        # 图谱空间里没有"原图几何"可言（细胞的 atlas 坐标本来就是从合拢后的样本
+        # 算出来的），这一层不存在，开关跟着收起来。
+        self._sync_restored_layer()
 
     # 跟着开关走的图层：脑区标签本身。高亮层（">> Highlight Atlas <<"）故意不跟 ——
     # 它是搜索的结果，永远填充才看得见，轮廓化等于把搜到的东西又藏起来。
-    REGION_LAYER_NAMES = ("Atlas Regions", "Atlas Anatomy")
+    REGION_LAYER_NAMES = ("Atlas Regions", "Atlas Anatomy", RESTORED_LAYER_NAME)
 
     def _apply_region_contour(self):
         """把"填充/轮廓"开关应用到当前存在的脑区标签层。
@@ -1031,6 +1293,47 @@ class MainController:
         for name in self.REGION_LAYER_NAMES:
             if name in self.viewer.layers:
                 self.viewer.layers[name].contour = width
+
+    def _sync_restored_layer(self, default_on=False):
+        """把"碎片搬回原位"这个开关铺到图层上，并且换掉 hover / 点击 / 搜索高亮
+        读的那一卷。
+
+        两卷标签图只留一卷可见，而不是叠着看：它们在碎片之外逐体素相同，在碎片
+        上一个说"这块在原位"、一个说"这块在合拢后的位置"，同时点亮的话同一块图谱
+        会在画面上出现两次，正好是这一层要消除的那种误会。想对着看就在 napari
+        的图层列表里手动把另一只眼睛点开 —— 但 hover 回答的仍然是这里选中的那卷。
+        """
+        has_layer = self.RESTORED_LAYER_NAME in self.viewer.layers
+        self.cb_restored.setVisible(has_layer)
+        if not has_layer:
+            return
+
+        # 默认值只在第一次建出这一层时下，之后归用户的勾选管：切一次视图就把
+        # 手动选的状态推翻，比不给默认值还烦。
+        if not self._restored_choice_made:
+            self._restored_choice_made = True
+            self.cb_restored.blockSignals(True)
+            self.cb_restored.setChecked(default_on)
+            self.cb_restored.blockSignals(False)
+
+        active = self.RESTORED_LAYER_NAME if self.cb_restored.isChecked() else "Atlas Regions"
+        for name in ("Atlas Regions", self.RESTORED_LAYER_NAME):
+            if name in self.viewer.layers:
+                self.viewer.layers[name].visible = (name == active)
+        # 让选中的那卷紧挨着另一卷、并且压在它上面，而不是直接顶到图层表最上面：
+        # 最上面那格属于 🚩 Flagged Cells（钉的点被 0.5 不透明度的标签层盖住就白钉
+        # 了），而这一对整体该在哪由 _apply_grid_layout 决定。napari 的 move 是
+        # "按原下标插入、再删掉源"，所以往上挪要 +1。
+        other = "Atlas Regions" if active == self.RESTORED_LAYER_NAME else self.RESTORED_LAYER_NAME
+        if other in self.viewer.layers:
+            i_active = self.viewer.layers.index(active)
+            i_other = self.viewer.layers.index(other)
+            if i_active < i_other:
+                self.viewer.layers.move(i_active, i_other + 1)
+
+        self.current_atlas_labels = self.viewer.layers[active].data
+        self.last_hover_val = -1          # 换了卷，上一次的取值不能再拿来去重
+        self.perform_search()             # 高亮是从 current_atlas_labels 算的，得重算
 
     def _apply_grid_layout(self, atlas_layer_name):
         # 图谱图层移到最顶层：叠加模式下轮廓要压在原图上面才看得见。
@@ -1245,6 +1548,21 @@ class MainController:
         self.cb_outline.setChecked(False)
         self.cb_outline.stateChanged.connect(lambda _state: self._apply_region_contour())
         layout.addWidget(self.cb_outline)
+
+        # 只有带 reposition plan 的样本才看得到这个开关（_sync_restored_layer 负责
+        # 显隐）：没有碎片的样本两卷标签图完全一样，多一个永远无效的勾选框只会让人
+        # 以为自己漏了什么。
+        self.cb_restored = QCheckBox("Fragments moved back (matches the original stack)")
+        self.cb_restored.setToolTip(
+            "The registration ran on a stack whose split-off fragments had been swung "
+            "shut, so its label volume describes the closed brain. Tick this to read it "
+            "back on the geometry the raw stack actually has: each fragment's regions go "
+            "where the fragment really sits and the socket it was folded into is left "
+            "empty. Hover, click and the region search all follow whichever volume is "
+            "showing.")
+        self.cb_restored.setVisible(False)
+        self.cb_restored.stateChanged.connect(lambda _state: self._sync_restored_layer())
+        layout.addWidget(self.cb_restored)
 
         h_size = QHBoxLayout()
         h_size.addWidget(QLabel("<b>Cell Size:</b>"))

@@ -72,3 +72,25 @@ view_rotate_k: 0
 #    日志被清掉、或跑的是不打这行的老版本 cellMap.py 时，在这里手写；
 #    两处都没有的话脚本会跳过标签图而不是画一张错位的（宁缺毋滥）。
 # labels_crop_offset: [20, 0, 0]
+
+# 7. 可选：碎片复位（reposition）。
+#    只有裂开过、跑 pipeline 时配了 sample.reposition_plan 的样本才用得上。
+#    那种样本的配准是在"把碎片合拢之后"的几何上跑的，所以 *_fine_*um.nii.gz、
+#    *_labels_in_sample.nii.gz、细胞表第 4-6 列全在合拢后的坐标系里；而上面第 4 条
+#    的 native_image_path（= pipeline 配置里的 sample.raw_tiff）是没合拢的原图。
+#    两者叠在一起看时，图谱是一整块完整的脑，碎片所在的位置底下什么标签都没有，
+#    hover 一律回答 background —— 尽管那块组织的细胞其实都配准到了脑区上。
+#
+#    所以 Native 视图会多建一层 "Atlas Regions (fragments moved back)"：同一份配准
+#    结果按同一个 plan 送回没合拢的几何，碎片的脑区搬回碎片真正所在的位置，合拢后
+#    被它填上的窟窿留空。完整的那一层原样保留，控制面板上的
+#    "Fragments moved back" 开关切哪一层可见 —— hover / 点击 / 搜索高亮读的都是
+#    当前选中的那一层。显示的正是 plan 里记的那张原图时默认打开，否则默认关闭。
+#
+#    plan 的路径默认从样本目录里那份 pipeline 配置快照读（run_pipeline.sh 会把跑
+#    这一次用的 config 拷进 output_dir），所以一般什么都不用写。没有碎片就不会多
+#    这一层。快照出现之前跑的老结果没有那个文件，用下面两条之一指过去：
+# registration_config: /home/fyu7/My_project/Registration_ants/configs/s18.yaml
+# reposition_plan: /home/fyu7/My_project/Registration_ants/atlas/mask/s18/s18_DeMBA5.reposition.json
+#
+#    写成空字符串 = 明确不要这一层（`reposition_plan: ""`）。
