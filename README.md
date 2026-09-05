@@ -12,6 +12,7 @@ dependency only points one way.
 
 ---
 
+
 ## Layout
 
 Three kinds of file, kept apart:
@@ -276,6 +277,26 @@ python tools/convert_regions_ontology.py \
 ```
 
 ---
+
+### tools/stats_view.py —— 组间统计热图（交互式 3D）
+
+加载配准用的图谱标注（默认只取右半球）和 `../Registration_ants` 那边
+`group_stats.py` 产出的 `region_stats.csv`，把每个脑区按选定统计量着色，在 napari
+里滑动查看；右侧面板随时切 ontology level / 细胞类别 / 指标 / 统计量。
+右半球满分辨率加载约 0.6 秒，切换重绘约 0.15 秒。
+
+```bash
+conda activate antsreg
+cp configs/stats_view.example.yaml configs/stats_view.yaml   # 改成自己的路径
+python tools/stats_view.py
+python tools/stats_view.py --selftest    # 无显示器也能跑
+```
+
+level 折叠和取值复用 `Registration_ants/stats/region_maps.py`（config 里的
+`ants_root` 指过去），所以和那边的静态图 `stats/plot_heatmaps.py` 用的是同一份逻辑。
+
+读图三件事：**颜色是逐脑区的不是逐体素的**；**切 level 靠每个体素读它在该层的祖先**
+（标着 CA1 的体素在 level 5 上显示 HPF 的值）；**灰色 = 没有结果，不是没有差异**。
 
 ## Conventions
 

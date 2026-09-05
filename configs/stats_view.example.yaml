@@ -1,0 +1,32 @@
+# tools/stats_view.py —— 组间统计结果的交互式 3D 热图
+#   conda activate antsreg
+#   cp configs/stats_view.example.yaml configs/stats_view.yaml   # 改成自己的路径
+#   python tools/stats_view.py
+
+# Registration_ants 仓库根目录。stats_view 从这里 import stats.region_maps，
+# 好让 level 折叠和取值的逻辑跟静态图（stats/plot_heatmaps.py）用的是同一份代码。
+ants_root: ../Registration_ants
+
+# 画在哪张图谱上。用配准时那套图谱的【主标注】（未做 orientation/slicing 的原始
+# 文件），这样冠状/矢状是标准方位。shape (AP, DV, ML) = (563, 400, 570)。
+annotation_path: ../Registration_ants/atlas/DeMBA/DeMBA_P5_annotation.tif
+ontology_path:   ../Registration_ants/atlas/DeMBA/CCF_v3_ontology.json
+
+# group_stats.py 的输出
+region_stats_csv: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/stats_marker/region_stats.csv
+
+# right / left / both。样本是半脑，图谱配准时也按解剖中线裁到右半球，所以默认
+# right。左半球样本（s10）是靠镜像图谱配准的，结果同样表达在右半球坐标里。
+hemisphere: right
+
+# 每个轴的抽稀倍数。1 = 原分辨率（右半球约 6400 万体素，内存约 1.2 GB）。
+# 机器吃力就设 2，只影响显示，不影响任何数字。
+downsample: 1
+
+# 启动时的默认选项，之后都能在右侧面板里改
+level: 5
+class_name: GFP_any
+metric: Density
+value: log2fc          # log2fc / hedges_g / neglog10p / mean_a / mean_b
+significant_only: true
+alpha: 0.05
