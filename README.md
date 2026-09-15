@@ -39,9 +39,21 @@ tools/                   the smaller runnable tools
   qc_guide_mask.py
   convert_regions_ontology.py
 
+qc/                      detection-recall QC, its own subsystem (qc/README.md)
+  cut_crops.py             cut blind annotation crops from the full-res tiles
+  annotate_crop.py         the only GUI of the three: annotate one crop
+  score_crops.py           confusion matrix + cluster bootstrap over crops
+  crop_geometry.py         atlas region -> global pixel box -> assembled crop
+
 configs/                 <tool>.example.yaml tracked, <tool>.yaml gitignored
 tests/                   headless, plus test_gui_smoke.py which builds real windows
 ```
+
+`qc/` is kept apart from `tools/` on purpose: the three scripts run at
+different times, on different machines, and the annotation step is deliberately
+unable to reach the sample/group/prediction manifest the other two share. See
+`qc/README.md` -- blinding there is a property of what the annotator is handed,
+not of their self-discipline.
 
 `configs/` and `.dialog_state/` live at the **repo root**, not inside `shared/`,
 so a tool in `tools/` and a main script in the root find the same ones. Anything
@@ -169,6 +181,25 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
   does not reproduce them, the cells are left alone and the reason is printed
   rather than a few hundred thousand points being drawn in the wrong place.
   Flagged pins are re-projected onto their own cell too.
+
+  **Cell density heat map.** The points answer "where is this cell"; the heat
+  map answers "where are the cells dense". Cell counts are binned onto whatever
+  grid the current view uses and blurred with a Gaussian (σ in microns, set in
+  the panel; converted per axis with that grid's voxel size, so an anisotropic
+  grid still gets a blur that is isotropic in real space), then divided by the
+  voxel volume and shown in cells/mm³. It works in both views, on the same
+  coordinates the points use — over the standard atlas in Atlas view, over the
+  raw image plus the warped atlas in Native view — so the hot spots and the
+  points can never drift apart. Which cells go in is its own dropdown (all
+  classes / one marker combination / one class folder), independent of the
+  class checkboxes, which only decide whether the point layers are drawn.
+
+  It is voxel-wise, so there is no ontology level to choose and no region
+  boundary involved: this is *not* the per-region `Density` of the group-stats
+  tables (cells ÷ that region's volume in that sample). The Gaussian is
+  normalised, so the volume still sums to the number of cells that went into
+  it, and the blur spreads counts past the edge of the tissue — read it for
+  where the cells are, not for an absolute number at the border.
 - **`registration_eval.py`** — Dice/HD95, landmark TRE, Jacobian and
   inverse-consistency metrics across samples and groups.
   `python registration_eval.py configs/eval_config.yaml`.

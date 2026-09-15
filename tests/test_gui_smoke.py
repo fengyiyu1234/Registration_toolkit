@@ -614,6 +614,116 @@ def test_single_sample_fill_switch():
     print("   OK")
 
 
+def test_single_sample_density_heat_map():
+    print("5b. single_sample: the cell-density heat map is the cells, blurred, in place...")
+    import napari
+    import pandas as pd
+    from PyQt5.QtWidgets import QComboBox, QDoubleSpinBox, QLabel
+    import single_sample as ss
+
+    viewer = napari.Viewer(show=False)
+    try:
+        grid = (12, 20, 20)
+        viewer.add_image(np.zeros(grid, dtype=np.float32), name="Raw Image")
+        viewer.add_labels(np.ones(grid, dtype=np.uint32), name="Atlas Regions")
+
+        # Two classes of the same marker plus one of another, one background
+        # cell (mapped_id 0) and one cell off the far edge of the grid.
+        cells = pd.DataFrame({
+            "z": [6.0, 6.0, 6.0, 6.0, 6.0, 99.0],
+            "y": [10.0, 10.0, 11.0, 6.0, 10.0, 10.0],
+            "x": [10.0, 10.0, 10.0, 6.0, 10.0, 10.0],
+            "class_name": ["neuron_GFP", "glia_GFP", "neuron_GFP",
+                           "neuron_RFP", "neuron_GFP", "neuron_GFP"],
+            "mapped_id": [315, 315, 315, 315, 0, 315],
+        })
+
+        class Stub:
+            DENSITY_LAYER_NAME = ss.MainController.DENSITY_LAYER_NAME
+            DENSITY_FALLBACK_VOXEL_UM = ss.MainController.DENSITY_FALLBACK_VOXEL_UM
+            for _name in ("_refresh_density", "_density_points", "_populate_density_classes",
+                          "_grid_voxel_um"):
+                locals()[_name] = getattr(ss.MainController, _name)
+            del _name
+
+        stub = Stub()
+        stub.viewer = viewer
+        stub.current_cells_df = cells
+        stub.density_grid_shape = grid
+        stub.density_voxel_um = (20.0, 20.0, 20.0)
+        stub.cb_show_bg = SimpleNamespace(isChecked=lambda: False)
+        stub.cb_density = SimpleNamespace(isChecked=lambda: False)
+        stub.lbl_density = QLabel()
+        stub.combo_density_class = QComboBox()
+        stub.spin_density_sigma = QDoubleSpinBox()
+        stub.spin_density_sigma.setRange(0.0, 2000.0)
+        stub.spin_density_sigma.setValue(0.0)
+
+        stub._populate_density_classes(cells)
+        labels = [stub.combo_density_class.itemText(i)
+                  for i in range(stub.combo_density_class.count())]
+        assert labels[0] == "All classes", labels
+        # neuron_GFP and glia_GFP are one marker: the YOLO soma call is not a
+        # cell type this project distinguishes, and splitting the heat map by
+        # it would halve every count for no reason.
+        assert "marker · GFP" in labels and "marker · RFP" in labels, labels
+        assert "class · neuron_GFP" in labels, labels
+
+        # Off = no layer at all, not an empty one.
+        stub._refresh_density()
+        assert stub.DENSITY_LAYER_NAME not in viewer.layers
+
+        stub.cb_density = SimpleNamespace(isChecked=lambda: True)
+        stub._refresh_density()
+        layer = viewer.layers[stub.DENSITY_LAYER_NAME]
+        assert layer.data.shape == grid, layer.data.shape
+        # Painted on the display grid itself, so world coordinates are grid
+        # indices -- the same frame the cell points and the labels live in.
+        assert tuple(layer.translate) == (0, 0, 0) and tuple(layer.scale) == (1, 1, 1)
+        # Sits above the greyscale it is read against and below the atlas, or
+        # it hides the outlines the sample is being judged against.
+        assert [l.name for l in viewer.layers].index(stub.DENSITY_LAYER_NAME) == 1
+
+        # sigma=0 -> raw counts / voxel volume. Four cells go in: the two at
+        # the same voxel, the one next to them, the RFP one. The background
+        # cell and the off-grid one do not.
+        voxel_mm3 = (20e-3) ** 3
+        assert np.isclose(layer.data.sum() * voxel_mm3, 4.0), layer.data.sum() * voxel_mm3
+        assert np.isclose(layer.data[6, 10, 10] * voxel_mm3, 2.0), "two cells in one voxel"
+        assert "1 cell(s) fell outside" in stub.lbl_density.text(), stub.lbl_density.text()
+
+        # Blurring conserves the total (normalised kernel) -- that is what
+        # makes cells/mm^3 mean anything after the blur.
+        stub.spin_density_sigma.setValue(40.0)   # 2 voxels at 20 um
+        stub._refresh_density()
+        blurred = viewer.layers[stub.DENSITY_LAYER_NAME].data
+        # rtol, not exact: the kernel is normalised, but whatever it pushes past
+        # the edge of the grid is gone. Every cell here sits >= 3 sigma inside.
+        assert np.isclose(blurred.sum() * voxel_mm3, 4.0, rtol=0.02), blurred.sum() * voxel_mm3
+        assert blurred[6, 10, 10] < 2.0 / voxel_mm3, "the peak must spread out, not stay put"
+        assert blurred[6, 12, 10] > 0, "and reach its neighbours"
+
+        # One marker group only: neuron_GFP + glia_GFP, minus the background
+        # one and the off-grid one = 3 cells.
+        stub.spin_density_sigma.setValue(0.0)
+        stub.combo_density_class.setCurrentIndex(labels.index("marker · GFP"))
+        stub._refresh_density()
+        gfp = viewer.layers[stub.DENSITY_LAYER_NAME].data
+        assert np.isclose(gfp.sum() * voxel_mm3, 3.0), gfp.sum() * voxel_mm3
+
+        # Background cells follow the same switch the points do.
+        stub.cb_show_bg = SimpleNamespace(isChecked=lambda: True)
+        stub._refresh_density()
+        assert np.isclose(viewer.layers[stub.DENSITY_LAYER_NAME].data.sum() * voxel_mm3, 4.0)
+
+        # A grid whose voxel size nothing records falls back rather than
+        # refusing to draw -- only the scale depends on it.
+        assert stub._grid_voxel_um([None, "/nope.tif"], 0) == (20.0, 20.0, 20.0)
+    finally:
+        viewer.close()
+    print("   OK")
+
+
 def _repositioned_sample(tmp, inputs):
     """A sample directory that looks like a run WITH a reposition plan.
 
@@ -820,6 +930,10 @@ def test_single_sample_fragments_moved_back(tmp, inputs):
                 current_atlas_labels=None, last_hover_val=7, current_cells_df=cells,
                 mode="Native", flagged_cells=[], flag_layer=None,
                 RESTORED_LAYER_NAME=ss.MainController.RESTORED_LAYER_NAME,
+                # moving the cells moves the density heat map with them; here
+                # the layer never exists, so the switch just has to not trip
+                # over it (see _apply_cell_geometry).
+                DENSITY_LAYER_NAME=ss.MainController.DENSITY_LAYER_NAME,
                 setup_flag_layer=lambda: None,
                 perform_search=lambda: searched.append(True))
             for name in ("_sync_restored_layer", "_apply_cell_geometry", "_reproject_pins"):
@@ -2136,6 +2250,7 @@ def main():
         test_labels_mode_resume(tmp, inputs)
         test_labels_mode_resume_from(tmp, inputs)
         test_single_sample_fill_switch()
+        test_single_sample_density_heat_map()
         test_single_sample_fragments_moved_back(tmp, inputs)
         test_panels_are_resizable(tmp, inputs)
         test_assignment_panel_drops_one_region(tmp, inputs)

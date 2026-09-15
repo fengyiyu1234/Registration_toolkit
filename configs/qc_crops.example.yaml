@@ -1,0 +1,147 @@
+# qc/cut_crops.py 和 qc/score_crops.py 的配置模板。复制成 configs/qc_crops.yaml
+# （gitignored）再改成本机的真实路径：
+#
+#   cp configs/qc_crops.example.yaml configs/qc_crops.yaml
+#   conda activate antsreg
+#   python qc/cut_crops.py --dry-run     # 先只选点，确认区域和数量
+#   python qc/cut_crops.py               # 真的切图，需要能访问全分辨率 tile
+#   python qc/annotate_crop.py <out_dir>/<crop_id>    # 每个 crop 开一次
+#   python qc/score_crops.py             # 全部标完之后跑一次
+#
+# 三个脚本里只有 annotate_crop.py 不读这份配置，它只接受一个 crop 目录。
+# 那是故意的：盲法要靠标注者拿到的东西保证，不能靠自觉。见 qc/README.md。
+
+
+# ── 输出。out_dir 交给标注者，manifest_path 留在自己这里 ────────────────────
+#
+# manifest_path 不能落在 out_dir 里面，cut_crops.py 会直接报错。清单里有 crop
+# 对应哪个样本、哪一组、哪个区，以及该 crop 内的全部预测 —— 标注之前看到任何
+# 一条，这次标注就白做了。
+out_dir:       /data/hdd12tb-1/fengyi/COMBINe/qc_crops/round1/crops
+manifest_path: /data/hdd12tb-1/fengyi/COMBINe/qc_crops/round1_manifest.sealed.json
+
+
+# ── 采样 ───────────────────────────────────────────────────────────────────
+
+# 图谱本体 JSON，和跑配准时用的是同一份。
+ontology_json: /home/fyu7/My_project/Registration_ants/atlas/DeMBA/CCF_v3_ontology.json
+
+# 采样的目标脑区，按名字写，会自动包含它在本体树下的全部后代。
+regions:
+  - Isocortex
+
+# 细胞检测所在的原始图像体素大小 [x, y, z]，微米。必须和跑配准时
+# Registration_ants 配置里 cells.voxel_size_um 完全一致 —— 这个数把全局像素
+# 坐标和 20 µm 的标签体积挂在同一个物理坐标系上，写错了整条链就错位。
+cell_voxel_um: [0.65, 0.65, 8.0]
+
+# 每个 crop 的大小 [x, y, z]，单位是原始图像像素。
+# 250 x 250 x 50 约等于 162 x 162 x 400 µm。
+#
+# 这个数字是在 s11 和 s8 的皮层上用 --dry-run 实测出来的，不是估的。同样 6 个
+# crop，每个 crop 里已有的预测细胞数：
+#
+#     200 x 200 x 50    中位 22    范围 3-38
+#     250 x 250 x 50    中位 74    范围 9-134
+#     300 x 300 x 50    中位 105   范围 19-173
+#
+# 200 那一档不够用：落在 layer 1 或深层的 crop 只有个位数细胞，标了也说明不了
+# 什么。范围这么宽是因为皮层各层密度差很多，这是真实情况，不是选点有问题。
+#
+# 换样本或换脑区之后先跑一次 --dry-run 看这三个数，再决定切多大。宁可多切几个
+# 中等大小的，也不要切两个巨大的：置信区间是在 crop 层面 bootstrap 的，crop 的
+# 数量才是有效样本量，同一个 crop 里的细胞不是独立的。
+crop_px: [250, 250, 50]
+
+# 每个样本切几个。六个样本各 3 个就是 18 个，总共 900 个左右的细胞。
+# 组间必须均衡：单一的混合 recall 数字区分不了"两组同等衰减"和"一组被系统性
+# 压低"，而 3 对 3 的设计里能凭空造出结论的恰恰是后者。
+n_crops_per_sample: 3
+
+# 按成像深度分几层采样。Sox9 假阴性最可能沿探测轴衰减，分层才看得出来。
+z_bands: 3
+
+# 选点的随机种子。换一个数就是另一批 crop。
+seed: 0
+
+# 可选。跑 signal check 用哪个通道，默认用 channels 里的第一个。
+# 应该选一个 soma 通道 —— 检查的是预测的细胞中心是不是落在亮的地方。
+# signal_check_channel: RFP
+
+
+# ── 样本 ───────────────────────────────────────────────────────────────────
+#
+# run_dir  配准的 run 目录，就是放着 *_labels_in_sample.nii.gz 和
+#          cell_registration/ 的那一层，不是它上面的样本目录。
+#          反向映射和预测都从这里读。
+#
+# group    只写进封存清单，不会出现在 crop 目录里。
+#
+# channels 每个通道的全分辨率 tile 根目录，也就是拼接 xml 所在的那一层。
+#          默认找目录下的 xml_merging.xml，其次 xml_import.xml。
+#          每个通道用它自己的 xml —— 这是 brain_detector 写全局坐标时的做法，
+#          换一份 xml 切出来的框和预测描述的就不是同一块组织。
+#
+#          通道也可以写成带参数的形式：
+#            Sox9:
+#              dir: /path/to/730nm
+#              xml: xml_merging.xml     # 可选，指定别的文件名
+#              offset_px: [0, 0, 0]     # 可选，见下
+#
+#          offset_px 是这个通道相对 soma 通道的残余偏移，切图时会加到请求的框
+#          上。默认全零，也就是完全按各通道自己的拼接坐标切。如果 Sox9 通道和
+#          soma 通道在图上肉眼可见地错位，把 brain_detector 的
+#          0_channel_alignment 里那个 tile 的 offset 填进来再切一次。
+#          注意这个偏移本身就是 Sox9 假阴性的机制来源之一，填之前先确认它是
+#          系统性的，不是某几个 tile 的个案。
+samples:
+  s11:
+    run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s11/DeMBA_0902
+    group: Control
+    channels:
+      RFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample11/561nm
+      GFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample11/640nm_20
+      Sox9: /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample11/730nm
+
+  s10:
+    run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s10/DeMBA_0904
+    group: Control
+    channels:
+      RFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample10_reimg/561nm
+      GFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample10_reimg/640nm_30
+      Sox9: /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample10_reimg/730nm
+
+  # s18 跑的是重定位过的 run（DeMBA_0902_repos）。那批细胞的原始像素坐标没变，
+  # 但归区用的是搬过之后的位置，所以从脑区反推回原图这一步对碎片上的组织不是
+  # 纯缩放。最省事的做法是让 s18 的 crop 避开碎片，别在那里采样。
+  s18:
+    run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s18/DeMBA_0902_repos
+    group: Control
+    channels:
+      RFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/561nm
+      GFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/640nm_20
+      Sox9: /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/730nm
+
+  s8:
+    run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s8/DeMBA_0904
+    group: Experimental
+    channels:
+      RFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample8/561nm
+      GFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample8/640nm_20
+      Sox9: /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample8/730nm
+
+  s12q:
+    run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12q/DeMBA_0830_mask2
+    group: Experimental
+    channels:
+      RFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample12q/561nm
+      GFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample12q/640nm_20
+      Sox9: /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample12q/730nm
+
+  s12t:
+    run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/DeMBA_0828
+    group: Experimental
+    channels:
+      RFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample12t/561nm
+      GFP:  /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample12t/640nm_20
+      Sox9: /rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample12t/730nm

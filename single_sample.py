@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import tifffile
 import SimpleITK as sitk
+from scipy import ndimage as ndi
 import os
 import glob
 import json
@@ -250,6 +251,23 @@ class OntologyManager:
         return "<br>".join(lines)
 
 # ================= 📂 2. 数据加载与处理 =================
+
+# 细胞类别文件夹名 -> marker 组合。热图的类别下拉里把 neuron_/glia_ 两个文件夹
+# 并成同一项用的就是它：YOLO 的形态判定（neuron/glia）在本项目的分析口径里已经
+# 弃用，看密度时也没理由把同一种 marker 的细胞拆成两张图。
+#
+# 统计口径的唯一出处是 Registration_ants 的 stats/cell_tables.py:marker_signature
+# （neuron_3_GFP_RFP_Sox9 -> GFP_RFP_Sox9；类名里的数字 token 是 tile 目录名混进
+# 来的，不是批次）。这里照抄它的规则而不是 import：那个包不在 viewer 的依赖里，
+# 装不上也应该能看图。规则变了两边都要改。
+_SOMA_TYPES = ("neuron", "glia")
+
+
+def marker_group(class_name):
+    tokens = [t for t in re.split(r"[^a-zA-Z0-9]+", str(class_name)) if t]
+    kept = [t for t in tokens if not t.isdigit() and t.lower() not in _SOMA_TYPES]
+    return "_".join(kept) if kept else str(class_name)
+
 
 class DataLoader:
     @staticmethod
@@ -536,6 +554,42 @@ class DataLoader:
         return out
 
     @staticmethod
+    def density_volume(points_zyx, grid_shape, sigma_vox):
+        """细胞点 -> 高斯模糊后的密度体积，返回 (体积 float32, 落在网格外的点数)。
+
+        两步，都刻意做得笨：
+        1. 最近邻投点计数 —— 一个体素里落了几个细胞就是几。这一步不做任何插值，
+           所以体积的总和严格等于参与的细胞数。
+        2. 各向异性高斯（每个轴的 σ 是"多少个体素"，由调用方按该轴的体素尺寸从
+           微米换算，网格各向异性时三个轴的 σ 不同）。核是归一化的，所以模糊
+           **不改变总和**：每个体素的值仍然是"摊到这里的细胞数"，除以体素体积就
+           是 cells/mm³。
+
+        落在网格外的点丢掉并把个数报回去 —— 静默丢的话，热图会在裁剪边界上凭空
+        缺一块，而画面上看不出是缺了还是本来就没细胞。
+
+        边界用 mode='constant'（脑外算 0）而不是 'reflect'：脑边缘的密度因此会
+        往外糊出去一圈、并且比脑内偏低，这是"把细胞数摊开"这件事本身的性质，不是
+        bug。要读绝对密度请看统计表（stats/group_stats.py 按脑区体积算），热图是
+        用来看空间分布的。
+        """
+        counts = np.zeros(tuple(int(v) for v in grid_shape), dtype=np.float32)
+        n_outside = 0
+        pts = np.asarray(points_zyx, dtype=float)
+        if pts.size:
+            idx = np.rint(pts).astype(np.int64)
+            inside = np.all((idx >= 0) & (idx < np.array(counts.shape)), axis=1)
+            n_outside = int((~inside).sum())
+            idx = idx[inside]
+            # np.add.at 而不是 counts[idx] += 1：后者对重复下标只加一次，密度最高
+            # 的那些体素（同一格里好几个细胞）恰恰全是重复下标。
+            np.add.at(counts, (idx[:, 0], idx[:, 1], idx[:, 2]), np.float32(1.0))
+        if any(float(sg) > 0 for sg in sigma_vox):
+            counts = ndi.gaussian_filter(counts, sigma=[float(sg) for sg in sigma_vox],
+                                         mode='constant', cval=0.0)
+        return counts, n_outside
+
+    @staticmethod
     def normalize_image_8bit(img_path):
         img = DataLoader.load_volume(img_path)
         if img is None: return None, None
@@ -762,6 +816,12 @@ class MainController:
         self.cell_checkboxes = {}
         self.last_search_mode = "Exact"
 
+        # 🔥 细胞密度热图：两个视图各自的显示网格（(z,y,x) 形状 + 体素微米数），
+        # 由 load_sample_*_view 在旋转之后填。热图直接画在这张网格上，所以它跟
+        # 图谱层、细胞点用的是同一套世界坐标，不需要任何 translate/scale。
+        self.density_grid_shape = None
+        self.density_voxel_um = None
+
         # 🧩 碎片复位：plan 里记的原始图路径（决定这一层默认要不要顶上去），以及
         # 默认值有没有下过 —— 下过之后就归用户的勾选说了算，切视图不该把它重置。
         self._restored_plan_image = None
@@ -855,6 +915,144 @@ class MainController:
                 layer.metadata['cell_rows'] = sub_df.index.values
                 layer.events.highlight.connect(self.on_cell_layer_click)
 
+    # ================= 🔥 细胞密度热图 =================
+    #
+    # 细胞点画的是"每颗细胞在哪"，密度图画的是"哪一片细胞多"：把细胞数投到显示
+    # 网格上再高斯模糊。两个视图都能开 —— 图谱空间（用细胞表第 7-9 列，热图叠在
+    # 标准图谱上）和原图空间（第 4-6 列，热图叠在原图 + 变形回来的图谱上）——
+    # 用的是跟细胞点完全相同的那套坐标，所以点和热团永远对得上。
+    #
+    # 没有 ontology level 这个概念：值是逐体素的，不经过任何脑区归并，也就不需要
+    # 选层。相应地它**不是**统计表里的 Density —— 那个是"脑区内细胞数 ÷ 该区在这
+    # 个样本里的体积"，逐区一个数；这里是空间平滑的结果，脑区边界不参与。
+
+    DENSITY_LAYER_NAME = "🔥 Cell Density"
+    DENSITY_FALLBACK_VOXEL_UM = 20.0
+
+    def _grid_voxel_um(self, paths, k):
+        """当前显示网格的体素尺寸 (z,y,x) µm。
+
+        σ 要从微米换成体素、计数要换成 cells/mm³，都得知道这个。tif 里没有可靠的
+        体素尺寸（DataLoader.volume_spacing 对 tif 直接返回 None，不猜），所以按
+        顺序问几个处在同一张网格上的候选文件；全问不到才退到 20 µm 并说一声——
+        本项目的 fine/图谱网格都是 20 µm，退化值错了也只是 σ 和密度的标尺错，
+        热团的位置和形状不受影响。
+        """
+        for path in paths:
+            spacing = DataLoader.volume_spacing(path)
+            if spacing:
+                # rot90 换的是 y/x 两轴，体素尺寸得跟着换，否则各向异性网格上
+                # σ 会加在错的轴上。
+                return (spacing[0], spacing[2], spacing[1]) if k % 2 else tuple(spacing)
+        print(f"   ↳ no file in this view records a voxel size, so the density heat map "
+              f"assumes {self.DENSITY_FALLBACK_VOXEL_UM:g} µm isotropic (only the sigma and "
+              f"the cells/mm³ scale depend on it, not where the hot spots are).")
+        return (self.DENSITY_FALLBACK_VOXEL_UM,) * 3
+
+    def _populate_density_classes(self, df_cells):
+        """热图的类别下拉：全部 / 按 marker 合并 / 单个类别文件夹。
+
+        故意跟左边那排 class 勾选框分开：那排管的是"点画不画"，默认全不勾（点铺
+        满整卷会盖住图谱轮廓），热图要是跟着它走就永远是空的。
+        """
+        combo = self.combo_density_class
+        keep = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All classes", ("all", None))
+        if not df_cells.empty:
+            classes = sorted(df_cells['class_name'].unique())
+            for group in sorted({marker_group(c) for c in classes}):
+                combo.addItem(f"marker · {group}", ("marker", group))
+            for cls in classes:
+                combo.addItem(f"class · {cls}", ("class", cls))
+        if keep is not None:
+            for i in range(combo.count()):
+                if combo.itemData(i) == keep:
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+
+    def _density_points(self):
+        """进热图的细胞点 (n,3) 和一句"这是哪些细胞"。
+
+        背景细胞（mapped_id=0，warp 之后落在图谱外）跟着 "Show Background Cells"
+        那个开关走：它们不在任何脑区里，算进去会在脑外堆出一片假热区。
+        """
+        df = self.current_cells_df
+        if df.empty:
+            return np.empty((0, 3)), "no cells loaded"
+        if hasattr(self, 'cb_show_bg') and not self.cb_show_bg.isChecked():
+            df = df[df['mapped_id'] != 0]
+        kind, value = self.combo_density_class.currentData() or ("all", None)
+        if kind == "marker":
+            df = df[df['class_name'].map(marker_group) == value]
+            what = f"marker {value}"
+        elif kind == "class":
+            df = df[df['class_name'] == value]
+            what = value
+        else:
+            what = "all classes"
+        return df[['z', 'y', 'x']].to_numpy(dtype=float), what
+
+    def _refresh_density(self):
+        """按当前设置重建热图图层（开关关着就只是把它移掉）。
+
+        每次都整卷重算而不是缓存：一次高斯在 20 µm 半脑网格（约 4000 万体素）上
+        大概一两秒，而缓存要跟着类别、σ、背景开关、碎片几何开关一起失效，省下的
+        时间不值那些失效逻辑。
+        """
+        name = self.DENSITY_LAYER_NAME
+        if name in self.viewer.layers:
+            self.viewer.layers.remove(name)
+        if not getattr(self, 'cb_density', None) or not self.cb_density.isChecked():
+            self.lbl_density.setText("")
+            return
+        if self.density_grid_shape is None:
+            self.lbl_density.setText("⚠️ This view has no display grid, so there is nothing "
+                                     "to paint the density onto.")
+            return
+
+        points, what = self._density_points()
+        voxel_um = self.density_voxel_um or (self.DENSITY_FALLBACK_VOXEL_UM,) * 3
+        sigma_um = float(self.spin_density_sigma.value())
+        sigma_vox = tuple(sigma_um / v for v in voxel_um)
+
+        self.viewer.status = f"Computing the density heat map ({len(points)} cells)..."
+        vol, n_outside = DataLoader.density_volume(points, self.density_grid_shape, sigma_vox)
+        # 每个体素摊到的细胞数 -> cells/mm³，这样换 σ、换网格、换样本时数值还有
+        # 可比性（模糊不改变总和，所以整卷的和 × 体素体积 = 参与的细胞数）。
+        voxel_mm3 = float(np.prod(voxel_um)) * 1e-9
+        vol /= np.float32(voxel_mm3)
+
+        peak = float(vol.max()) if vol.size else 0.0
+        positive = vol[vol > 0]
+        # 上限取正值的 99.5 分位而不是峰值：密度分布是长尾的，按峰值拉的话除了
+        # 最亮的那几团之外全是黑的。滑条范围仍然放到峰值，想看极值随时能拉。
+        hi = float(np.percentile(positive, 99.5)) if positive.size else 1.0
+        hi = max(hi, 1e-6)
+
+        layer = self.viewer.add_image(vol, name=name, colormap='inferno',
+                                      blending='additive', opacity=0.9,
+                                      contrast_limits=(0.0, hi))
+        layer.contrast_limits_range = (0.0, max(peak, hi))
+        # 垫在最底下那张图（原图 / Sample in Atlas）之上、图谱标签和细胞点之下：
+        # additive 混合下 0 是透明的，热团压住灰度图正是要的，但压住图谱轮廓和
+        # 细胞点就把参照物盖掉了。
+        if len(self.viewer.layers) > 1:
+            self.viewer.layers.move(self.viewer.layers.index(name), 1)
+
+        note = (f"  ⚠️ {n_outside} cell(s) fell outside this grid and were dropped"
+                if n_outside else "")
+        sigma_txt = "×".join(f"{sg:.1f}" for sg in sigma_vox)
+        self.lbl_density.setText(
+            f"{len(points):,} cells ({what}) · σ {sigma_um:g} µm = {sigma_txt} vox (z,y,x) · "
+            f"peak {peak:,.0f}, display max {hi:,.0f} cells/mm³{note}")
+        self.viewer.status = f"Density heat map: {len(points)} cells, peak {peak:,.0f} cells/mm³"
+        print(f"🔥 Density heat map: {len(points)} cells ({what}), grid "
+              f"{tuple(self.density_grid_shape)} at {tuple(round(v, 3) for v in voxel_um)} µm, "
+              f"σ={sigma_um:g} µm, peak {peak:,.0f} cells/mm³{note}")
+
     def perform_search(self, search_mode=None):
         if search_mode is not None:
             self.last_search_mode = search_mode
@@ -925,6 +1123,7 @@ class MainController:
                 widget.setParent(None)
                 widget.deleteLater()
         self.cell_checkboxes.clear()
+        self._populate_density_classes(df_cells)
 
         if df_cells.empty: return
 
@@ -1320,6 +1519,12 @@ class MainController:
         if 'z_orig' in df_cells.columns:
             df_cells[['z_moved', 'y_moved', 'x_moved']] = df_cells[['z', 'y', 'x']].values
 
+        # 🔥 热图画在哪张网格上：就是细胞点所在的那张（旋转之后的），所以两者
+        # 天然对齐。标签图缺失时退回它自己的形状——那时 grid_shape 也来自它。
+        self.density_grid_shape = (grid_shape if grid_shape is not None
+                                   else (mhd.shape if mhd is not None else None))
+        self.density_voxel_um = self._grid_voxel_um([resampled_path, mhd_path], k)
+
         self.current_cells_df = df_cells
         self.update_class_filter_ui(df_cells)
         self.render_cells_from_df(df_cells, labels_layer)
@@ -1329,6 +1534,7 @@ class MainController:
         # 最后调：它会把当选的那一卷挪到最顶上，得在 _apply_grid_layout 之后。
         self._sync_restored_layer(
             default_on=self._restored_layer_default(self._restored_plan_image))
+        self._refresh_density()
 
     def load_sample_atlas_view(self):
         self.viewer.layers.clear()
@@ -1350,10 +1556,12 @@ class MainController:
         # 跟 Atlas Anatomy 标签图是同一个网格，直接叠加显示，方便肉眼核对配准准不准。
         # ClearMap 原生流程没有这个文件，找不到就跳过，不影响原有功能。
         in_atlas_matches = glob.glob(os.path.join(self.target_dir, '*_in_atlas.nii.gz'))
+        in_atlas_shape = None
         if in_atlas_matches:
             img_norm, _ = DataLoader.normalize_image_8bit(in_atlas_matches[0])
             if img_norm is not None:
                 if k: img_norm = DataLoader.rotate_vol(img_norm, k)
+                in_atlas_shape = img_norm.shape
                 self.viewer.add_image(img_norm, name="Sample in Atlas", colormap="gray", blending='additive')
 
         if os.path.exists(atlas_path):
@@ -1371,6 +1579,14 @@ class MainController:
             print(f"⚠️ No reference atlas label file found, showing the cell points only: {atlas_path}")
             self.setup_highlight_layers(None)
 
+        # 🔥 图谱空间的热图网格 = 图谱标签图本身；图谱文件缺了就退回"样本变形到
+        # 图谱空间"那张灰度图（同一张网格）。两个都没有就不画。
+        self.density_grid_shape = (self.current_atlas_labels.shape
+                                   if self.current_atlas_labels is not None else in_atlas_shape)
+        # 图谱 tif 里没有体素尺寸，所以把同网格的 *_in_atlas.nii.gz 也列进候选。
+        self.density_voxel_um = self._grid_voxel_um(
+            [atlas_path] + (in_atlas_matches[:1] if in_atlas_matches else []), k)
+
         self.current_cells_df = df_cells
         self.update_class_filter_ui(df_cells)
         self.render_cells_from_df(df_cells, atlas_layer)
@@ -1380,6 +1596,7 @@ class MainController:
         # 图谱空间里没有"原图几何"可言（细胞的 atlas 坐标本来就是从合拢后的样本
         # 算出来的），这一层不存在，开关跟着收起来。
         self._sync_restored_layer()
+        self._refresh_density()
 
     # 跟着开关走的图层：脑区标签本身。高亮层（">> Highlight Atlas <<"）故意不跟 ——
     # 它是搜索的结果，永远填充才看得见，轮廓化等于把搜到的东西又藏起来。
@@ -1461,6 +1678,11 @@ class MainController:
                 continue
             layer.data = df.loc[rows, ['z', 'y', 'x']].values
         self._reproject_pins()
+        # 热图是从这些坐标算出来的，点搬了它也得跟着重算，否则热团还停在合拢
+        # 后的位置，正好是这个开关要消除的那种错位。只在它已经画出来时才重算：
+        # 视图加载时这条路径会先于 _refresh_density 跑一次，没这个判断就白算一遍。
+        if self.DENSITY_LAYER_NAME in self.viewer.layers:
+            self._refresh_density()
 
     def _reproject_pins(self):
         """钉住的细胞跟着它自己那颗点走。
@@ -1724,6 +1946,55 @@ class MainController:
         h_size.addWidget(self.spin_point_size)
         layout.addLayout(h_size)
 
+        layout.addSpacing(5); line_dens = QFrame(); line_dens.setFrameShape(QFrame.HLine); layout.addWidget(line_dens); layout.addSpacing(5)
+
+        # 🔥 密度热图：细胞点回答"这颗细胞在哪"，热图回答"哪一片细胞多"。两个视图
+        # 都能开，画的都是当前视图那套坐标，所以热团和点永远对得上。
+        layout.addWidget(QLabel("<b>🔥 Cell Density Heat Map:</b>"))
+        self.cb_density = QCheckBox("Show density (Gaussian-blurred cell counts)")
+        self.cb_density.setChecked(bool(CONFIG.get('density_on', False)))
+        self.cb_density.setToolTip(
+            "Cell counts binned onto the display grid and blurred with a Gaussian, in "
+            "cells/mm³. Voxel-wise, so there is no ontology level to pick and no region "
+            "boundary involved -- this is NOT the per-region Density in the group stats "
+            "tables. The blur spreads counts past the edge of the tissue, so read it for "
+            "where the cells are dense, not for an absolute number at the border.")
+        self.cb_density.stateChanged.connect(lambda _state: self._refresh_density())
+        layout.addWidget(self.cb_density)
+
+        h_dens_cls = QHBoxLayout()
+        h_dens_cls.addWidget(QLabel("Cells:"))
+        self.combo_density_class = QComboBox()
+        self.combo_density_class.setToolTip(
+            "Which cells go into the heat map. Independent of the class checkboxes below, "
+            "which only control whether the point layers are drawn.")
+        self.combo_density_class.addItem("All classes", ("all", None))
+        self.combo_density_class.currentIndexChanged.connect(lambda _i: self._refresh_density())
+        h_dens_cls.addWidget(self.combo_density_class, 1)
+        layout.addLayout(h_dens_cls)
+
+        h_sigma = QHBoxLayout()
+        h_sigma.addWidget(QLabel("Blur σ (µm):"))
+        self.spin_density_sigma = QDoubleSpinBox()
+        self.spin_density_sigma.setRange(0.0, 2000.0)
+        self.spin_density_sigma.setSingleStep(25.0)
+        self.spin_density_sigma.setDecimals(0)
+        # 100 µm = 20 µm 网格上的 5 个体素：足以把离散的点糊成连续的云，又不至于
+        # 把皮层各层（每层约 100~200 µm）抹成一片。
+        self.spin_density_sigma.setValue(float(CONFIG.get('density_sigma_um', 100.0)))
+        self.spin_density_sigma.setToolTip(
+            "Standard deviation of the Gaussian, in microns. Converted to voxels per axis "
+            "with this grid's voxel size, so an anisotropic grid still gets an isotropic "
+            "blur in real space. 0 = raw counts, no blur.")
+        self.spin_density_sigma.valueChanged.connect(lambda _v: self._refresh_density())
+        h_sigma.addWidget(self.spin_density_sigma, 1)
+        layout.addLayout(h_sigma)
+
+        self.lbl_density = QLabel("")
+        self.lbl_density.setStyleSheet("color: #888; font-size: 11px;")
+        self.lbl_density.setWordWrap(True)
+        layout.addWidget(self.lbl_density)
+
         layout.addSpacing(5); line_flag = QFrame(); line_flag.setFrameShape(QFrame.HLine); layout.addWidget(line_flag); layout.addSpacing(5)
 
         layout.addWidget(QLabel("<b>🚩 Flag Suspicious Cell:</b> click a cell point, then Pin"))
@@ -1871,6 +2142,8 @@ class MainController:
         # 3. 根据当前设置重新渲染并恢复搜索高亮
         self.render_cells_from_df(self.current_cells_df, labels_layer)
         self.perform_search()
+        # 背景细胞进不进热图跟着同一个开关，见 _density_points。
+        self._refresh_density()
 
 def main():
     parser = argparse.ArgumentParser(

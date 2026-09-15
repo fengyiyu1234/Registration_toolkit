@@ -1,0 +1,114 @@
+# tools/pick_blocks.py 的配置模板。复制成 configs/pick_blocks.yaml（gitignored）：
+#
+#   cp configs/pick_blocks.example.yaml configs/pick_blocks.yaml
+#   conda activate antsreg
+#   python tools/pick_blocks.py --dry-run    # 先看能放下几个块
+#   python tools/pick_blocks.py              # 布点、写记录、画图
+#   python tools/pick_blocks.py --napari     # 再在 3D 里翻一遍
+
+out_dir: /data/hdd12tb-1/fengyi/COMBINe/stats/blocks_ctx600
+
+# 原生（未定向、未裁剪）的图谱标注，以及配套的本体 JSON。
+# 块定义在这个网格上，因为六个样本的图谱变体网格并不相同。
+native_annotation: /home/fyu7/My_project/Registration_ants/atlas/DeMBA/DeMBA_P5_annotation.tif
+ontology_json:     /home/fyu7/My_project/Registration_ants/atlas/DeMBA/CCF_v3_ontology.json
+atlas_res_um: 20
+
+# 采样的目标结构，自动包含本体树下的全部后代。
+regions:
+  - Isocortex
+
+# 块的形状。cube = 轴对齐立方块；column = 沿皮层法向摆的柱子。
+#
+# 立方块碰不到上层，而且缩小也没用。实测（DeMBA P5，占块体积的百分比）：
+#
+#     600 µm 立方       L1  3.0   L2/3  7.4   L4 2.5   L5 39.3   L6a 47.7
+#     200 µm 立方       L1  2.2   L2/3 16.6   L4 7.8   L5 40.3   L6a 33.0
+#     300 µm 柱子       L1  9.3   L2/3 17.9   L4 5.3   L5 26.9   L6a 37.1
+#     整个 Isocortex    L1 13.0   L2/3 20.8   L4 5.1   L5 29.2   L6a 29.4
+#
+# 小立方确实能采到中层，但 L1 在任何边长下都停在 2% 左右：L1 是最外的一层壳，
+# "整块必须在 mask 内" 永远把它刮掉。柱子沿法向站着，两端由 mask 自己截断，
+# 所以从软膜通到白质，覆盖归一化深度 0.03–0.97。
+#
+# 柱子还能按深度切片，给出逐块的层剖面 —— 径向迁移表型就住在这个量里。
+# 按归一化深度切 10 层，主导层纯度 84.4%；600 µm 立方沿背腹轴切是 67.6%。
+block_shape: cube
+
+# ── block_shape: column 时用的参数 ───────────────────────────────────────────
+# 截面边长，微米。300 是推荐下限：配准误差在这批数据上是 100–250 µm，横向推
+# 150 µm 时 300 µm 柱子还剩约 25% 的原定组织，200 µm 立方只剩不到 2%。
+# 柱子长的那个方向恰好是误差最伤人的方向（推 150 µm 径向还剩约 81%），横向被
+# 推只是采到隔壁同深度的皮层，性质差不多。
+column_um: 300
+
+# 轴向窗口 = 射线量出的跨度 × 这个倍数。两端反正由 mask 截断，放宽只是保证窗口
+# 盖住两个面，宁可大一点。
+axial_slack: 1.25
+
+# 候选柱心取在这个归一化深度区间里（0 = 软膜，1 = 白质），再沿轴滑到跨度中点。
+depth_band: [0.45, 0.55]
+
+# 候选中心的采样步长，体素。3 = 60 µm，够密了，调小只是让贪心布点更慢。
+candidate_stride: 3
+
+# 写出的逐样本深度分箱体分几层。切片按归一化深度，不按轴向坐标：两端被 mask
+# 截断之后，固定轴向位置的一片会横跨好几个深度。
+depth_bins: 10
+
+# 一根柱子至少要留下多少体素才算数。默认是同截面直柱穿过中位厚度皮层的四分之一。
+# min_voxels: 5062
+
+# 立方块边长，微米。600 是实测出来的折中值，理由见脚本头部：
+#   Isocortex 的最大内切球半径只有 649 µm，中位 200 µm，所以 800 µm 立方块
+#   在皮层里一个位置都放不下，大块平板更放不下（限制是曲率不是厚度）。
+#   长方体能换来单块体积但代价是块数：1200x1200x300 是 0.43 mm³ 但只有 7 个
+#   不重叠位置，600 立方是 0.216 mm³ 有 27 个。这笔交换不值，因为每块细胞数
+#   从来不是瓶颈（500 µm 立方已有约 900 个细胞，泊松变异系数 3%），而在某个
+#   方向薄的块正好在配准误差最伤的方向上短。
+block_um: 600
+
+# 块内属于 regions 的体素占比下限。
+#   1.0  = 严格，整块必须在目标结构内。600 µm 立方在皮层有约 30 万个合法中心。
+#   0.8  = 放宽。纯度不影响组间公平性，因为每个样本看到的是同一个混合成分，
+#          但必须在 methods 里写清楚。放宽到 0.8 时 1 mm 立方块也能用。
+min_purity: 1.0
+
+# 块中心之间的最小 Chebyshev 距离，以 block_um 为单位。
+#   1.0 = 刚好不重叠。>1 会在块之间留空隙，意义是相邻块不共享同一份配准误差，
+#         而紧贴的块基本上是共享的。
+spacing_scale: 1.0
+
+# 要放几个。null = 能放多少放多少。
+n_blocks: null
+
+# 可选。排除离任何组织表面近的位置，单位微米。
+# 实测：在 min_purity: 1.0 下这一条是多余的。整块必须落在 Isocortex 内本身就
+# 保证了块心离脑表面至少半个边长，所以设 200 和设 0 的合法中心数完全一样。
+# 只有放宽纯度之后它才开始起作用。
+min_surface_dist_um: 0
+
+# 可选。专门排除背侧的一层，单位微米。这批样本裂在脑的背侧表面。
+# 从背腹轴上最背侧的组织体素往下量，所以跟数组从哪里开始无关。
+# 背腹轴是哪一根、哪一端是背侧，都在运行时重新推导并校验，不是写死的。
+# 实测：600 µm 立方配严格纯度时这一条只去掉几百个体素，因为纯度约束已经把
+# 块推离脑表面了。样本破损更靠外侧或更深的时候才用得上。
+avoid_dorsal_um: 400
+
+# 布点的随机种子。位置一旦定下来就不要再改这个数：块的位置必须在看到
+# 分组结果之前固定，事后挪块等于做了一次没有记录的多重比较。
+seed: 0
+
+# 每个样本指向它自己的 Registration_ants 流程配置。
+# 只写这一个路径，orientation / slicing / background_margin_voxels 全部从那边读，
+# 不复制到这里 —— 复制会漂移，而块的位置一漂移，各样本就不再是同一片组织。
+#
+# s10 是左半脑，orientation 和 slicing 都跟其它五个不同，网格形状也不同。
+# 这正是块必须定义在原生网格上、再逐样本推过去的原因。
+samples:
+  s10:  /home/fyu7/My_project/Registration_ants/configs/s10.yaml
+  s18:  /home/fyu7/My_project/Registration_ants/configs/s18.yaml
+  s11:  /home/fyu7/My_project/Registration_ants/configs/s11.yaml
+  s8:   /home/fyu7/My_project/Registration_ants/configs/s8.yaml
+  s12q: /home/fyu7/My_project/Registration_ants/configs/s12q.yaml
+  s12t: /home/fyu7/My_project/Registration_ants/configs/s12t.yaml
