@@ -39,7 +39,9 @@ tools/                   the smaller runnable tools
   qc_guide_mask.py
   convert_regions_ontology.py
 
-qc/                      detection-recall QC, its own subsystem (qc/README.md)
+qc/                      QC subsystems (qc/README.md)
+  view_region_cells.py     post-registration QC: cells by region, back on the raw data
+  region_cells.py          its GUI-free half: selection, geometry, depth, frame check
   cut_crops.py             cut blind annotation crops from the full-res tiles
   annotate_crop.py         the only GUI of the three: annotate one crop
   score_crops.py           confusion matrix + cluster bootstrap over crops

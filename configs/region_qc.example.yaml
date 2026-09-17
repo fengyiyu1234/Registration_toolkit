@@ -1,0 +1,105 @@
+# qc/view_region_cells.py 的配置模板 —— 配准之后的细胞质控：按脑区选细胞，回到
+# 原始数据上看它们到底在哪。复制成 configs/region_qc.yaml（gitignored）再改路径：
+#
+#   cp configs/region_qc.example.yaml configs/region_qc.yaml
+#   conda activate antsreg
+#   python qc/view_region_cells.py --summary     # 只看统计和选中的 site，不读图
+#   python qc/view_region_cells.py --snapshot    # 每个 site 一张 PNG，不开窗口
+#   python qc/view_region_cells.py               # napari 逐个看、逐个判定
+#
+# 同一台机器上给不同样本各留一份：python qc/view_region_cells.py configs/region_qc.s8.yaml
+#
+# 这个工具不是盲的（显示脑区和预测），和 qc/cut_crops.py 那套漏检率标注是两回事，
+# 两边的输出目录不要混在一起。
+
+
+# ── 配准结果 ───────────────────────────────────────────────────────────────
+
+# 放着 *_labels_in_sample.nii.gz、cell_registration/ 和 pipeline 配置快照的那一层。
+# 细胞坐标体素（cells.voxel_size_um）、配准原图（sample.raw_tiff）和它的体素
+# 都从快照里读，不用在这里再写一遍。
+run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/DeMBA_0915
+
+# 和跑配准时同一份本体。
+ontology_json: /home/fyu7/My_project/Registration_ants/atlas/DeMBA/CCF_v3_ontology.json
+
+# 判定结果、截图、PNG 都写到这里。verdicts.csv 按 run_dir + 细胞 id 记，
+# 不同样本共用一个 out_dir 也不会互相覆盖。
+out_dir: /data/hdd12tb-1/fengyi/COMBINe/qc_region/s12t_0915
+
+
+# ── 选哪些细胞 ─────────────────────────────────────────────────────────────
+
+# 名字、缩写或 id 都行，自动包含本体树下的全部后代；写多个就是并集。
+# 按细胞表第 9 列选 —— 和统计用的是同一个归区结果。
+regions:
+  - Isocortex
+  # - SSp-bfd1          # 单独一层
+  # - Hippocampal formation
+
+# 细胞类别，按 cell_registration/ 下的文件夹名做通配匹配；不写 = 全部。
+# classes: ["*Sox9"]
+# classes: ["glia_*"]
+
+# 看几个 site、怎么挑。
+n_sites: 30
+seed: 0
+
+# random   在选中的细胞里随机挑（各类别轮流，稀有类别也能被看到）
+# boundary 只挑离所选区域边界 boundary_um 以内的 —— 归区错误集中在这里
+prefer: random
+boundary_um: 100
+
+# 两个 site 至少隔多远（µm）。默认是框宽，避免两个 site 看的是同一块组织。
+# min_separation_um: 400
+
+# 也可以直接钉死要看的细胞（--summary 打出来的 cell_id，"类别:行号"），
+# 写了就忽略上面的随机挑选。
+# sites:
+#   - glia_GFP_Sox9:1203
+#   - neuron_RFP:88
+
+
+# ── 从哪读图 ───────────────────────────────────────────────────────────────
+
+# volume  配准网格上的整脑 tif（默认 = 快照里的 sample.raw_tiff），哪台机器都能跑。
+#         2.6 × 2.6 × 32 µm：看得清组织边缘、分层和大致位置，z 上分不开单个细胞。
+# tiles   0.65 µm 的原始 tile，需要在挂着 Y: 盘的那台机器上跑。看单个细胞用这个。
+source: volume
+
+# volume 模式：要叠加的图，都必须在同一个网格上。不写就只用快照里的 raw_tiff。
+# images:
+#   730: /data/hdd12tb-1/fengyi/COMBINe/Registration/raw_data/s12t/s12t_730_registration.tif
+#   555: /data/hdd12tb-1/fengyi/COMBINe/Registration/raw_data/s12t/registration.tif
+# image_voxel_um: [2.6, 2.6, 32.0]   # 不写就用快照里的 sample.voxel_size_um
+
+# tiles 模式：每个通道的 tile 根目录（拼接 xml 所在那层），写法和
+# qc_crops.example.yaml 的 channels 完全一样，也支持 xml / offset_px。
+# channels:
+#   RFP:  Y:/Fengyi/TSC_brain/sample12t/561nm
+#   GFP:  Y:/Fengyi/TSC_brain/sample12t/640nm_20
+#   Sox9: Y:/Fengyi/TSC_brain/sample12t/730nm
+# signal_check_channel: RFP     # 默认第一个通道；应该是 soma 通道
+
+# 以细胞为中心的半框大小 [x, y, z]，µm。
+# 默认 tiles [200, 200, 40]（约 615×615×11 张），volume [600, 600, 160]。
+# half_extent_um: [200, 200, 40]
+
+# --snapshot 的 z 方向最大投影厚度（µm，细胞上下各这么多）。
+# 默认 tiles 16，volume 0（只画细胞所在那一层）。
+# snapshot_mip_um: 16
+
+# 细胞坐标的体素大小。快照里有 cells.voxel_size_um 时不用写；写了会覆盖。
+# cell_voxel_um: [0.65, 0.65, 8.0]
+
+# ── 坐标检查（--frame-check，只在 source: volume 下）─────────────────────────
+#
+# 比较 marker+ 和 marker- 细胞在整脑图上的平均强度随 z 平移的变化，峰值位置就是
+# 细胞坐标相对原图的偏移，逐 tile 各算一次。555/561 的配准图用 RFP，730 用 Sox9。
+# 正常的 run 每个 tile 都在 -20 µm（与"配准图第 k 层 = 全局第 4k+1~4k+4 层的平均"
+# 一致，这是从偏移反推的，没核对过降采样代码）；各 tile 散开几十微米，说明
+# cell_centroids 的 tile z 起点错了。
+# frame_check_marker: RFP
+
+# 单个 site 的 signal ratio 低于多少标红。默认 tiles 1.5，volume 1.2。
+# signal_warn_below: 1.5

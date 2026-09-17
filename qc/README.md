@@ -1,4 +1,17 @@
-# qc/ — 检测漏检率的穷举标注
+# qc/ — 质控
+
+两套互相独立的东西：
+
+- **配准后的细胞质控**（`view_region_cells.py` + `region_cells.py`）：按脑区选细胞，
+  回到原始数据上看它们是不是真在那个区里，逐个判定。不是盲的。见文末
+  「配准后质控：按脑区回看原图」。
+- **检测漏检率的穷举标注**（下面这一大段）：盲的，切 crop、人工从零标。
+
+两套的输出目录不要混用。
+
+---
+
+# 检测漏检率的穷举标注
 
 回答一个问题：**统计结果里的 Sox9 共定位细胞，有多少是检测漏掉的？**
 
@@ -126,3 +139,49 @@ Sox9 判读的一致性。如果人眼自己前后都不一致，就不存在 gr
 `uncertain` 那一层同理：它的比例本身就是「Sox9 能不能用人眼判」的答案。比例高
 的话诚实的结论是判不了，退回去比较 Sox9 阴性 soma 里 730 nm 通道的强度分布是
 不是双峰，那条路不需要任何人工判读。
+
+---
+
+# 配准后质控：按脑区回看原图
+
+```bash
+cp configs/region_qc.example.yaml configs/region_qc.yaml   # 改 run_dir / out_dir
+python qc/view_region_cells.py --summary --frame-check      # 先看数字，约 10 秒
+python qc/view_region_cells.py --snapshot                   # 每个 site 一张 PNG
+python qc/view_region_cells.py                              # napari 逐个判定
+python tests/test_region_qc_smoke.py                        # 自测，headless
+```
+
+- **选细胞**：`regions` 写名字 / 缩写 / id，自动含后代；`classes` 按文件夹名通配。
+  按细胞表第 9 列选，和统计用的是同一个归区。`prefer: boundary` 只挑离边界近的。
+- **读图**：`source: volume` 用配准网格的整脑 tif（哪台机器都能跑，看组织边缘和
+  分层）；`source: tiles` 用 0.65 µm tile（挂着 Y: 的机器，看单个细胞），tile
+  拼接复用 `crop_geometry.TileGrid`。
+- **每个 site 给两个归区答案**：细胞表的（细胞推进图谱空间查的）和
+  `labels_in_sample` 的（图谱拉回样本空间查的），外加到所选区域边界的有符号
+  距离（µm，正 = 区内）。不一致的几乎都在边界 20 µm 以内。
+- **判定**写进 `<out_dir>/verdicts.csv`，按 run_dir + 细胞 id（`类别:行号`）记，
+  可以关掉再接着判。键盘 `1-4` 判定、`n/p` 翻页、`u` 跳到下一个未判的。
+
+## frame check：细胞坐标和原图对不对得上
+
+`--frame-check`（仅 volume 模式）在整脑图上比较 marker+ 和 marker- 细胞处的平均
+强度，扫 z 平移，逐 tile 给出峰值位置。两组细胞都在组织里，组织/背景的差异抵消，
+剩下的只有 marker 本身，所以比「细胞 vs 框内随机点」灵敏得多（后者在 2.6 µm 图上
+错开 50 µm 几乎不变）。555 的配准图用 `RFP`，730 用 `Sox9`。
+
+2026-09-17 在六个 TSC run 上实测（RFP，555 图）：
+
+| run | dz=0 比值 | 最佳 dz | 逐 tile |
+|---|---|---|---|
+| s8 DeMBA_0904 | 2.5 | −20 µm | 19/20 个 tile 都是 −20 |
+| s11 DeMBA_0902 | 2.1 | −20 µm | 26/33 个是 −20，其余 −12~−32 |
+| s18 DeMBA_0902_repos | 1.9 | −20 µm | — |
+| s12t DeMBA_0915 | 1.4 | −24 µm | −16~−36 |
+| **s12q DeMBA_0830_mask2** | **1.0** | −80 µm | **−44~−148，各 tile 不一致** |
+| **s12t DeMBA_0828** | **1.0** | −120 µm | **−32~−140，各 tile 不一致** |
+| **s10 DeMBA_0904** | **1.0** | −68 µm | 没有 tile_name，只有整体 |
+
+正常 run 统一在 −20 µm，这和「配准图第 k 层 = 全局第 4k+1~4k+4 层的平均」一致
+（从偏移反推的，没核对降采样代码）。也就是流水线把所有细胞放深了约 20 µm，
+各样本相同。各 tile 散开几十微米的，是 cell_centroids 本身的 tile z 起点有问题。
