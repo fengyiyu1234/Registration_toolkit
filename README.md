@@ -42,6 +42,8 @@ tools/                   the smaller runnable tools
 qc/                      QC subsystems (qc/README.md)
   view_region_cells.py     post-registration QC: cells by region, back on the raw data
   region_cells.py          its GUI-free half: selection, geometry, depth, frame check
+  view_detection_qc.py     whole-chain QC: every detector stage's boxes, by region
+  detection_boxes.py       its GUI-free half: stage readers, rasterising, reconciliation
   cut_crops.py             cut blind annotation crops from the full-res tiles
   annotate_crop.py         the only GUI of the three: annotate one crop
   score_crops.py           confusion matrix + cluster bootstrap over crops
@@ -51,11 +53,20 @@ configs/                 <tool>.example.yaml tracked, <tool>.yaml gitignored
 tests/                   headless, plus test_gui_smoke.py which builds real windows
 ```
 
-`qc/` is kept apart from `tools/` on purpose: the three scripts run at
+`qc/` is kept apart from `tools/` on purpose: the scripts run at
 different times, on different machines, and the annotation step is deliberately
 unable to reach the sample/group/prediction manifest the other two share. See
 `qc/README.md` -- blinding there is a property of what the annotator is handed,
 not of their self-discipline.
+
+`qc/view_detection_qc.py` is the one tool here that reaches across into
+`brain_detector`'s own output (`1_tile_2d_filtered/`, `2_global_2d_raw/`,
+`3_channel_3d/`, `4_colocalization/`). It still does not *import* that repo --
+the frame conventions and display colours are copied, as `qc/crop_geometry.py`
+already copies the tile grid, and each copy names its source. Start with
+`--funnel`: it reads no images and reports where in the chain a class
+proportion changes, plus the one reconciliation that must come out exact
+(`coloc_result.csv` -> `cell_registration.csv`).
 
 `configs/` and `.dialog_state/` live at the **repo root**, not inside `shared/`,
 so a tool in `tools/` and a main script in the root find the same ones. Anything
@@ -403,6 +414,9 @@ python shared/label_partition.py --selftest
 python shared/hover_bar.py --selftest
 python tests/test_tool_inputs_smoke.py
 python tests/test_registration_eval_smoke.py
+python tests/test_region_qc_smoke.py
+python tests/test_detection_qc_smoke.py
+python tests/test_qc_crops_smoke.py
 python tests/test_gui_smoke.py            # builds real napari windows, ~3 s
 ```
 

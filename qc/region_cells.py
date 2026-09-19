@@ -741,14 +741,22 @@ VERDICTS = {
 
 class VerdictStore:
     """out_dir/verdicts.csv, one row per (run_dir, cell_id), rewritten on
-    every change so a crash loses at most the current click."""
+    every change so a crash loses at most the current click.
+
+    `vocab` is the set of allowed verdicts.  qc/view_detection_qc.py passes its
+    own (over-merge, missed Sox9, ...) rather than this file's region ones, so
+    both tools write one format and a verdict is always readable next to the
+    cell it is about -- but a run judged with one vocabulary keeps those
+    strings, which is why nothing here rewrites old rows.
+    """
 
     COLUMNS = ["run_dir", "cell_id", "class_name", "x", "y", "z", "table_region_id",
                "lookup_region_id", "depth_um", "source", "verdict", "note", "time"]
 
-    def __init__(self, path, run_dir):
+    def __init__(self, path, run_dir, vocab=None):
         self.path = Path(path)
         self.run_dir = str(run_dir)
+        self.vocab = dict(vocab) if vocab else VERDICTS
         if self.path.exists():
             self.df = pd.read_csv(self.path, dtype={"cell_id": str, "note": str})
         else:
@@ -764,7 +772,7 @@ class VerdictStore:
 
     def set(self, site_row, verdict, note, source):
         from datetime import datetime
-        if verdict not in VERDICTS:
+        if verdict not in self.vocab:
             raise ValueError(verdict)
         m = (self.df["run_dir"] == self.run_dir) & (self.df["cell_id"] == site_row["cell_id"])
         self.df = self.df.loc[~m]
@@ -785,3 +793,8 @@ class VerdictStore:
     def tally(self):
         sub = self.df[self.df["run_dir"] == self.run_dir]
         return sub["verdict"].value_counts().to_dict()
+
+    def tally_text(self, empty="0"):
+        """"名称 n，名称 n" for whichever of this store's vocabulary was used."""
+        return "，".join(f"{self.vocab[k]} {n}" for k, n in self.tally().items()
+                         if k in self.vocab) or empty

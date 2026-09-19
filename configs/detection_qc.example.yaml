@@ -1,0 +1,106 @@
+# qc/view_detection_qc.py 的配置模板 —— 检测 + 配准全链路质控：按脑区选位置，
+# 把原始 tile、brain_detector 的每一级检测框、图谱边界和最终细胞表画在一起。
+#
+#   cp configs/detection_qc.example.yaml configs/detection_qc.yaml
+#   conda activate antsreg
+#   python qc/view_detection_qc.py --funnel     # 先跑这个：数字，不读图
+#   python qc/view_detection_qc.py --snapshot   # 每个 site 一张 PNG
+#   python qc/view_detection_qc.py              # napari 逐个看、逐个判定
+#
+# 和 configs/region_qc.yaml 的字段完全兼容（多出来的只有 detection_* 几项），
+# 所以同一个样本可以直接从那份复制过来再补两行。
+#
+# 这台机器上要同时能看到：配准输出目录、以及 brain_detector 的结果目录
+# （1_tile_2d_filtered / 2_global_2d_raw / 3_channel_3d / 4_colocalization）。
+# 全分辨率 tile 只有 source: tiles 才需要。
+
+
+# ── 配准结果 ───────────────────────────────────────────────────────────────
+
+# 放着 *_labels_in_sample.nii.gz、cell_registration/ 和 pipeline 配置快照那一层。
+run_dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/DeMBA_0915
+
+ontology_json: /home/fyu7/My_project/Registration_ants/atlas/DeMBA/CCF_v3_ontology.json
+
+out_dir: /data/hdd12tb-1/fengyi/COMBINe/qc_detection/s12t_0915
+
+
+# ── 检测结果 ───────────────────────────────────────────────────────────────
+
+# brain_detector 的 pATHRESULT，也就是 config_*.json 里 "pATHRESULT" 指的那层。
+detection_dir: Y:/Fengyi/TSC_brain/sample12t/detection_results
+
+# 要看哪些通道。不写就用下面 channels 的 key；再没有就默认 RFP/GFP/Sox9。
+# 通道 id 必须和检测结果的文件名对得上（{ch}_3d_tracked.csv），
+# 不是 class 字符串里的 marker —— 'GFP_3' 这种带曝光后缀的 id 照写。
+# detection_channels: [RFP, GFP, Sox9]
+
+# 看哪几级。s2 是整脑原始 2D（一个框一层，文件很大但这里是分块读的，不占内存）；
+# 只想快点看结果就去掉 s2。
+#   s1  逐 tile 的 1_tile_2d_filtered（没有 2_global_2d_raw 时自动回退到它）
+#   s2  2_global_2d_raw       原始 2D
+#   s3  3_channel_3d          z-link 去重后
+#   s4  4_colocalization      共定位后的最终类别
+stages: [s2, s3, s4]
+
+# 框的线宽（像素）。0.65 µm 的 tile 上 2 就够，看不清再调大。
+# outline_width: 2
+
+
+# ── 选哪些细胞当 site ───────────────────────────────────────────────────────
+
+# 名字、缩写或 id，自动含全部后代；写多个是并集。按细胞表第 9 列选 ——
+# 和统计用的是同一个归区。--funnel 的漏斗也是在这个区里数的。
+regions:
+  - Isocortex
+
+# 类别按 cell_registration/ 下的文件夹名通配；不写 = 全部。
+# 查 Sox9 判读就把 site 集中到 Sox9 类上，反面对照用 classes: ["*_GFP", "*_RFP"]。
+# classes: ["*Sox9"]
+
+n_sites: 24
+seed: 0
+
+# random   在选中的细胞里随机挑（各类别轮流，稀有类别也看得到）
+# boundary 只挑离所选区域边界 boundary_um 以内的
+prefer: random
+boundary_um: 100
+
+# min_separation_um: 400
+
+# 也可以钉死要看哪些细胞（--summary 打出来的 cell_id，"类别:行号"）。
+# sites:
+#   - glia_GFP_Sox9:1203
+
+
+# ── 从哪读图 ───────────────────────────────────────────────────────────────
+
+# tiles   0.65 µm 原始 tile。**检测框只有在这个模式下才对得上单个细胞**，
+#         因为框本身就是在这个网格上画出来的。要挂着 tile 盘的那台机器。
+# volume  配准网格的整脑 tif（2.6 × 2.6 × 32 µm）。哪台机器都能跑，但一个
+#         细胞不到一个体素，框会挤成一团 —— 只适合看框的整体分布和 --funnel。
+source: tiles
+
+channels:
+  RFP:  Y:/Fengyi/TSC_brain/sample12t/561nm
+  GFP:  Y:/Fengyi/TSC_brain/sample12t/640nm_20
+  Sox9: Y:/Fengyi/TSC_brain/sample12t/730nm
+signal_check_channel: RFP
+
+# 以细胞为中心的半框 [x, y, z]，µm。默认 tiles [200, 200, 40]。
+# 框大一点能看到 z-link 的上下文，但 2D 框会多到看不清，200 µm 左右比较合适。
+# half_extent_um: [200, 200, 40]
+
+# --snapshot 的 z 方向最大投影厚度（µm）。默认 tiles 16。
+# 注意投影越厚，画进来的 2D 框越多。
+# snapshot_mip_um: 16
+
+# volume 模式用这两项（和 region_qc 一样）：
+# images:
+#   730: /data/hdd12tb-1/fengyi/COMBINe/Registration/raw_data/s12t/s12t_730_registration.tif
+#   555: /data/hdd12tb-1/fengyi/COMBINe/Registration/raw_data/s12t/registration.tif
+# image_voxel_um: [2.6, 2.6, 32.0]
+
+# cell_voxel_um: [0.65, 0.65, 8.0]    # 快照里有 cells.voxel_size_um 时不用写
+# frame_check_marker: RFP
+# signal_warn_below: 1.5

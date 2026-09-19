@@ -1,13 +1,18 @@
 # qc/ — 质控
 
-两套互相独立的东西：
+三套互相独立的东西：
 
 - **配准后的细胞质控**（`view_region_cells.py` + `region_cells.py`）：按脑区选细胞，
   回到原始数据上看它们是不是真在那个区里，逐个判定。不是盲的。见文末
   「配准后质控：按脑区回看原图」。
+- **全链路质控**（`view_detection_qc.py` + `detection_boxes.py`）：同样按脑区选点，
+  但把 brain_detector 的**每一级**检测框也铺开 —— 原始 2D、z-link 去重后、共定位
+  后 —— 所以能回答「类别比例是在哪一步变的」，而不只是「这个细胞归区对不对」。
+  不是盲的。见文末「全链路质控：每一级检测框 + 分级漏斗」。
 - **检测漏检率的穷举标注**（下面这一大段）：盲的，切 crop、人工从零标。
 
-两套的输出目录不要混用。
+三套的输出目录不要混用。前两套共用 `verdicts.csv` 的格式，但判定词表不同
+（`rc.VerdictStore(..., vocab=...)`），所以也各给各的 `out_dir`。
 
 ---
 
@@ -185,3 +190,105 @@ python tests/test_region_qc_smoke.py                        # 自测，headless
 正常 run 统一在 −20 µm，这和「配准图第 k 层 = 全局第 4k+1~4k+4 层的平均」一致
 （从偏移反推的，没核对降采样代码）。也就是流水线把所有细胞放深了约 20 µm，
 各样本相同。各 tile 散开几十微米的，是 cell_centroids 本身的 tile z 起点有问题。
+
+---
+
+# 全链路质控：每一级检测框 + 分级漏斗
+
+```bash
+cp configs/detection_qc.example.yaml configs/detection_qc.yaml   # 改 run_dir / detection_dir / out_dir
+python qc/view_detection_qc.py --funnel      # 先跑这个：数字，不读图
+python qc/view_detection_qc.py --snapshot    # 每个 site 一张 PNG
+python qc/view_detection_qc.py               # napari 逐个看、逐个判定
+python tests/test_detection_qc_smoke.py      # 自测，headless
+```
+
+## 它比 `view_region_cells.py` 多了什么
+
+那个工具画的是 `cell_registration.csv`，一个细胞一个点 —— 整条链路的**最后一步**。
+点画对了只说明归区没错，说明不了这个细胞是怎么来的。这个工具把 brain_detector 的
+中间产物也铺开：
+
+| 图层 | 来自 | 一行是什么 |
+|---|---|---|
+| `[s2] <ch>` | `2_global_2d_raw/{ch}_2d_global.csv` | 一个 2D 框在一层上 |
+| `[s3] <ch>` | `3_channel_3d/{ch}_3d_tracked.csv` | z-link 之后的一个细胞 |
+| `[coloc] GFP+Sox9` | `4_colocalization/coloc_result.csv` | 共定位判定后的最终类别 |
+| `region cells` | `cell_registration/*/cell_registration.csv` | 统计真正数的那一批 |
+
+没有 `2_global_2d_raw/` 时 `[s2]` 自动回退到逐 tile 的 `1_tile_2d_filtered/`
+（stage 3 自己读的就是它），那时才需要 `channels` 里的拼接 xml 来还原偏移。
+
+coloc 那几层和 `visualize.py` 一样是**超集**匹配：GFP+RFP+Sox9 的细胞同时出现在
+GFP+RFP 层和 GFP+Sox9 层里。几层叠起来是一张 Venn 图，不是互斥分区 —— 各层框数
+加起来超过细胞数是对的。
+
+## 先跑 `--funnel`
+
+`--funnel` 一张图都不读，两趟扫盘，回答的是**类别比例是在哪一级变的**：
+
+```
+检测分级漏斗 —— Isocortex（归区口径：labels_in_sample 回查框中心）
+  s2  原始 2D（全局）：GFP 1,223   RFP 525   Sox9 628
+  s3  z-link 去重后：GFP 415   RFP 177   Sox9 214
+  s4  共定位后：592
+        glia_GFP_Sox9      214
+        ...
+        Sox9+ 占比       36.15%
+  z-link 压缩比（2D 框·层 ÷ 细胞，≈ 每个细胞跨几层）：GFP 2.95  RFP 2.97  Sox9 2.93
+  细胞表 cell_registration/（第 9 列归区）：592   Sox9+ 占比 36.15%
+```
+
+看两个数：每一级各有多少，以及 **Sox9+ 占比**。占比是这套数据里唯一跨样本可比的
+量（标记效率是动物级的，这个设计没有内参），所以它在哪一级变的，就是该去查哪一级。
+逐个看图是用来解释漏斗里那个跳变的，不是用来发现它的。
+
+`z-link 压缩比` 是一个细胞平均跨几层。同一个样本里各通道差很多，或者两组之间差
+很多，说明 `z_linker` 的 `iou_thresh` / `max_cell_z_span` 对某个通道不合适 ——
+过并会吃掉细胞数，欠并会凭空多出细胞。
+
+## s4 → cell_registration 对账：唯一一处应该精确相等的接缝
+
+`run_inference.py` 写质心用的是 `cx = (x1 + x2) / 2`、`cy = (y1 + y2) / 2`、`z`
+原样；`cell_points.py` 把这三个数原样抄进 `cell_registration.csv` 的 0-2 列
+（reposition 也不动它们）。所以这两份文件**应该逐行精确相等**：
+
+```
+s4 → cell_registration 对账（(x1+x2)/2, (y1+y2)/2, z, class 精确相等）：
+  coloc_result.csv 1,200 行，细胞表 1,200 行，匹配上 1,200（100.00%）
+  ✅ 完全一致
+```
+
+对不上不是精度问题（坐标全程 float64，就是为了这个检查），是细胞表和这份
+`coloc_result.csv` 不是同一次跑出来的、或者中间丢了行。**先修好再看任何按类别
+或按区的统计**，因为这两份东西一旦错位，分组比较里的差异可以完全是它造出来的。
+
+## 判定词表和归区质控不一样
+
+| 键 | 含义 |
+|---|---|
+| `ok` | 都对 |
+| `over_merge` | 该分没分（z-link 过并） |
+| `under_merge` | 该并没并（一个细胞数成多个） |
+| `sox9_wrong` | Sox9 判错 |
+| `not_cell` | 不是细胞 / 看不清 |
+
+写进 `<out_dir>/verdicts.csv`，格式和 `view_region_cells.py` 的一样（按
+run_dir + 细胞 id），所以两边的判定可以并在一张表里读，但**词表不同**，不要共用
+同一个 `out_dir`。
+
+## 几件要知道的事
+
+- **框只有在 `source: tiles` 下才对得上单个细胞。** 框本来就是在 0.65 µm 网格上
+  画出来的；`source: volume` 的 2.6 × 2.6 × 32 µm 网格上一个细胞不到一个体素，
+  框会挤成一团。volume 模式适合 `--funnel` 和看框的整体分布。
+- **`--funnel` 的归区口径和统计的不完全一样。** 漏斗里每一级都是用
+  `labels_in_sample` 回查框中心（四级和细胞表统一口径，否则少掉的那几个说不清是
+  真少了还是换了个查法）；细胞表那一行用的是它自己第 9 列（细胞推进图谱空间查的
+  那个答案），和统计一致。两者差几个百分点是正常的，差很多要先查配准。
+- **内存和文件大小无关。** `2_global_2d_raw` 是一个框一层一行，整脑几千万行；
+  这里所有读取都是分块的，看图时只留落在 site 框里的行，对账时一行都不留。
+- **s18 跑的是重定位过的 run。** 碎片上的细胞，画出来的脑区边界是合拢后的位置，
+  和原图对不上（session 会警告）。选区按第 9 列仍然正确，判碎片上的细胞时不要看
+  边界。
+
