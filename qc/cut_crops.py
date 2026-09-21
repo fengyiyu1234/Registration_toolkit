@@ -158,8 +158,12 @@ def cut_sample(sample_name, sample_cfg, cfg, out_dir, rng, dry_run=False):
     if not dry_run:
         for ch_name, ch in sample_cfg["channels"].items():
             ch = {"dir": ch} if isinstance(ch, str) else dict(ch)
+            tile_shifts = None
+            if ch.get("align_dir"):
+                tile_shifts = geom.load_tile_shifts(ch["align_dir"], ch.get("align_key", ch_name))
             grids[ch_name] = geom.TileGrid(ch["dir"], ch.get("xml"),
-                                           ch.get("offset_px", (0, 0, 0)))
+                                           ch.get("offset_px", (0, 0, 0)),
+                                           tile_shifts)
     channel_names = list(grids) or list(sample_cfg["channels"])
     anchor = cfg.get("signal_check_channel") or channel_names[0]
     records = []

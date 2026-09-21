@@ -328,8 +328,12 @@ class TileSource:
         self.grids = {}
         for name, ch in channels.items():
             ch = {"dir": ch} if isinstance(ch, str) else dict(ch)
+            tile_shifts = None
+            if ch.get("align_dir"):
+                tile_shifts = geom.load_tile_shifts(ch["align_dir"], ch.get("align_key", name))
             self.grids[name] = geom.TileGrid(ch["dir"], ch.get("xml"),
-                                             ch.get("offset_px", (0, 0, 0)))
+                                             ch.get("offset_px", (0, 0, 0)),
+                                             tile_shifts)
 
     def cut(self, lo_phys, hi_phys):
         origin, size = _index_range(lo_phys, hi_phys, self.voxel_um)

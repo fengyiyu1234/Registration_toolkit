@@ -48,6 +48,7 @@ dependencies:
       - scikit-image==0.26.0
       - pandas==3.0.3
       - pyyaml==6.0.3
+      - nibabel==5.4.2
 
       # tests/
       - pytest

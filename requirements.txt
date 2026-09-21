@@ -20,3 +20,4 @@ scikit-image
 pandas
 pyyaml
 tifffile
+nibabel

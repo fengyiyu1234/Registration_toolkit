@@ -26,7 +26,7 @@ z-link 有没有把它并掉、共定位有没有把它贴到 soma 上、最后�
     python qc/view_detection_qc.py --snapshot    # 每个 site 一张 PNG，不开窗口
     python qc/view_detection_qc.py               # napari 逐个看、逐个判定
 
-    python qc/view_detection_qc.py configs/detection_qc.s8.yaml
+    python qc/view_detection_qc.py local_config/detection_qc_s12t.yaml
 
 **先跑 --funnel。** 它不读一张图，几分钟内回答"类别比例是在哪一级变的"，而逐个
 看图只能回答"这一个细胞对不对"。看图是用来解释漏斗里那个跳变的，不是用来发现它的。

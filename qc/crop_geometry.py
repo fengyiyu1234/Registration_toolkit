@@ -33,11 +33,32 @@ guesses: `TileGrid` follows visualize.py's `_get_tile_offset` exactly
 cut_crops.py runs `signal_check()` on every crop it writes, which catches an
 off-by-one or a flipped sign in x, y or z as a collapsed intensity ratio.
 """
+import json
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
+
+
+def load_tile_shifts(align_dir, key):
+    """{tile_name: (dx, dy, dz)} from brain_detector's 0_channel_alignment/.
+
+    Every `*_offsets.json` there holds one tile's per-channel residual shift
+    (aligned = raw + shift, computed by point_cloud_aligner.save_tile_offsets).
+    RFP is the reference channel and always (0, 0, 0); other channels' raw
+    tile pixels sit off the RFP-based stitching xml by this much, tile by
+    tile -- it is not one constant across the mosaic, so it cannot be folded
+    into a single `offset_px`.
+    """
+    align_dir = Path(align_dir)
+    shifts = {}
+    for path in align_dir.glob("*_offsets.json"):
+        tile_name = path.name[: -len("_offsets.json")]
+        entry = json.loads(path.read_text(encoding="utf-8")).get(key)
+        if entry:
+            shifts[tile_name] = (entry["dx"], entry["dy"], entry["dz"])
+    return shifts
 
 
 # ── Frame conversion ──────────────────────────────────────────────────────────
@@ -219,9 +240,10 @@ class TileGrid:
         local_z_0idx = global_z - 1 + tile_z0
     """
 
-    def __init__(self, channel_dir, xml_name=None, offset_px=(0, 0, 0)):
+    def __init__(self, channel_dir, xml_name=None, offset_px=(0, 0, 0), tile_shifts=None):
         self.channel_dir = Path(channel_dir)
         self.offset_px = np.asarray(offset_px, int)
+        self.tile_shifts = tile_shifts or {}
         self.xml_path = self._find_xml(xml_name)
         self.tiles = self._parse()
         self.tile_shape = None  # (H, W), filled lazily from the first tif read
@@ -255,12 +277,16 @@ class TileGrid:
             if not path.is_dir():
                 alt = self.channel_dir / leaf
                 path = alt if alt.is_dir() else path
+            dx, dy, dz = self.tile_shifts.get(leaf, (0, 0, 0))
             tiles.append({
                 "name": leaf,
                 "path": path,
-                "x0": int(stack.get("ABS_H", 0)) - x_min,
-                "y0": int(stack.get("ABS_V", 0)) - y_min,
-                "z0": z_start - int(stack.get("ABS_D", 0)),
+                # + shift: this tile's own raw pixels sit here in the
+                # RFP-based xml frame (aligned = raw + shift, so the tile's
+                # origin in the shared frame moves by the same amount).
+                "x0": int(stack.get("ABS_H", 0)) - x_min + dx,
+                "y0": int(stack.get("ABS_V", 0)) - y_min + dy,
+                "z0": z_start - int(stack.get("ABS_D", 0)) + dz,
             })
         return tiles
 
