@@ -67,6 +67,9 @@ already copies the tile grid, and each copy names its source. Start with
 `--funnel`: it reads no images and reports where in the chain a class
 proportion changes, plus the one reconciliation that must come out exact
 (`coloc_result.csv` -> `cell_registration.csv`).
+The viewer also accepts a cell ID or global pixel coordinates to locate the nearest
+registered cell, reporting its distance and the source TIFF paths and local tile
+coordinates for every overlapping tile in each channel (`source: tiles`).
 
 `configs/` and `.dialog_state/` live at the **repo root**, not inside `shared/`,
 so a tool in `tools/` and a main script in the root find the same ones. Anything

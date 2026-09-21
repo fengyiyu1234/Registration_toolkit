@@ -336,6 +336,37 @@ def test_snapshot_and_verdicts():
             raise AssertionError("a verdict outside this tool's vocabulary must raise")
 
 
+def test_interactive_cell_location():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = build_run(root)
+        build_detection(root, run)
+        from qc.view_detection_qc import DetectionSession
+        s = DetectionSession(det_cfg(root, n_sites=1), log=lambda *a: None)
+        original = s.sites.iloc[0]["cell_id"]
+        target = s.cells[~s.cells["cell_id"].isin(s.sites["cell_id"])].iloc[0]
+        k, distance = s.locate_cell(target["cell_id"])
+        assert k == 1 and distance == 0
+        assert s.sites.iloc[0]["cell_id"] == original
+        assert s.sites.iloc[k]["cell_id"] == target["cell_id"]
+        assert any(len(frame) for _, frame, *_ in s.site_boxes(k))
+        assert s.cut_site(k)["cells"]["is_target"].sum() == 1
+        assert s.locate_cell(target["cell_id"]) == (k, 0.0)
+        assert len(s.sites) == 2
+        xyz = target[["x", "y", "z"]].to_numpy(float) + [0.1, 0, 0]
+        found, distance = s.locate_cell(", ".join(map(str, xyz)))
+        assert found == k
+        assert np.isclose(distance, 0.1 * CELL_UM[0])
+        for bad in ("unknown:999", "nan 0 0", "1 2", "inf 2 3"):
+            try:
+                s.locate_cell(bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(bad)
+        assert len(s.sites) == 2
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:

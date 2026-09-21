@@ -95,6 +95,52 @@ class DetectionSession(rc.Session):
         if load_boxes and len(self.sites):
             self.load_boxes()
 
+    def locate_cell(self, query):
+        """Resolve an exact cell id or the nearest registered cell to global xyz.
+
+        Distance is measured in physical microns, not anisotropic pixels.
+        Searches all registered cells, independently of the region filter.
+        """
+        query = query.strip()
+        exact = self.cells.index[self.cells["cell_id"] == query]
+        distance = 0.0
+        if len(exact):
+            idx = int(exact[0])
+        else:
+            try:
+                xyz = np.asarray([float(x) for x in query.replace(",", " ").split()])
+            except ValueError:
+                raise ValueError("请输入完整 cell_id，或全局像素 x, y, z") from None
+            if xyz.shape != (3,) or not np.isfinite(xyz).all():
+                raise ValueError("请输入完整 cell_id，或三个有限的全局像素坐标")
+            distances = np.linalg.norm(self.phys - xyz * self.cell_voxel_um, axis=1)
+            idx = int(np.argmin(distances))
+            distance = float(distances[idx])
+        row = self.cells.iloc[idx].copy()
+        existing = np.flatnonzero(self.sites["cell_id"].to_numpy() == row["cell_id"])
+        if len(existing):
+            return int(existing[0]), distance
+        phys = self.phys[idx:idx + 1]
+        row["lookup_id"] = int(self.labels.lookup(phys)[0])
+        row["depth_um"] = float(rc.signed_depth_um(self.labels, self.region_ids, phys)[0])
+        row["lookup_agrees"] = row["lookup_id"] in self.region_ids
+        k = len(self.sites)
+        # Read only the new window; leave existing site caches intact.
+        extra = self.run.collect([(phys[0] - self.half_um, phys[0] + self.half_um)])
+        for key, frame in extra.items():
+            frame = frame.assign(window=k)
+            self.boxes[key] = pd.concat([self.boxes[key], frame], ignore_index=True) \
+                if key in self.boxes else frame
+        self.sites = pd.concat([self.sites, row.to_frame().T], ignore_index=True)
+        s4 = self.boxes.get(("s4", None))
+        self.groups = db.coloc_groups(s4["class"].unique()) if s4 is not None else []
+        return k, distance
+
+    def source_locations(self, k):
+        xyz = self.sites.iloc[k][["x", "y", "z"]].to_numpy(float)
+        return {ch: grid.locate(xyz)
+                for ch, grid in getattr(self.source, "grids", {}).items()}
+
     def windows(self):
         return [(self.site_phys(k) - self.half_um, self.site_phys(k) + self.half_um)
                 for k in range(len(self.sites))]
@@ -307,6 +353,22 @@ class Viewer:
             nav.addWidget(b)
         lay.addLayout(nav)
 
+        self.location = QLineEdit()
+        self.location.setPlaceholderText("cell_id 或全局像素 x, y, z（定位最近细胞）")
+        self.location.returnPressed.connect(self.locate)
+        lay.addWidget(self.location)
+        jump = QPushButton("定位细胞 / 回看原图")
+        jump.clicked.connect(self.locate)
+        lay.addWidget(jump)
+        self.location_info = QLabel()
+        self.location_info.setWordWrap(True)
+        lay.addWidget(self.location_info)
+        from qtpy.QtWidgets import QTextEdit
+        self.sources = QTextEdit()
+        self.sources.setReadOnly(True)
+        self.sources.setMaximumHeight(140)
+        lay.addWidget(self.sources)
+
         grid = QGridLayout()
         for i, (key, label) in enumerate(VERDICTS.items()):
             b = QPushButton(f"{i + 1}  {label}")
@@ -373,10 +435,21 @@ class Viewer:
             self.info.setText("没有选中任何细胞 —— 检查 regions / classes。")
             return
         k = int(np.clip(k, 0, n - 1))
+        self.location_info.clear()
         self.viewer.status = f"loading site {k} ..."
         self.k, self.cut = k, self._fetch(k)
         self._draw()
         self._prefetch(k + 1)
+
+    def locate(self):
+        from qtpy.QtWidgets import QMessageBox
+        try:
+            k, distance = self.s.locate_cell(self.location.text())
+            self.show(k)
+            self.location_info.setText(
+                f"定位到 {self.s.sites.iloc[k]['cell_id']}；距输入坐标 {distance:.2f} µm")
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self.viewer.window._qt_window, "定位失败", str(exc))
 
     def next(self):
         if self.k is not None:
@@ -388,6 +461,8 @@ class Viewer:
 
     def next_open(self):
         n = len(self.s.sites)
+        if self.k is None:
+            return
         for j in list(range(self.k + 1, n)) + list(range(0, self.k + 1)):
             if self.store.get(self.s.sites.iloc[j]["cell_id"])[0] is None:
                 self.show(j)
@@ -395,6 +470,8 @@ class Viewer:
         self.viewer.status = "全部 site 都判过了"
 
     def judge(self, verdict):
+        if self.k is None:
+            return
         self.store.set(self.s.sites.iloc[self.k], verdict, self.note.text().strip(),
                        self.s.source.kind)
         self.viewer.status = f"site {self.k}: {VERDICTS[verdict]}"
@@ -404,6 +481,8 @@ class Viewer:
             self._update_info()
 
     def screenshot(self):
+        if self.k is None:
+            return
         info = self.s.describe_site(self.k)
         path = self.s.out_dir / "screens" / f"site{self.k:03d}_{info['cell_id'].replace(':', '_')}.png"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,7 +542,7 @@ class Viewer:
         for name, m in (("other cells", ~cells["selected"].to_numpy()),
                         ("region cells", cells["selected"].to_numpy())):
             subc = cells[m]
-            colors, symbols = _point_style(subc) if len(subc) else (np.zeros((0, 4)), np.array([]))
+            colors, symbols = _point_style(subc) if len(subc) else ("gray", "disc")
             layer = v.add_points(local[m][:, ::-1], name=name, size=diam, symbol=symbols,
                                  face_color="transparent", border_color=colors,
                                  border_width=0.12, scale=scale, translate=translate,
@@ -520,6 +599,15 @@ class Viewer:
             f"signal ratio {ratio:.2f}{warn}<br>"
             f"判定：<b>{VERDICTS.get(verdict, '—') if verdict else '—'}</b>")
         self.tally.setText("已判：" + self.store.tally_text())
+        source_lines = []
+        try:
+            for channel, hits in self.s.source_locations(self.k).items():
+                source_lines.append(f"{channel}: {len(hits)} 个原始 tile 覆盖目标")
+                for hit in hits:
+                    source_lines.append(f"  {hit['path']}\n  tile 局部 xyz (0 起): {hit['local_xyz']}")
+        except (OSError, ValueError, RuntimeError) as exc:
+            source_lines.append(f"原始文件定位失败：{exc}")
+        self.sources.setPlainText("\n".join(source_lines) or "原始文件追溯需要 source: tiles")
 
     def _on_move(self, viewer, event):
         pos = np.asarray(viewer.cursor.position, float)

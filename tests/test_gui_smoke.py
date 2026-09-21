@@ -2228,6 +2228,38 @@ def test_reposition_names_follow_their_fragment(tmp, inputs):
     print("   OK")
 
 
+def test_detection_qc_location():
+    """Exercise the location field and redraw with an empty other-cells layer."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from test_detection_qc_smoke import build_run, build_detection, det_cfg
+    from qc.view_detection_qc import DetectionSession, Viewer
+    from qtpy.QtWidgets import QApplication
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = build_run(root)
+        build_detection(root, run)
+        session = DetectionSession(det_cfg(root, n_sites=1), log=lambda *a: None)
+        gui = Viewer(session)
+        try:
+            target = session.cells[~session.cells.cell_id.isin(session.sites.cell_id)].iloc[0]
+            gui.location.setText(target.cell_id)
+            gui.location.returnPressed.emit()
+            QApplication.processEvents()
+            assert gui.k == 1
+            assert target.cell_id in gui.location_info.text()
+            assert "source: tiles" in gui.sources.toPlainText()
+            assert gui.box_layers
+            gui.prev()
+            assert gui.k == 0
+            gui.next()
+            assert gui.k == 1
+        finally:
+            gui.pool.shutdown(wait=True)
+            gui.viewer.close()
+    print("   OK detection QC location and empty point layer")
+
+
 def main():
     print("=== tests/test_gui_smoke.py ===")
     if not _ensure_display():
@@ -2249,6 +2281,7 @@ def main():
         test_labels_mode_window(tmp, inputs)
         test_labels_mode_resume(tmp, inputs)
         test_labels_mode_resume_from(tmp, inputs)
+        test_detection_qc_location()
         test_single_sample_fill_switch()
         test_single_sample_density_heat_map()
         test_single_sample_fragments_moved_back(tmp, inputs)

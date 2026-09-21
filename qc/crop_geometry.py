@@ -300,6 +300,30 @@ class TileGrid:
             raise RuntimeError(f"{self.channel_dir} 下没有任何 tile 能读出图像。")
         return self.tile_shape
 
+    def locate(self, global_px):
+        """All source slices covering a global point, including overlapping tiles.
+
+        Local x/y remain fractional; the nearest acquired z plane is reported
+        with a zero-based index, using exactly the convention used by cut().
+        """
+        point = np.asarray(global_px, float)
+        if point.shape != (3,) or not np.isfinite(point).all():
+            raise ValueError("global_px 必须是三个有限数值 [x, y, z]")
+        x, y, z = point + self.offset_px
+        height, width = self.probe_tile_shape()
+        hits = []
+        for tile in self.tiles:
+            lx, ly = x - tile["x0"], y - tile["y0"]
+            if not (0 <= lx < width and 0 <= ly < height):
+                continue
+            files = self._slice_files(tile)
+            iz = int(np.floor(z - 1 + tile["z0"] + 0.5))
+            if 0 <= iz < len(files):
+                hits.append({"tile": tile["name"],
+                             "path": str(tile["path"] / files[iz]),
+                             "local_xyz": [float(lx), float(ly), iz]})
+        return hits
+
     def cut(self, origin_px, size_px, dtype=np.uint16):
         """Assemble the global box [origin, origin+size) into one (Z, Y, X) array.
 

@@ -107,6 +107,27 @@ def test_tile_grid_cut_matches_global_frame():
     print("  ok  TileGrid.cut reproduces the global frame on x, y and z")
 
 
+def test_source_slice_location():
+    import tifffile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_mosaic(root)
+        grid = geom.TileGrid(root)
+        hits = grid.locate([50, 50, 3])
+        assert len(hits) == 4  # overlap: retain every source, not an arbitrary tile
+        for hit in hits:
+            x, y, z = hit["local_xyz"]
+            assert tifffile.imread(hit["path"])[int(y), int(x)] == encode(50, 50, 3)
+            assert Path(hit["path"]).name == f"slice_{z:04d}.tif"
+        shifted = geom.TileGrid(root, offset_px=(2, 0, 1)).locate([50, 50, 3])
+        for hit in shifted:
+            x, y, _ = hit["local_xyz"]
+            assert tifffile.imread(hit["path"])[int(y), int(x)] == encode(52, 50, 4)
+        assert not grid.locate([-100, 0, 3])
+        assert not grid.locate([50, 50, 999])
+    print("  ok  source paths and local pixels reproduce global coordinates")
+
+
 def test_offset_px_shifts_the_read():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -254,6 +275,7 @@ def test_bootstrap_is_over_crops_not_cells():
 if __name__ == "__main__":
     print("qc/ smoke tests")
     test_tile_grid_cut_matches_global_frame()
+    test_source_slice_location()
     test_offset_px_shifts_the_read()
     test_frame_conversion_round_trip()
     test_pick_crop_sites_stays_inside_the_region()
