@@ -18,6 +18,7 @@ noticed if it is wrong -- a crop cut one slice off still looks like tissue.
 
 Needs numpy, tifffile, scipy.
 """
+import json
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -41,7 +42,7 @@ def encode(gx, gy, gz):
     return (np.asarray(gx) * 7 + np.asarray(gy) * 13 + np.asarray(gz) * 31) % 60000
 
 
-def build_mosaic(root):
+def build_mosaic(root, tile_shifts=None):
     """2x2 tiles with a 16 px overlap and two different ABS_D, written so that
     every pixel holds encode(global coords)."""
     import tifffile
@@ -53,6 +54,7 @@ def build_mosaic(root):
         {"name": "001_000", "H": 0, "V": step, "D": 5, "ROW": 1, "COL": 0},
         {"name": "001_001", "H": step, "V": step, "D": 0, "ROW": 1, "COL": 1},
     ]
+    tile_shifts = tile_shifts or {}
     z_start = max(s["D"] for s in stacks)
     x_min = min(s["H"] for s in stacks)
     y_min = min(s["V"] for s in stacks)
@@ -68,8 +70,9 @@ def build_mosaic(root):
         tile_dir = root / s["name"]
         tile_dir.mkdir(parents=True, exist_ok=True)
 
-        x0, y0 = s["H"] - x_min, s["V"] - y_min
-        z0 = z_start - s["D"]
+        dx, dy, dz = tile_shifts.get(s["name"], (0, 0, 0))
+        x0, y0 = s["H"] - x_min + dx, s["V"] - y_min + dy
+        z0 = z_start - s["D"] + dz
         gy, gx = np.meshgrid(np.arange(TILE) + y0, np.arange(TILE) + x0,
                              indexing="ij")
         for local_z in range(N_SLICES):
@@ -126,6 +129,31 @@ def test_source_slice_location():
         assert not grid.locate([-100, 0, 3])
         assert not grid.locate([50, 50, 999])
     print("  ok  source paths and local pixels reproduce global coordinates")
+
+
+def test_per_tile_alignment_shifts_are_used_by_cut_and_locate():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        shifts = {"000_000": (2, -1, 1)}
+        build_mosaic(root, shifts)
+        align = root / "alignment"
+        align.mkdir()
+        (align / "000_000_offsets.json").write_text(json.dumps({
+            "GFP": {"dx": 2, "dy": -1, "dz": 1}}))
+        loaded = geom.load_tile_shifts(align, "GFP")
+        assert loaded["000_000"] == (2, -1, 1)
+        grid = geom.TileGrid(root, tile_shifts=loaded)
+        import tifffile
+        hits = [h for h in grid.locate([50, 50, 3]) if h["tile"] == "000_000"]
+        assert len(hits) == 1
+        hit = hits[0]
+        x, y, z = hit["local_xyz"]
+        assert tifffile.imread(hit["path"])[int(y), int(x)] == encode(50, 50, 3)
+        cut = grid.cut((48, 48, 2), (8, 8, 3))
+        gz, gy, gx = np.meshgrid(np.arange(3) + 2, np.arange(8) + 48,
+                                 np.arange(8) + 48, indexing="ij")
+        assert np.array_equal(cut, encode(gx, gy, gz).astype(np.uint16))
+    print("  ok  per-tile alignment shifts agree for cut and locate")
 
 
 def test_offset_px_shifts_the_read():
@@ -276,6 +304,7 @@ if __name__ == "__main__":
     print("qc/ smoke tests")
     test_tile_grid_cut_matches_global_frame()
     test_source_slice_location()
+    test_per_tile_alignment_shifts_are_used_by_cut_and_locate()
     test_offset_px_shifts_the_read()
     test_frame_conversion_round_trip()
     test_pick_crop_sites_stays_inside_the_region()

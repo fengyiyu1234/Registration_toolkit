@@ -367,6 +367,48 @@ def test_interactive_cell_location():
         assert len(s.sites) == 2
 
 
+def test_direct_coordinate_target_keeps_requested_center():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = build_run(root)
+        build_detection(root, run)
+        from qc.view_detection_qc import DetectionSession
+        s = DetectionSession(det_cfg(root, n_sites=1), log=lambda *a: None)
+        xyz = np.array([12.5, 23.5, 3.0])
+        k, distance = s.locate_coordinate(xyz)
+        row = s.sites.iloc[k]
+        assert row["target_kind"] == "coordinate"
+        assert np.allclose(row[["x", "y", "z"]].to_numpy(float), xyz)
+        cut = s.cut_site(k)
+        assert np.allclose(cut["center"], xyz * CELL_UM)
+        assert distance >= 0
+        assert s.locate_coordinate(xyz)[0] == k
+    print("ok  direct coordinate target keeps its own crop center")
+
+
+def test_three_dimension_verdicts_share_legacy_csv():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = build_run(root)
+        from qc import region_cells as rc
+        s = rc.Session(make_cfg(root, n_sites=1), log=lambda *a: None)
+        path = root / "out" / "verdicts.csv"
+        store = rc.VerdictStore(path, s.run_dir)
+        row = s.sites.iloc[0]
+        store.set_dimensions(row, detection_verdict="correct",
+                             colocalization_verdict="over_merge",
+                             registration_verdict="boundary_uncertain",
+                             note="three axes", source="tiles")
+        again = rc.VerdictStore(path, s.run_dir)
+        record = again.get_record(row["cell_id"])
+        assert record["detection_verdict"] == "correct"
+        assert record["colocalization_verdict"] == "over_merge"
+        assert record["registration_verdict"] == "boundary_uncertain"
+        assert again.get(row["cell_id"])[1] == "three axes"
+        assert len(again.df) == 1
+    print("ok  three-dimensional verdicts share legacy CSV")
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:

@@ -1,0 +1,208 @@
+# Codex-readable progress log.
+# This file is the source of truth for the QC visualization integration work.
+schema_version: 1
+project: registration_toolkit
+topic: qc_visualization
+last_updated: "2026-09-21"
+owner: codex
+tracking:
+  goal_thread_id: "01a0c4cd-8ba4-7560-9a65-82d81e17a646"
+  status: in_progress
+  current_phase: audit_complete_implementation_pending
+  next_review: "Implement fixes, then rerun headless and GUI QC validation."
+
+scope:
+  plan: qc/QC_VISUALIZATION_PLAN.md
+  primary_modules:
+    - qc/qc_visualization.py
+    - qc/coordinate_contract.py
+    - qc/crop_geometry.py
+    - qc/region_cells.py
+    - qc/detection_boxes.py
+    - qc/view_detection_qc.py
+    - qc/view_region_cells.py
+    - qc/cut_crops.py
+    - qc/annotate_crop.py
+    - qc/score_crops.py
+  explicitly_out_of_scope:
+    - "盲法 crop 标注流程的输出不能与非盲 detection/region QC 混用。"
+    - "不修改 brain detector 或 registration pipeline 的结果文件。"
+
+baseline:
+  repository_head: "e996710"
+  remote_head: "origin/main"
+  working_tree: clean_at_audit_time
+  environment: "conda env antsreg"
+  completed_checks:
+    - command: "conda run -n antsreg python -m py_compile qc/*.py"
+      result: passed
+    - command: "conda run -n antsreg python tests/test_detection_qc_smoke.py"
+      result: passed
+      details: "9 passed"
+    - command: "conda run -n antsreg python tests/test_region_qc_smoke.py"
+      result: passed
+      details: "6 passed"
+    - command: "conda run -n antsreg python tests/test_qc_crops_smoke.py"
+      result: passed
+      details: "all passed"
+    - command: "conda run -n antsreg python tests/test_gui_smoke.py"
+      result: failed_outside_qc_scope
+      details: "paint_mask UI assertion: controls.minimumHeight() == 68, expected <= 48"
+  audit_result: "No Git merge conflict. Headless QC paths pass. Logical integration gaps remain."
+
+issues:
+  - id: QC-COORD-001
+    title: "coordinate_contract 与真实标签查询路径重复且未接入"
+    priority: high
+    status: open
+    affected_files:
+      - path: qc/coordinate_contract.py
+        lines: "26-43"
+        role: "支持 origin/spacing/direction 的新坐标 API"
+      - path: qc/crop_geometry.py
+        lines: "66-75"
+        role: "实际 crop 流程仍使用旧的 origin-zero 标量换算"
+      - path: qc/region_cells.py
+        lines: "192-249"
+        role: "LabelVolume.index_of/lookup/box/resample_to 忽略 direction"
+    conflict: "计划要求非零 origin、各向异性 spacing 和非默认 direction；实际标签查询只处理 origin 与 spacing。"
+    evidence:
+      - "coordinate_contract.py 的 direction 参数没有被 LabelVolume 使用。"
+      - "crop_geometry.global_px_to_label_voxel 仍是 px * voxel / spacing。"
+      - "现有 scalar smoke test 通过，但没有 direction 测试。"
+    next_actions:
+      - "选择一个唯一坐标实现，并让 crop_geometry 与 LabelVolume 复用它。"
+      - "从 NIfTI affine 提取完整 direction/origin，明确 LPS/RAS 约定。"
+      - "增加非零 origin、各向异性 spacing、非默认 direction 的 lookup/box/resample 测试。"
+    acceptance:
+      - "任意坐标经过 global -> physical -> label -> physical 往返误差在明确容差内。"
+      - "LabelVolume.lookup 与 LabelVolume.box 在非默认 direction 下返回正确标签。"
+
+  - id: QC-COORD-002
+    title: "任意全局坐标不能真正裁图或进入 Napari 证据链"
+    priority: high
+    status: open
+    affected_files:
+      - path: qc/qc_visualization.py
+        lines: "39-56"
+        role: "只解析坐标、最近细胞、标签和边界"
+      - path: qc/qc_visualization.py
+        lines: "103-119"
+        role: "CLI 只打印 JSON；source_locations 仅对 --cell-id 执行"
+      - path: qc/view_detection_qc.py
+        lines: "356-369"
+        role: "GUI 输入框将坐标描述为定位最近细胞"
+      - path: qc/view_detection_qc.py
+        lines: "444-450"
+        role: "GUI locate_cell 将任意坐标吸附到最近 cell"
+    conflict: "计划要求任意坐标保持为查看中心，并直接裁图；当前实现仍以最近细胞为中心，qc_visualization.py 也没有图像查看器。"
+    evidence:
+      - "--xyz 输出没有原始 tile/TIFF 候选。"
+      - "--xyz 不创建 direct coordinate target，也不调用 source.cut。"
+      - "现有 GUI 的 cell_id/坐标定位测试只验证最近细胞行为。"
+    next_actions:
+      - "为 DetectionSession 增加无 cell_id 的 coordinate target 和 direct cut 接口。"
+      - "让 GUI 同时支持 cell target 与 coordinate target，坐标中心不可替换。"
+      - "对任意坐标显示所有覆盖 tile，并允许选择默认/其他来源。"
+      - "补充空点、无覆盖 tile、重叠 tile 和 tile 边缘测试。"
+    acceptance:
+      - "输入没有最终细胞的坐标仍能打开原始局部图像。"
+      - "最近细胞只作为附加信息，不改变裁图中心。"
+      - "局部图像可以叠加各阶段检测框、最终细胞和标签边界。"
+
+  - id: QC-VERDICT-001
+    title: "三维判定 JSON 与现有 verdicts.csv 并行，格式未统一"
+    priority: high
+    status: open
+    affected_files:
+      - path: qc/region_cells.py
+        lines: "746-795"
+        role: "现有 VerdictStore，CSV，单 verdict 字段"
+      - path: qc/view_detection_qc.py
+        lines: "333-334"
+        role: "detection GUI 写 verdicts.csv"
+      - path: qc/qc_visualization.py
+        lines: "77-100"
+        role: "新增 append_verdict 写 schema-versioned JSON"
+    conflict: "计划要求兼容旧版 verdicts.csv 并保存 detection/colocalization/registration 三个判定维度；当前存在两个互不读取的存储格式。"
+    evidence:
+      - "append_verdict 没有被 GUI 或任何读取路径调用。"
+      - "append_verdict 每次追加而非按 target 更新。"
+      - "append_verdict 将 table_region_id 固定为 null。"
+      - "VerdictStore 只保存一个 verdict。"
+    next_actions:
+      - "确定 CSV 为主格式，向后兼容旧列，并添加 schema_version 和三维判定列；或明确 JSON 为唯一格式并改造所有读取器。"
+      - "实现 coordinate target 的稳定键，避免 cell_id 为空时覆盖错误记录。"
+      - "让 GUI 保存 source_tile/source_tiff、坐标和三维判定。"
+      - "增加旧 CSV 读取、重复 target 更新、崩溃原子写入测试。"
+    acceptance:
+      - "旧版 verdicts.csv 可继续读取。"
+      - "同一 target 重判后只有一条有效记录。"
+      - "cell target 与 coordinate target 均能保存三维判定和备注。"
+
+  - id: QC-TILE-001
+    title: "tile_shifts 已贯通主要路径，但缺少真实合成测试和配置说明"
+    priority: medium
+    status: open
+    affected_files:
+      - path: qc/crop_geometry.py
+        lines: "44-60"
+        role: "读取 per-tile alignment JSON"
+      - path: qc/crop_geometry.py
+        lines: "243-289"
+        role: "将 tile shift 合并进 tile origin"
+      - path: qc/cut_crops.py
+        lines: "158-166"
+        role: "盲 crop 读取 alignment"
+      - path: qc/region_cells.py
+        lines: "328-336"
+        role: "region/detection QC 读取 alignment"
+    conflict: "当前 offset_px 测试通过，但没有验证 per-tile dx/dy/dz，且 example config/README 对 align_dir/align_key 说明不完整。"
+    evidence:
+      - "现有测试覆盖 offset_px，不覆盖 load_tile_shifts。"
+      - "shift 值没有显式校验为整数，而 TileGrid.cut 使用数组切片。"
+      - "远端更新后 headless QC 仍通过，但这不能证明真实 alignment JSON 坐标正确。"
+    next_actions:
+      - "用合成 alignment JSON 增加 cut/locate/detection s1 fallback 测试。"
+      - "明确 shift 的单位、符号、整数要求，并在加载时验证。"
+      - "同步更新 qc_crops、region_qc、detection_qc 配置模板。"
+    acceptance:
+      - "同一合成全局点在 shift 前后能精确还原正确原始像素。"
+      - "所有三个使用方对同一 tile shift 得到一致结果。"
+
+  - id: QC-GUI-001
+    title: "GUI smoke 的 paint_mask 尺寸断言失败"
+    priority: low
+    status: separate_regression
+    affected_files:
+      - path: tests/test_gui_smoke.py
+        lines: "1239-1244"
+      - path: paint_mask.py
+        lines: "803-870"
+    conflict: "不是 qc 逻辑冲突；远端当前 GUI smoke 在 paint_mask 控件最小高度 68 > 48 处失败。"
+    evidence:
+      - "detection QC location smoke 在同一测试进程中已通过。"
+      - "失败发生在 paint_mask 的 panel height assertion。"
+    next_actions:
+      - "单独修复或重新校准 paint_mask/napari 版本相关的最小高度。"
+      - "修复后重跑 tests/test_gui_smoke.py。"
+    acceptance:
+      - "完整 GUI smoke test 通过，或测试明确适配当前 napari 版本。"
+
+updates:
+  - date: "2026-09-21"
+    type: audit
+    summary: "远端拉取后完成 QC 全脚本审计；无 Git conflict。"
+    validation: "21 headless QC checks passed; CLI help and py_compile passed."
+    decision: "保留现有远端 tile_shifts 改动，先解决坐标、任意坐标裁图和判定格式三项高优先级问题。"
+  - date: "2026-09-21"
+    type: discovered
+    summary: "发现 GUI smoke 的独立 paint_mask 最小高度回归。"
+    validation: "tests/test_gui_smoke.py failed at controls.minimumHeight() == 68, expected <= 48."
+
+definition_of_done:
+  - "QC-COORD-001、QC-COORD-002、QC-VERDICT-001 状态为 resolved。"
+  - "QC-TILE-001 有合成 shift 测试并更新配置说明。"
+  - "detection、region、crop headless 测试全部通过。"
+  - "GUI smoke 的 QC 相关部分通过；paint_mask 独立回归已修复或明确记录为外部阻塞。"
+  - "本文件 updates 追加最终实现、测试命令和结果。"

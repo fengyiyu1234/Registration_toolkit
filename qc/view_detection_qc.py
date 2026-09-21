@@ -67,6 +67,22 @@ VERDICTS = {
     "sox9_wrong":  "Sox9 判错",
     "not_cell":    "不是细胞 / 看不清",
 }
+DIMENSION_OPTIONS = {
+    "detection": [("", "未判"), ("correct", "correct"),
+                  ("false_positive", "false_positive"),
+                  ("missed_nearby_cell", "missed_nearby_cell"),
+                  ("uncertain", "uncertain")],
+    "colocalization": [("", "未判"), ("correct", "correct"),
+                       ("over_merge", "over_merge"),
+                       ("under_merge", "under_merge"),
+                       ("colocalization_wrong", "colocalization_wrong"),
+                       ("channel_alignment_problem", "channel_alignment_problem")],
+    "registration": [("", "未判"), ("correct", "correct"),
+                     ("wrong_region", "wrong_region"),
+                     ("boundary_uncertain", "boundary_uncertain"),
+                     ("registration_offset", "registration_offset"),
+                     ("reposition_mismatch", "reposition_mismatch")],
+}
 
 STAGE_VISIBLE = {"s1": False, "s2": False, "s3": True, "s4": True}
 
@@ -131,6 +147,50 @@ class DetectionSession(rc.Session):
             frame = frame.assign(window=k)
             self.boxes[key] = pd.concat([self.boxes[key], frame], ignore_index=True) \
                 if key in self.boxes else frame
+        self.sites = pd.concat([self.sites, row.to_frame().T], ignore_index=True)
+        s4 = self.boxes.get(("s4", None))
+        self.groups = db.coloc_groups(s4["class"].unique()) if s4 is not None else []
+        return k, distance
+
+    def locate_coordinate(self, global_xyz):
+        """Add a direct coordinate target without replacing it by a cell.
+
+        The nearest registered cell is retained only as context.  The new site
+        row's x/y/z are always the requested global pixels, so cut_site(),
+        detection-box collection and the white crosshair share that centre.
+        """
+        xyz = np.asarray(global_xyz, dtype=float)
+        if xyz.shape != (3,) or not np.isfinite(xyz).all():
+            raise ValueError("请输入三个有限的全局像素坐标 x, y, z")
+        phys = xyz * self.cell_voxel_um
+        distances = np.linalg.norm(self.phys - phys, axis=1) if len(self.phys) else np.array([])
+        nearest = int(np.argmin(distances)) if len(distances) else None
+        distance = float(distances[nearest]) if nearest is not None else float("nan")
+        key = "coordinate:" + ",".join(f"{v:.9g}" for v in xyz)
+        existing = np.flatnonzero(self.sites["cell_id"].to_numpy() == key)
+        if len(existing):
+            return int(existing[0]), distance
+        lookup_id = int(self.labels.lookup(phys)[0])
+        depth = float(rc.signed_depth_um(self.labels, self.region_ids, phys[None])[0])
+        if nearest is None:
+            row = pd.Series({"x": xyz[0], "y": xyz[1], "z": xyz[2]})
+        else:
+            row = self.cells.iloc[nearest].copy()
+            row[["x", "y", "z"]] = xyz
+        row["cell_id"] = key
+        row["class_name"] = "coordinate_target"
+        row["region_id"] = lookup_id
+        row["lookup_id"] = lookup_id
+        row["depth_um"] = depth
+        row["lookup_agrees"] = lookup_id in self.region_ids
+        row["target_kind"] = "coordinate"
+        row["nearest_cell_id"] = "" if nearest is None else self.cells.iloc[nearest]["cell_id"]
+        k = len(self.sites)
+        extra = self.run.collect([(phys - self.half_um, phys + self.half_um)])
+        for key_name, frame in extra.items():
+            frame = frame.assign(window=k)
+            self.boxes[key_name] = (pd.concat([self.boxes[key_name], frame], ignore_index=True)
+                                    if key_name in self.boxes else frame)
         self.sites = pd.concat([self.sites, row.to_frame().T], ignore_index=True)
         s4 = self.boxes.get(("s4", None))
         self.groups = db.coloc_groups(s4["class"].unique()) if s4 is not None else []
@@ -326,8 +386,8 @@ class Viewer:
     def __init__(self, session, start=0, extra_lines=()):
         import napari
         from concurrent.futures import ThreadPoolExecutor
-        from qtpy.QtWidgets import (QCheckBox, QGridLayout, QHBoxLayout, QLabel,
-                                    QLineEdit, QPushButton, QVBoxLayout, QWidget)
+        from qtpy.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout,
+                                    QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget)
 
         self.s = session
         self.store = rc.VerdictStore(session.out_dir / "verdicts.csv", session.run_dir,
@@ -354,7 +414,7 @@ class Viewer:
         lay.addLayout(nav)
 
         self.location = QLineEdit()
-        self.location.setPlaceholderText("cell_id 或全局像素 x, y, z（定位最近细胞）")
+        self.location.setPlaceholderText("cell_id 或全局像素 x, y, z（坐标保持为查看中心）")
         self.location.returnPressed.connect(self.locate)
         lay.addWidget(self.location)
         jump = QPushButton("定位细胞 / 回看原图")
@@ -378,6 +438,14 @@ class Viewer:
         self.note = QLineEdit()
         self.note.setPlaceholderText("备注（随判定一起保存）")
         lay.addWidget(self.note)
+
+        self.dimension_boxes = {}
+        for dimension, options in DIMENSION_OPTIONS.items():
+            combo = QComboBox()
+            combo.addItems([label for _, label in options])
+            combo.setToolTip(f"{dimension} verdict")
+            lay.addWidget(combo)
+            self.dimension_boxes[dimension] = (combo, options)
 
         self.stage_boxes = {}
         for stage in ("s1", "s2", "s3", "s4"):
@@ -443,11 +511,25 @@ class Viewer:
 
     def locate(self):
         from qtpy.QtWidgets import QMessageBox
+        query = self.location.text().strip()
         try:
-            k, distance = self.s.locate_cell(self.location.text())
+            if query in set(self.s.cells["cell_id"]):
+                k, distance = self.s.locate_cell(query)
+                message = f"定位到细胞 {self.s.sites.iloc[k]['cell_id']}；距离 {distance:.2f} µm"
+            else:
+                try:
+                    xyz = np.asarray([float(x) for x in query.replace(",", " ").split()])
+                except ValueError:
+                    xyz = np.asarray([], dtype=float)
+                if xyz.shape != (3,) or not np.isfinite(xyz).all():
+                    raise ValueError("请输入完整 cell_id，或全局像素 x, y, z")
+                k, distance = self.s.locate_coordinate(xyz)
+                row = self.s.sites.iloc[k]
+                nearest = row.get("nearest_cell_id", "")
+                message = (f"保持输入坐标 ({xyz[0]:.9g}, {xyz[1]:.9g}, {xyz[2]:.9g}) 为中心；"
+                           f"最近细胞 {nearest or '无'}，距离 {distance:.2f} µm")
             self.show(k)
-            self.location_info.setText(
-                f"定位到 {self.s.sites.iloc[k]['cell_id']}；距输入坐标 {distance:.2f} µm")
+            self.location_info.setText(message)
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self.viewer.window._qt_window, "定位失败", str(exc))
 
@@ -472,8 +554,25 @@ class Viewer:
     def judge(self, verdict):
         if self.k is None:
             return
-        self.store.set(self.s.sites.iloc[self.k], verdict, self.note.text().strip(),
-                       self.s.source.kind)
+        row = self.s.sites.iloc[self.k]
+        # Legacy numbered buttons remain useful; they also populate the new
+        # independent dimensions when the user has not chosen them manually.
+        defaults = {
+            "ok": ("correct", "correct", "correct"),
+            "over_merge": ("correct", "over_merge", "correct"),
+            "under_merge": ("correct", "under_merge", "correct"),
+            "sox9_wrong": ("correct", "colocalization_wrong", "correct"),
+            "not_cell": ("false_positive", "", ""),
+        }[verdict]
+        chosen = []
+        for (combo, options), fallback in zip(self.dimension_boxes.values(), defaults):
+            key = options[combo.currentIndex()][0]
+            chosen.append(key or fallback)
+        self.store.set_dimensions(
+            row, detection_verdict=chosen[0], colocalization_verdict=chosen[1],
+            registration_verdict=chosen[2], legacy_verdict=verdict,
+            note=self.note.text().strip(),
+            source=self.s.source.kind, source_tile=row.get("tile_name", ""))
         self.viewer.status = f"site {self.k}: {VERDICTS[verdict]}"
         if self.k < len(self.s.sites) - 1:
             self.next()
@@ -505,14 +604,12 @@ class Viewer:
                         blending="additive", contrast_limits=_contrast(arr))
 
         lab = cut["labels"].transpose(2, 1, 0)
-        lab_scale = tuple(self.s.labels.spacing[::-1])
-        lab_translate = tuple(cut["labels_origin"][::-1])
+        lab_affine = self.s.labels.napari_affine(cut["labels_origin"])
         all_lab = v.add_labels(lab.astype(np.int32), name="all regions",
-                               scale=lab_scale, translate=lab_translate, opacity=0.35)
+                               affine=lab_affine, opacity=0.35)
         all_lab.contour = 1
         sel = v.add_labels(np.isin(lab, list(self.s.region_ids)).astype(np.uint8),
-                           name="selected region", scale=lab_scale, translate=lab_translate,
-                           opacity=0.9,
+                           name="selected region", affine=lab_affine, opacity=0.9,
                            colormap=DirectLabelColormap(
                                color_dict={1: "yellow", None: "transparent"}))
         sel.contour = 2
@@ -578,7 +675,12 @@ class Viewer:
     def _update_info(self):
         d = self.s.describe_site(self.k)
         verdict, note = self.store.get(d["cell_id"])
+        record = self.store.get_record(d["cell_id"]) or {}
         self.note.setText(note)
+        for dimension, (combo, options) in self.dimension_boxes.items():
+            value = record.get(f"{dimension}_verdict", "")
+            keys = [key for key, _ in options]
+            combo.setCurrentIndex(keys.index(value) if value in keys else 0)
         ratio = self.cut["signal_ratio"]
         floor = float(self.s.cfg.get("signal_warn_below",
                                      1.5 if self.s.source.kind == "tiles" else 1.2))

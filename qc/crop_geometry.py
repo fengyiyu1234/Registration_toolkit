@@ -63,16 +63,24 @@ def load_tile_shifts(align_dir, key):
 
 # ── Frame conversion ──────────────────────────────────────────────────────────
 
-def global_px_to_label_voxel(px_xyz, cell_voxel_um, label_spacing_um):
-    """Global stitched pixel (x, y, z) -> float index into the labels volume."""
-    px = np.asarray(px_xyz, dtype=float)
-    return px * np.asarray(cell_voxel_um, float) / np.asarray(label_spacing_um, float)
+def global_px_to_label_voxel(px_xyz, cell_voxel_um, label_spacing_um,
+                             label_origin_um=None, label_direction=None):
+    """Global stitched pixel -> label voxel, honoring label metadata."""
+    from qc.coordinate_contract import global_pixel_to_physical, physical_to_label_voxel
+    origin = np.zeros(3) if label_origin_um is None else label_origin_um
+    return physical_to_label_voxel(
+        global_pixel_to_physical(px_xyz, cell_voxel_um), origin,
+        label_spacing_um, label_direction)
 
 
-def label_voxel_to_global_px(vox_xyz, cell_voxel_um, label_spacing_um):
-    """Labels-volume index (x, y, z) -> float global stitched pixel."""
-    vox = np.asarray(vox_xyz, dtype=float)
-    return vox * np.asarray(label_spacing_um, float) / np.asarray(cell_voxel_um, float)
+def label_voxel_to_global_px(vox_xyz, cell_voxel_um, label_spacing_um,
+                             label_origin_um=None, label_direction=None):
+    """Label voxel -> global stitched pixel, honoring label metadata."""
+    from qc.coordinate_contract import label_voxel_to_physical, physical_to_global_pixel
+    origin = np.zeros(3) if label_origin_um is None else label_origin_um
+    return physical_to_global_pixel(
+        label_voxel_to_physical(vox_xyz, origin, label_spacing_um, label_direction),
+        cell_voxel_um)
 
 
 # ── Region selection ──────────────────────────────────────────────────────────

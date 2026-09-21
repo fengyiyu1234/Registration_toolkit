@@ -10,8 +10,8 @@ import numpy as np
 
 def _xyz(value, name):
     out = np.asarray(value, dtype=float)
-    if out.shape != (3,) or not np.isfinite(out).all():
-        raise ValueError(f"{name} must be three finite values in (x, y, z) order")
+    if out.ndim == 0 or out.shape[-1] != 3 or not np.isfinite(out).all():
+        raise ValueError(f"{name} must end in three finite values in (x, y, z) order")
     return out
 
 
@@ -30,7 +30,7 @@ def physical_to_label_voxel(physical_um, origin_um, spacing_um, direction=None):
     d = np.eye(3) if direction is None else np.asarray(direction, dtype=float)
     if d.shape != (3, 3) or not np.isfinite(d).all():
         raise ValueError("direction must be a finite 3x3 matrix")
-    return (np.linalg.inv(d) @ (p - origin)) / spacing
+    return ((p - origin) @ np.linalg.inv(d).T) / spacing
 
 
 def label_voxel_to_physical(voxel_xyz, origin_um, spacing_um, direction=None):
@@ -40,7 +40,7 @@ def label_voxel_to_physical(voxel_xyz, origin_um, spacing_um, direction=None):
     d = np.eye(3) if direction is None else np.asarray(direction, dtype=float)
     if d.shape != (3, 3) or not np.isfinite(d).all():
         raise ValueError("direction must be a finite 3x3 matrix")
-    return origin + d @ (v * spacing)
+    return origin + (v * spacing) @ d.T
 
 
 def napari_xyz_to_zyx(xyz):

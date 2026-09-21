@@ -146,6 +146,33 @@ def test_wrong_cell_voxel_is_refused():
             raise AssertionError("a voxel size that does not reproduce columns 3-5 must raise")
 
 
+def test_label_volume_honors_origin_spacing_and_direction():
+    import nibabel as nib
+    from qc.region_cells import LabelVolume
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "rotated_labels.nii.gz"
+        data = np.zeros((5, 6, 7), dtype=np.uint32)
+        data[2, 3, 4] = 123
+        spacing = np.array([2.0, 3.0, 4.0])
+        direction = np.array([[0.0, -1.0, 0.0],
+                              [1.0, 0.0, 0.0],
+                              [0.0, 0.0, 1.0]])
+        origin = np.array([10.0, 20.0, 30.0])
+        lps_affine = np.eye(4)
+        lps_affine[:3, :3] = direction * spacing[None, :]
+        lps_affine[:3, 3] = origin
+        ras_to_lps = np.diag([-1.0, -1.0, 1.0, 1.0])
+        nib.save(nib.Nifti1Image(data, ras_to_lps @ lps_affine), str(path))
+        labels = LabelVolume(path)
+        phys = origin + direction @ (np.array([2.0, 3.0, 4.0]) * spacing)
+        assert labels.lookup(phys)[0] == 123
+        assert np.allclose(labels.index_float_of(phys), [2, 3, 4])
+        assert np.allclose(labels.origin, origin)
+        assert np.allclose(labels.spacing, spacing)
+        assert np.allclose(labels.direction, direction)
+    print("  ok  labels honor nonzero origin, anisotropic spacing and direction")
+
+
 def test_volume_cut_matches_frame():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

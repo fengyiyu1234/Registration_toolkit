@@ -334,15 +334,14 @@ class Viewer:
                         blending="additive", contrast_limits=_contrast(arr))
 
         lab = cut["labels"].transpose(2, 1, 0)                     # xyz -> zyx
-        lab_scale = tuple(self.s.labels.spacing[::-1])
-        lab_translate = tuple(cut["labels_origin"][::-1])
+        lab_affine = self.s.labels.napari_affine(cut["labels_origin"])
         self.lab_layer = v.add_labels(lab.astype(np.int32), name="all regions",
-                                      scale=lab_scale, translate=lab_translate,
+                                      affine=lab_affine,
                                       opacity=0.35, visible=True)
         self.lab_layer.contour = 1
         sel = np.isin(lab, list(self.s.region_ids)).astype(np.uint8)
-        sel_layer = v.add_labels(sel, name="selected region", scale=lab_scale,
-                                 translate=lab_translate, opacity=0.9,
+        sel_layer = v.add_labels(sel, name="selected region", affine=lab_affine,
+                                 opacity=0.9,
                                  colormap=DirectLabelColormap(
                                      color_dict={1: "yellow", None: "transparent"}))
         sel_layer.contour = 2

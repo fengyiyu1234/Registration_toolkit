@@ -113,9 +113,19 @@ def main(argv=None):
     session = DetectionSession(cfg, load_boxes=False)
     target = trace_cell(session, args.cell_id) if args.cell_id else resolve_target(session, args.xyz)
     result = asdict(target)
-    if args.cell_id and getattr(session.source, "grids", {}):
-        result["source_locations"] = session.source_locations(
-            session.locate_cell(args.cell_id)[0])
+    grids = getattr(session.source, "grids", {})
+    if grids:
+        # This is deliberately independent of cell lookup: --xyz can point at
+        # an empty region and still returns every overlapping source tile.
+        result["source_locations"] = {
+            channel: grid.locate(target.global_xyz)
+            for channel, grid in grids.items()
+        }
+    half = np.asarray(session.half_um, dtype=float)
+    result["view_window_physical_um"] = {
+        "lo": (np.asarray(target.physical_um) - half).tolist(),
+        "hi": (np.asarray(target.physical_um) + half).tolist(),
+    }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

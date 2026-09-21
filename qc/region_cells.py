@@ -190,12 +190,11 @@ def select_cells(cells, ids, class_patterns=None):
 # ── Label volume ──────────────────────────────────────────────────────────────
 
 class LabelVolume:
-    """<run>/*_labels_in_sample.nii.gz in the pipeline's physical frame.
+    """Sample-space labels with explicit physical origin and direction.
 
-    nibabel hands back an RAS affine for a file ANTs wrote in LPS, so the
-    origin is taken off the affine with the first two signs flipped back.  For
-    every run so far it is 0 anyway -- pipeline.py keeps the label volume on
-    the uncropped fine grid on purpose.
+    NIfTI files written by ANTs are exposed by nibabel in RAS.  The pipeline
+    coordinate contract is LPS-like, so the affine is converted once here and
+    all later lookup/resampling uses the resulting physical metadata.
     """
 
     def __init__(self, path):
@@ -203,13 +202,32 @@ class LabelVolume:
         img = nib.load(str(path))
         self.path = Path(path)
         self.data = np.asarray(img.dataobj)
-        self.spacing = np.array(img.header.get_zooms()[:3], float)
-        t = img.affine[:3, 3]
-        self.origin = np.array([-t[0], -t[1], t[2]], float)
         self.shape = np.array(self.data.shape[:3])
+        ras_to_lps = np.diag([-1.0, -1.0, 1.0, 1.0])
+        lps_affine = ras_to_lps @ np.asarray(img.affine, dtype=float)
+        matrix = lps_affine[:3, :3]
+        self.spacing = np.linalg.norm(matrix, axis=0)
+        if np.any(self.spacing <= 0) or not np.isfinite(self.spacing).all():
+            raise ValueError(f"{path} 的标签 affine 没有有效 spacing")
+        self.direction = matrix / self.spacing[None, :]
+        self.origin = lps_affine[:3, 3]
+
+    def index_float_of(self, phys):
+        from qc.coordinate_contract import physical_to_label_voxel
+        return physical_to_label_voxel(
+            np.asarray(phys, dtype=float), self.origin, self.spacing, self.direction)
 
     def index_of(self, phys):
-        return np.rint((np.asarray(phys, float) - self.origin) / self.spacing).astype(np.int64)
+        return np.rint(self.index_float_of(phys)).astype(np.int64)
+
+    def napari_affine(self, origin_phys):
+        """Affine from label array axes (z, y, x) to physical (z, y, x)."""
+        flip = np.eye(3)[::-1]
+        matrix = flip @ self.direction @ np.diag(self.spacing) @ flip
+        affine = np.eye(4)
+        affine[:3, :3] = matrix
+        affine[:3, 3] = np.asarray(origin_phys, dtype=float)[::-1]
+        return affine
 
     def lookup(self, phys):
         """Label under each physical point (N, 3); 0 outside the volume."""
@@ -220,34 +238,34 @@ class LabelVolume:
         return out
 
     def box(self, lo_phys, hi_phys):
-        """Sub-volume covering [lo, hi] -> (array xyz, origin_phys xyz).
-
-        Zero-padded where the box leaves the volume, so the returned grid is
-        always exactly the requested one.
-        """
-        i0 = np.floor((np.asarray(lo_phys) - self.origin) / self.spacing).astype(int)
-        i1 = np.ceil((np.asarray(hi_phys) - self.origin) / self.spacing).astype(int) + 1
+        """Sub-volume covering a physical AABB, zero-padded outside labels."""
+        lo = np.asarray(lo_phys, dtype=float)
+        hi = np.asarray(hi_phys, dtype=float)
+        corners = np.array(np.meshgrid(*zip(lo, hi), indexing="ij")).reshape(3, -1).T
+        corner_idx = self.index_float_of(corners)
+        i0 = np.floor(corner_idx.min(axis=0)).astype(int)
+        i1 = np.ceil(corner_idx.max(axis=0)).astype(int) + 1
         out = np.zeros(tuple(i1 - i0), dtype=self.data.dtype)
         s0, s1 = np.maximum(i0, 0), np.minimum(i1, self.shape)
         if np.all(s1 > s0):
             out[tuple(slice(a - b, c - b) for a, b, c in zip(s0, i0, s1))] = \
                 self.data[tuple(slice(a, c) for a, c in zip(s0, s1))]
-        return out, self.origin + i0 * self.spacing
+        from qc.coordinate_contract import label_voxel_to_physical
+        origin = label_voxel_to_physical(i0.astype(float), self.origin,
+                                         self.spacing, self.direction)
+        return out, origin
 
     def resample_to(self, origin_phys, voxel_um, shape_xyz):
-        """Nearest-neighbour labels on another regular grid (for the PNG
-        renderer, which draws on the image grid)."""
-        axes = []
-        for a in range(3):
-            centres = origin_phys[a] + np.arange(shape_xyz[a]) * voxel_um[a]
-            axes.append(np.rint((centres - self.origin[a]) / self.spacing[a]).astype(np.int64))
-        valid = [(ix >= 0) & (ix < self.shape[a]) for a, ix in enumerate(axes)]
-        clipped = [np.clip(ix, 0, self.shape[a] - 1) for a, ix in enumerate(axes)]
-        out = self.data[np.ix_(*clipped)].astype(np.int64)
-        out[~valid[0], :, :] = 0
-        out[:, ~valid[1], :] = 0
-        out[:, :, ~valid[2]] = 0
-        return out
+        """Nearest-neighbour labels on an arbitrary physical regular grid."""
+        centres = [np.asarray(origin_phys)[a] + np.arange(shape_xyz[a]) * float(voxel_um[a])
+                   for a in range(3)]
+        grid = np.meshgrid(*centres, indexing="ij")
+        phys = np.stack(grid, axis=-1).reshape(-1, 3)
+        idx = np.rint(self.index_float_of(phys)).astype(np.int64)
+        valid = np.all((idx >= 0) & (idx < self.shape), axis=1)
+        out = np.zeros(len(idx), dtype=self.data.dtype)
+        out[valid] = self.data[idx[valid, 0], idx[valid, 1], idx[valid, 2]]
+        return out.reshape(tuple(shape_xyz))
 
 
 def _find_labels(run_dir):
@@ -456,7 +474,7 @@ class Session:
         if "xr" not in self.cells.columns:
             return
         xr = self.cells[["xr", "yr", "zr"]].apply(pd.to_numeric, errors="coerce").to_numpy(float)
-        pred = (self.phys - self.labels.origin) / self.labels.spacing
+        pred = self.labels.index_float_of(self.phys)
         ok = np.isfinite(xr).all(axis=1)
         if not ok.any():
             return
@@ -744,61 +762,141 @@ VERDICTS = {
 
 
 class VerdictStore:
-    """out_dir/verdicts.csv, one row per (run_dir, cell_id), rewritten on
-    every change so a crash loses at most the current click.
+    """Versioned, atomic verdict CSV shared by region and detection QC.
 
-    `vocab` is the set of allowed verdicts.  qc/view_detection_qc.py passes its
-    own (over-merge, missed Sox9, ...) rather than this file's region ones, so
-    both tools write one format and a verdict is always readable next to the
-    cell it is about -- but a run judged with one vocabulary keeps those
-    strings, which is why nothing here rewrites old rows.
+    Old files containing only ``verdict`` remain readable.  New rows also
+    carry independent detection/colocalization/registration verdicts and a
+    target key, so coordinate targets do not collide with cell ids.
     """
 
-    COLUMNS = ["run_dir", "cell_id", "class_name", "x", "y", "z", "table_region_id",
-               "lookup_region_id", "depth_um", "source", "verdict", "note", "time"]
+    COLUMNS = [
+        "schema_version", "run_dir", "target_kind", "target_key", "cell_id",
+        "class_name", "x", "y", "z", "table_region_id", "lookup_region_id",
+        "depth_um", "source", "source_tile", "source_tiff", "verdict",
+        "detection_verdict", "colocalization_verdict", "registration_verdict",
+        "note", "time",
+    ]
 
     def __init__(self, path, run_dir, vocab=None):
         self.path = Path(path)
         self.run_dir = str(run_dir)
         self.vocab = dict(vocab) if vocab else VERDICTS
         if self.path.exists():
-            self.df = pd.read_csv(self.path, dtype={"cell_id": str, "note": str})
+            self.df = pd.read_csv(self.path, dtype={"cell_id": str, "target_key": str,
+                                                     "note": str})
+            for col in self.COLUMNS:
+                if col not in self.df.columns:
+                    self.df[col] = ""
+            self.df["target_key"] = self.df["target_key"].where(
+                self.df["target_key"].notna() & (self.df["target_key"] != ""),
+                self.df["cell_id"])
+            self.df["schema_version"] = self.df["schema_version"].replace("", 1).fillna(1)
         else:
             self.df = pd.DataFrame(columns=self.COLUMNS)
 
-    def get(self, cell_id):
-        m = (self.df["run_dir"] == self.run_dir) & (self.df["cell_id"] == cell_id)
+    @staticmethod
+    def _key(row):
+        key = row.get("target_key", row.get("cell_id", ""))
+        return "" if pd.isna(key) else str(key)
+
+    def _mask(self, target_key):
+        key = str(target_key)
+        return (self.df["run_dir"].astype(str) == self.run_dir) & \
+               ((self.df["target_key"].astype(str) == key) |
+                ((self.df["target_key"].isna() | (self.df["target_key"] == "")) &
+                 (self.df["cell_id"].astype(str) == key)))
+
+    def get(self, target_key):
+        m = self._mask(target_key)
         if not m.any():
             return None, ""
         r = self.df.loc[m].iloc[-1]
         note = r.get("note", "")
-        return r["verdict"], "" if pd.isna(note) else str(note)
+        verdict = r.get("verdict", "")
+        if pd.isna(verdict):
+            verdict = ""
+        return verdict or None, "" if pd.isna(note) else str(note)
 
-    def set(self, site_row, verdict, note, source):
-        from datetime import datetime
+    def get_record(self, target_key):
+        m = self._mask(target_key)
+        return None if not m.any() else self.df.loc[m].iloc[-1].to_dict()
+
+    def _write(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        self.df.reindex(columns=self.COLUMNS).to_csv(tmp, index=False)
+        tmp.replace(self.path)
+
+    def _base_row(self, site_row, source):
+        target_key = self._key(site_row)
+        table_region = site_row.get("region_id", "")
+        lookup_region = site_row.get("lookup_id", "")
+        depth = site_row.get("depth_um", "")
+        return {
+            "schema_version": 2, "run_dir": self.run_dir,
+            "target_kind": site_row.get("target_kind", "cell"),
+            "target_key": target_key,
+            "cell_id": site_row.get("cell_id", "") if site_row.get("target_kind", "cell") != "coordinate" else "",
+            "class_name": site_row.get("class_name", ""),
+            "x": site_row.get("x", ""), "y": site_row.get("y", ""),
+            "z": site_row.get("z", ""), "table_region_id": table_region,
+            "lookup_region_id": lookup_region, "depth_um": depth,
+            "source": source, "source_tile": site_row.get("source_tile", ""),
+            "source_tiff": site_row.get("source_tiff", ""),
+            "verdict": "", "detection_verdict": "",
+            "colocalization_verdict": "", "registration_verdict": "",
+            "note": "", "time": "",
+        }
+
+    def _upsert(self, site_row, values):
+        target_key = self._key(site_row)
+        m = self._mask(target_key)
+        self.df = self.df.loc[~m]
+        row = self._base_row(site_row, values.pop("source", ""))
+        if m.any():
+            old = self.df  # kept for readability; values are merged below by caller
+        row.update(values)
+        self.df = pd.concat([self.df, pd.DataFrame([row])], ignore_index=True)
+
+    def set(self, site_row, verdict, note, source, **dimensions):
+        """Backward-compatible single verdict setter with optional dimensions."""
         if verdict not in self.vocab:
             raise ValueError(verdict)
-        m = (self.df["run_dir"] == self.run_dir) & (self.df["cell_id"] == site_row["cell_id"])
-        self.df = self.df.loc[~m]
-        new = pd.DataFrame([{
-            "run_dir": self.run_dir, "cell_id": site_row["cell_id"],
-            "class_name": site_row["class_name"],
-            "x": site_row["x"], "y": site_row["y"], "z": site_row["z"],
-            "table_region_id": int(site_row["region_id"]),
-            "lookup_region_id": int(site_row["lookup_id"]),
-            "depth_um": float(site_row["depth_um"]),
-            "source": source, "verdict": verdict, "note": note,
-            "time": datetime.now().isoformat(timespec="seconds"),
-        }])
-        self.df = new if self.df.empty else pd.concat([self.df, new], ignore_index=True)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.df.to_csv(self.path, index=False)
+        values = {
+            "verdict": verdict, "note": note,
+            "time": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+            **{k: v for k, v in dimensions.items() if k in self.COLUMNS},
+        }
+        self._upsert(site_row, {**values, "source": source})
+        self._write()
+
+    def set_dimensions(self, site_row, *, detection_verdict="", colocalization_verdict="",
+                       registration_verdict="", legacy_verdict="", note="", source="",
+                       source_tile="", source_tiff=""):
+        allowed = {
+            "correct", "false_positive", "missed_nearby_cell", "uncertain",
+            "over_merge", "under_merge", "colocalization_wrong",
+            "channel_alignment_problem", "wrong_region", "boundary_uncertain",
+            "registration_offset", "reposition_mismatch", "",
+        }
+        values = [detection_verdict, colocalization_verdict, registration_verdict]
+        if any(v not in allowed for v in values):
+            raise ValueError("invalid three-dimensional QC verdict")
+        self._upsert(site_row, {
+            "source": source, "source_tile": source_tile, "source_tiff": source_tiff,
+            "verdict": legacy_verdict,
+            "detection_verdict": detection_verdict,
+            "colocalization_verdict": colocalization_verdict,
+            "registration_verdict": registration_verdict,
+            "note": note,
+            "time": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        })
+        self._write()
 
     def tally(self):
-        sub = self.df[self.df["run_dir"] == self.run_dir]
+        sub = self.df[self.df["run_dir"].astype(str) == self.run_dir]
         return sub["verdict"].value_counts().to_dict()
 
     def tally_text(self, empty="0"):
-        """"名称 n，名称 n" for whichever of this store's vocabulary was used."""
         return "，".join(f"{self.vocab[k]} {n}" for k, n in self.tally().items()
                          if k in self.vocab) or empty
