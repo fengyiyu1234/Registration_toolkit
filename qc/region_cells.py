@@ -341,6 +341,9 @@ class TileSource:
     at physical (g + k) * voxel_z."""
     kind = "tiles"
 
+    def close(self):
+        """Tile reads are opened per slice and do not retain file handles."""
+
     def __init__(self, channels, cell_voxel_um):
         self.voxel_um = np.asarray(cell_voxel_um, float)
         self.grids = {}
@@ -401,6 +404,18 @@ class VolumeSource:
                     np.asarray(vol[s0[2]:s1[2], s0[1]:s1[1], s0[0]:s1[0]])
             arrays[name] = out
         return Box(arrays, origin * self.voxel_um, self.voxel_um, self.kind)
+
+    def close(self):
+        """Release TIFF memmaps so Windows can remove the source directory."""
+        for vol in self.vols.values():
+            mapping = getattr(vol, "_mmap", None)
+            if mapping is not None:
+                mapping.close()
+            store = getattr(vol, "store", None)
+            close = getattr(store, "close", None)
+            if close is not None:
+                close()
+        self.vols.clear()
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -464,6 +479,18 @@ class Session:
         self.half_um = None
         self.source = self._build_source()
         self.sites = self._pick_sites()
+
+    def close(self):
+        """Release optional source handles held for this QC session."""
+        close = getattr(self.source, "close", None)
+        if close is not None:
+            close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
     # -- setup ---------------------------------------------------------------
 

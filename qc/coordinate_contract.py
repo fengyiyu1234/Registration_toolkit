@@ -16,30 +16,43 @@ def _xyz(value, name):
 
 
 def global_pixel_to_physical(global_xyz, voxel_um):
-    return _xyz(global_xyz, "global_xyz") * _xyz(voxel_um, "voxel_um")
+    voxel = _xyz(voxel_um, "voxel_um")
+    if np.any(voxel <= 0):
+        raise ValueError("voxel_um must be strictly positive")
+    return _xyz(global_xyz, "global_xyz") * voxel
 
 
 def physical_to_global_pixel(physical_um, voxel_um):
-    return _xyz(physical_um, "physical_um") / _xyz(voxel_um, "voxel_um")
+    voxel = _xyz(voxel_um, "voxel_um")
+    if np.any(voxel <= 0):
+        raise ValueError("voxel_um must be strictly positive")
+    return _xyz(physical_um, "physical_um") / voxel
+
+
+def _label_metadata(origin_um, spacing_um, direction):
+    origin = _xyz(origin_um, "origin_um")
+    spacing = _xyz(spacing_um, "spacing_um")
+    if np.any(spacing <= 0):
+        raise ValueError("spacing_um must be strictly positive")
+    d = np.eye(3) if direction is None else np.asarray(direction, dtype=float)
+    if d.shape != (3, 3) or not np.isfinite(d).all():
+        raise ValueError("direction must be a finite 3x3 matrix")
+    if not np.allclose(d.T @ d, np.eye(3), atol=1e-6, rtol=0):
+        raise ValueError("direction must be orthonormal")
+    if abs(np.linalg.det(d)) < 1e-8:
+        raise ValueError("direction must be nonsingular")
+    return origin, spacing, d
 
 
 def physical_to_label_voxel(physical_um, origin_um, spacing_um, direction=None):
     p = _xyz(physical_um, "physical_um")
-    origin = _xyz(origin_um, "origin_um")
-    spacing = _xyz(spacing_um, "spacing_um")
-    d = np.eye(3) if direction is None else np.asarray(direction, dtype=float)
-    if d.shape != (3, 3) or not np.isfinite(d).all():
-        raise ValueError("direction must be a finite 3x3 matrix")
+    origin, spacing, d = _label_metadata(origin_um, spacing_um, direction)
     return ((p - origin) @ np.linalg.inv(d).T) / spacing
 
 
 def label_voxel_to_physical(voxel_xyz, origin_um, spacing_um, direction=None):
     v = _xyz(voxel_xyz, "voxel_xyz")
-    origin = _xyz(origin_um, "origin_um")
-    spacing = _xyz(spacing_um, "spacing_um")
-    d = np.eye(3) if direction is None else np.asarray(direction, dtype=float)
-    if d.shape != (3, 3) or not np.isfinite(d).all():
-        raise ValueError("direction must be a finite 3x3 matrix")
+    origin, spacing, d = _label_metadata(origin_um, spacing_um, direction)
     return origin + (v * spacing) @ d.T
 
 

@@ -8,8 +8,8 @@ owner: codex
 tracking:
   goal_thread_id: "01a0c4cd-8ba4-7560-9a65-82d81e17a646"
   status: in_progress
-  current_phase: audit_complete_implementation_pending
-  next_review: "Implement fixes, then rerun headless and GUI QC validation."
+  current_phase: phase_a_b_headless_validation_complete
+  next_review: "Implement whole-brain navigation and reposition support, then run GUI validation."
 
 scope:
   plan: qc/QC_VISUALIZATION_PLAN.md
@@ -54,7 +54,7 @@ issues:
   - id: QC-COORD-001
     title: "coordinate_contract 与真实标签查询路径重复且未接入"
     priority: high
-    status: open
+    status: resolved
     affected_files:
       - path: qc/coordinate_contract.py
         lines: "26-43"
@@ -113,7 +113,7 @@ issues:
   - id: QC-VERDICT-001
     title: "三维判定 JSON 与现有 verdicts.csv 并行，格式未统一"
     priority: high
-    status: open
+    status: resolved
     affected_files:
       - path: qc/region_cells.py
         lines: "746-795"
@@ -143,7 +143,7 @@ issues:
   - id: QC-TILE-001
     title: "tile_shifts 已贯通主要路径，但缺少真实合成测试和配置说明"
     priority: medium
-    status: open
+    status: resolved
     affected_files:
       - path: qc/crop_geometry.py
         lines: "44-60"
@@ -190,6 +190,16 @@ issues:
       - "完整 GUI smoke test 通过，或测试明确适配当前 napari 版本。"
 
 updates:
+  - date: "2026-09-21"
+    type: implementation
+    summary: "Completed Phase A/B corrective work: direction-aware coordinate CLI lookup, canonical CSV verdict storage, strict tile-shift validation, multiset s4/cell reconciliation, and explicit session resource release."
+    validation: "PYTHONUTF8=1 antsreg Python: test_region_qc_smoke.py (8 passed), test_detection_qc_smoke.py (12 passed), and test_qc_crops_smoke.py (all passed)."
+    decision: "Phase C whole-brain navigation, Phase D reposition support, and Phase E reporting remain pending."
+  - date: "2026-09-21"
+    type: policy_decision
+    summary: "Adopt English as the only language for all newly added or modified repository scripts and documentation."
+    validation: "The rule is recorded in QC_VISUALIZATION_PLAN.md under development constraints."
+    decision: "Existing Chinese text may remain until touched; touched Chinese text must be translated in the same change. Proper nouns and externally defined labels may keep their canonical spelling."
   - date: "2026-09-21"
     type: audit
     summary: "远端拉取后完成 QC 全脚本审计；无 Git conflict。"

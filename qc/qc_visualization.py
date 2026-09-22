@@ -10,7 +10,6 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +42,8 @@ def resolve_target(session, global_xyz):
         raise ValueError("global coordinate must be three finite values (x, y, z)")
     physical = global_pixel_to_physical(xyz, session.cell_voxel_um)
     label_xyz = physical_to_label_voxel(
-        physical, session.labels.origin, session.labels.spacing)
+        physical, session.labels.origin, session.labels.spacing,
+        session.labels.direction)
     target = CoordinateTarget(xyz.tolist(), physical.tolist(), label_xyz.tolist())
     if len(session.cells):
         distances = np.linalg.norm(session.phys - physical, axis=1)
@@ -64,40 +64,6 @@ def trace_cell(session, cell_id):
     target = resolve_target(session, row[["x", "y", "z"]].to_numpy(float))
     target.nearest_cell_id, target.nearest_distance_um = str(cell_id), 0.0
     return target
-
-
-def atomic_json_write(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-def append_verdict(path, target, *, run_dir, cell_id=None, source_tile="",
-                   source_tiff="", detection_verdict="uncertain",
-                   colocalization_verdict="uncertain",
-                   registration_verdict="boundary_uncertain", note=""):
-    """Atomically write schema-versioned, independently judged verdicts."""
-    path = Path(path)
-    rows = []
-    if path.exists():
-        old = json.loads(path.read_text(encoding="utf-8"))
-        rows = old.get("records", []) if isinstance(old, dict) else old
-    rows.append({
-        "schema_version": 1, "run_dir": str(run_dir),
-        "target_kind": "cell" if cell_id else "coordinate", "cell_id": cell_id,
-        "global_x": target.global_xyz[0], "global_y": target.global_xyz[1],
-        "global_z": target.global_xyz[2], "source_tile": source_tile,
-        "source_tiff": source_tiff, "table_region_id": None,
-        "lookup_region_id": target.lookup_region_id,
-        "boundary_depth_um": target.boundary_depth_um,
-        "detection_verdict": detection_verdict,
-        "colocalization_verdict": colocalization_verdict,
-        "registration_verdict": registration_verdict, "note": note,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-    atomic_json_write(path, {"schema_version": 1, "records": rows})
 
 
 def main(argv=None):

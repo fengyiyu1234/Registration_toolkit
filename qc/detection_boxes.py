@@ -50,6 +50,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from collections import Counter
 
 # ── 从 brain_detector/src/utils/visualize.py 抄来的显示约定 ───────────────────
 
@@ -467,23 +468,33 @@ def match_coloc_to_cells(run, cells, decimals=3):
         return {"available": False}
     got = pd.concat(got_parts, ignore_index=True)
 
-    merged = want.merge(got.assign(_s4=1).drop_duplicates(key_cols),
-                        on=key_cols, how="left")
-    matched = int(merged["_s4"].notna().sum())
-    back = got.merge(want.assign(_c=1).drop_duplicates(key_cols),
-                     on=key_cols, how="left")
-    by_class = (merged.assign(miss=merged["_s4"].isna())
-                .groupby("class")["miss"].agg(["size", "sum"])
-                .rename(columns={"size": "n_cells", "sum": "n_unmatched"}))
+    def keys(frame):
+        return [tuple(row) for row in frame[key_cols].itertuples(index=False, name=None)]
+
+    want_counts, got_counts = Counter(keys(want)), Counter(keys(got))
+    common = want_counts & got_counts
+    missing, extra = want_counts - got_counts, got_counts - want_counts
+    matched = sum(common.values())
+    by_class = pd.DataFrame(
+        [(key[3], want_counts[key], missing[key]) for key in missing],
+        columns=["class", "n_cells", "n_unmatched"],
+    )
+    if len(by_class):
+        by_class = by_class.groupby("class", as_index=False)[["n_cells", "n_unmatched"]].sum()
+        by_class = by_class.set_index("class").sort_values("n_unmatched", ascending=False)
+    else:
+        by_class = pd.DataFrame(columns=["n_cells", "n_unmatched"])
     return {
         "available": True,
         "n_s4": len(got),
         "n_cells": len(want),
         "n_matched": matched,
-        "n_cells_unmatched": len(want) - matched,
-        "n_s4_unmatched": int(back["_c"].isna().sum()),
-        "by_class": by_class[by_class["n_unmatched"] > 0].sort_values("n_unmatched",
-                                                                     ascending=False),
+        "n_cells_unmatched": sum(missing.values()),
+        "n_s4_unmatched": sum(extra.values()),
+        "n_duplicate_cell_keys": sum(n - 1 for n in want_counts.values() if n > 1),
+        "n_duplicate_s4_keys": sum(n - 1 for n in got_counts.values() if n > 1),
+        "rounding_decimals": decimals,
+        "by_class": by_class,
     }
 
 

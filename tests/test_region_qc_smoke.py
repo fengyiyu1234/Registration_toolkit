@@ -132,6 +132,9 @@ def test_session_selection_and_depth():
         want = list(s.selected["cell_id"].iloc[:2])
         s3 = rc.Session(make_cfg(root, sites=want), log=lambda *a: None)
         assert list(s3.sites["cell_id"]) == want
+        s.close()
+        s2.close()
+        s3.close()
 
 
 def test_wrong_cell_voxel_is_refused():
@@ -173,6 +176,35 @@ def test_label_volume_honors_origin_spacing_and_direction():
     print("  ok  labels honor nonzero origin, anisotropic spacing and direction")
 
 
+def test_coordinate_cli_resolution_honors_label_direction():
+    from types import SimpleNamespace
+    import nibabel as nib
+    from qc.region_cells import LabelVolume
+    from qc.qc_visualization import resolve_target
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "rotated_labels.nii.gz"
+        data = np.zeros((8, 8, 8), dtype=np.uint16)
+        data[2, 3, 4] = 123
+        spacing = np.array([2.0, 3.0, 5.0])
+        direction = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        origin = np.array([11.0, 13.0, 17.0])
+        affine = np.eye(4)
+        affine[:3, :3] = np.diag([-1.0, -1.0, 1.0]) @ (direction * spacing[None, :])
+        affine[:3, 3] = np.diag([-1.0, -1.0, 1.0]) @ origin
+        nib.save(nib.Nifti1Image(data, affine), str(path))
+        labels = LabelVolume(path)
+        physical = origin + direction @ (np.array([2.0, 3.0, 4.0]) * spacing)
+        session = SimpleNamespace(
+            cell_voxel_um=np.ones(3), labels=labels, cells=pd.DataFrame(),
+            phys=np.empty((0, 3)), region_ids={123},
+        )
+        target = resolve_target(session, physical)
+        assert np.allclose(target.label_voxel_xyz, [2, 3, 4])
+        assert target.lookup_region_id == 123
+    print("  ok  coordinate CLI resolution passes label direction")
+
+
 def test_volume_cut_matches_frame():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -196,6 +228,7 @@ def test_volume_cut_matches_frame():
             lab, lo = cut["labels"], cut["labels_origin"]
             centres = lo + np.argwhere(np.ones(lab.shape, bool)) * 20.0
             assert np.array_equal(lab.ravel(), s.labels.lookup(centres))
+        s.close()
 
 
 def test_frame_scan_finds_injected_offset():
@@ -239,6 +272,7 @@ def test_snapshot_and_verdicts():
         assert again.tally() == {"wrong_region": 1}
         other = rc.VerdictStore(root / "out" / "verdicts.csv", "/elsewhere")
         assert other.get(row["cell_id"]) == (None, "")
+        s.close()
 
 
 def main():

@@ -56,8 +56,14 @@ def load_tile_shifts(align_dir, key):
     for path in align_dir.glob("*_offsets.json"):
         tile_name = path.name[: -len("_offsets.json")]
         entry = json.loads(path.read_text(encoding="utf-8")).get(key)
-        if entry:
-            shifts[tile_name] = (entry["dx"], entry["dy"], entry["dz"])
+        if entry is None:
+            continue
+        if not isinstance(entry, dict) or set(("dx", "dy", "dz")) - set(entry):
+            raise ValueError(f"{path}: {key!r} must contain dx, dy, and dz")
+        shift = np.asarray([entry[axis] for axis in ("dx", "dy", "dz")], dtype=float)
+        if not np.isfinite(shift).all() or not np.equal(shift, np.rint(shift)).all():
+            raise ValueError(f"{path}: {key!r} shift must contain finite integer pixels")
+        shifts[tile_name] = tuple(np.rint(shift).astype(int))
     return shifts
 
 

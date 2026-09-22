@@ -259,6 +259,7 @@ def test_region_counts_and_funnel():
         assert 2.5 < ratio < 3.5, ratio
 
         text = "\n".join(lines)
+        s.close()
         assert "Sox9+ 占比" in text
         assert "完全一致" in text, text      # nothing was dropped, so s4 == cell table
 
@@ -301,6 +302,29 @@ def test_match_reconciliation():
         assert m2["n_matched"] == 0 and m2["n_s4"] == m2["n_cells"], m2
 
 
+def test_match_reconciliation_preserves_duplicate_keys():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = build_run(root)
+        det, _, _ = build_detection(root, run)
+        coloc = det / "4_colocalization" / "coloc_result.csv"
+        rows = pd.read_csv(coloc)
+        pd.concat([rows, rows.iloc[[0]]], ignore_index=True).to_csv(coloc, index=False)
+        runner = db.DetectionRun(det, ["RFP", "GFP", "Sox9"], CELL_UM,
+                                 stages=("s4",), log=lambda *a: None)
+        from qc import region_cells as rc
+        result = db.match_coloc_to_cells(runner, rc.load_cells(run))
+        assert result["n_s4_unmatched"] == 1, result
+        assert result["n_duplicate_s4_keys"] == 1, result
+
+        cells = rc.load_cells(run)
+        duplicate = pd.concat([cells, cells.iloc[[0]]], ignore_index=True)
+        result = db.match_coloc_to_cells(runner, duplicate)
+        assert result["n_cells_unmatched"] == 1, result
+        assert result["n_duplicate_cell_keys"] == 1, result
+    print("ok  reconciliation reports duplicate keys instead of hiding them")
+
+
 def test_snapshot_and_verdicts():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -334,6 +358,7 @@ def test_snapshot_and_verdicts():
             pass
         else:
             raise AssertionError("a verdict outside this tool's vocabulary must raise")
+        s.close()
 
 
 def test_interactive_cell_location():
@@ -353,6 +378,7 @@ def test_interactive_cell_location():
         assert s.cut_site(k)["cells"]["is_target"].sum() == 1
         assert s.locate_cell(target["cell_id"]) == (k, 0.0)
         assert len(s.sites) == 2
+        s.close()
         xyz = target[["x", "y", "z"]].to_numpy(float) + [0.1, 0, 0]
         found, distance = s.locate_cell(", ".join(map(str, xyz)))
         assert found == k
@@ -383,6 +409,7 @@ def test_direct_coordinate_target_keeps_requested_center():
         assert np.allclose(cut["center"], xyz * CELL_UM)
         assert distance >= 0
         assert s.locate_coordinate(xyz)[0] == k
+        s.close()
     print("ok  direct coordinate target keeps its own crop center")
 
 
@@ -406,6 +433,7 @@ def test_three_dimension_verdicts_share_legacy_csv():
         assert record["registration_verdict"] == "boundary_uncertain"
         assert again.get(row["cell_id"])[1] == "three axes"
         assert len(again.df) == 1
+        s.close()
     print("ok  three-dimensional verdicts share legacy CSV")
 
 

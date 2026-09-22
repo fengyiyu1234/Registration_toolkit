@@ -4,6 +4,10 @@
 > `README.md`、`qc/README.md`，再检查当前工作区和相关测试。不要跳过坐标验证，
 > 也不要在没有证据时猜测原始图像、检测结果和配准结果之间的轴顺序。
 
+> Status notation used below: `[x]` means implemented with relevant headless coverage,
+> `[!]` means partially implemented or requiring corrective verification, and `[ ]` means
+> pending. The status snapshot was reviewed against the working tree on 2026-09-21.
+
 ## 1. 项目目标
 
 在检测、z-link、共定位和配准全部完成后，提供一个交互式 QC 工具，让使用者能够：
@@ -51,6 +55,13 @@
   - 已有将重定位后的标签恢复到原始碎片位置的逻辑，应复用其数学和数据约定。
 - `qc/cut_crops.py`、`qc/annotate_crop.py`、`qc/score_crops.py`
   - 是独立的盲法漏检评估流程，不应与本工具的非盲人工判定输出目录混用。
+
+Entry-point decision:
+
+- `qc/view_detection_qc.py` is the canonical interactive viewer and snapshot writer.
+- `qc/qc_visualization.py` is a diagnostic JSON CLI for coordinate/cell lookup and source-file
+  tracing. It is not required to launch napari or write image crops. Image output belongs to
+  `view_detection_qc.py --snapshot`, which avoids a second viewer implementation.
 
 ## 3. 核心使用场景
 
@@ -177,8 +188,9 @@ Sox9 s3: 1 个候选
 同时显示：
 
 - 每一级的坐标、尺寸和类别。
-- s2 到 s3 的合并关系。
-- s3 到 s4 的共定位关系或最近距离。
+- Show an exact s2-to-s3 merge relation only when the source data contains stable lineage or
+  object IDs. Otherwise show spatial candidates and distances explicitly labeled as inferred.
+- Apply the same distinction between source-provided and spatially inferred s3-to-s4 relations.
 - s4 与 `cell_registration.csv` 是否精确对应。
 - 细胞表脑区与 `labels_in_sample` 回查脑区是否一致。
 - 到目标区域边界的有符号物理距离。
@@ -199,7 +211,9 @@ Sox9 s3: 1 个候选
 | 图谱空间 | atlas voxel 或物理坐标 | 展示最终图谱位置 |
 
 数组进入 napari 时通常是 `(z, y, x)`；磁盘表格和所有坐标 API 统一使用 `(x, y, z)`。
-任何轴交换只允许发生在明确的显示边界。
+任何轴交换只允许发生在明确的显示边界。The QC core uses LPS physical coordinates.
+The NIfTI RAS affine exposed by nibabel must be converted to LPS exactly once at the loading
+boundary.
 
 ### 5.2 全局像素到物理空间
 
@@ -210,11 +224,14 @@ physical_um = global_pixel_xyz * cell_voxel_um_xyz
 ### 5.3 物理空间到标签体素
 
 ```text
-label_voxel_xyz =
-    (physical_um - label_origin_um) / label_spacing_um
+delta_um = physical_um - label_origin_um
+label_voxel_xyz = inverse(label_direction) @ delta_um / label_spacing_um
 ```
 
-实现不能假设标签 origin 恒为零，也不能假设 spacing 各向同性。
+The formula uses column-vector notation; vectorized code may use the equivalent right-multiplied
+transpose. The implementation must not assume zero origin, isotropic spacing, or identity
+direction. Startup validation must reject non-finite origins, non-positive spacing, singular
+directions, and affines whose direction matrix is not orthonormal within a declared tolerance.
 
 ### 5.4 全局像素到 tile
 
@@ -256,6 +273,10 @@ tile 内 x/y/z（0 起）
 5. 人工判定中记录实际使用的源 tile。
 
 这样才能区分检测错误、tile 接缝问题、单个 tile 成像质量问题和拼接坐标错误。
+Define `tile_shifts` as `(dx, dy, dz)` in the shared global-pixel grid, with the sign convention
+`aligned = raw + shift`. The current array-slicing implementation requires integer pixels, so the
+loader must reject missing fields, non-finite values, and non-integer values instead of truncating
+them or allowing fractional origins to reach array indexing.
 
 ## 7. 各阶段数据来源
 
@@ -272,7 +293,10 @@ tile 内 x/y/z（0 起）
 
 启动时必须检查：
 
-- s4 与最终细胞表的坐标和类别是否逐行精确对应。
+- Reconcile s4 and the final cell table one-to-one as multisets keyed by `(cx, cy, z, class)`.
+  Do not depend on row order. The tolerance or rounding precision must be explicit and recorded in
+  the report. Report duplicate keys separately; never use `drop_duplicates` to hide extra or
+  missing rows.
 - `cell_voxel_um` 是否能复现细胞表保存的样本网格坐标。
 - tile XML 是否覆盖目标位置。
 - 各通道的 tile 网格、体素尺寸和偏移是否明确。
@@ -405,13 +429,20 @@ qc_output/
 
 任务：
 
-- [ ] 审计当前工作区已有定位实现和测试。
-- [ ] 定义统一的目标对象：最终细胞或任意全局坐标。
-- [ ] 支持任意全局坐标裁图，不强制吸附到最近细胞。
-- [ ] 返回所有覆盖坐标的原始 tile、TIFF 和局部坐标。
-- [ ] 完成全局像素、物理空间、标签体素之间的双向换算。
-- [ ] 查询当前位置的最终脑区和附近细胞。
-- [ ] 将坐标计算保持在 GUI 无关模块中。
+- [x] Audit the existing location implementation and tests in the working tree.
+- [!] Define one target representation for a final cell or arbitrary global coordinate. The GUI
+  target works, but `qc_visualization.py::CoordinateTarget` and the session row remain separate
+  representations.
+- [x] Crop around an arbitrary global coordinate without snapping to the nearest cell.
+- [x] Return every source tile, TIFF, and local coordinate covering the target.
+- [!] Complete bidirectional global-pixel, physical, and label-voxel conversion. The shared
+  contract is used by the main paths, but `qc_visualization.py::resolve_target()` must pass the
+  label direction and gain a non-identity-direction CLI regression test.
+- [x] Query the current region and nearby final cells.
+- [!] Keep coordinate calculations outside GUI code. Completion requires removing or adapting
+  duplicate conversion paths that bypass shared coordinate metadata.
+- [ ] Validate `tile_shifts` at load time, including required keys, finiteness, and integer-pixel
+  values, and document the shared sign convention in every relevant configuration template.
 
 验收：使用像素值由全局 `(x, y, z)` 编码的合成 mosaic，验证经过不同 tile、重叠区、
 z 起点和通道偏移后，仍能精确还原输入全局坐标。
@@ -420,12 +451,19 @@ z 起点和通道偏移后，仍能精确还原输入全局坐标。
 
 任务：
 
-- [ ] 支持 cell ID 和任意全局坐标入口。
-- [ ] 显示所有原始通道。
-- [ ] 叠加 s1、s2、s3、s4、最终细胞和脑区边界。
-- [ ] 显示流程追踪和源文件信息。
-- [ ] 支持分维度人工判定、备注和截图。
-- [ ] 保留前后翻页和未判项目导航。
+- [x] Accept both cell IDs and arbitrary global coordinates.
+- [x] Display all configured raw channels.
+- [x] Overlay s1, s2, s3, s4, final cells, and region boundaries.
+- [!] Display provenance and process evidence. Local stage boxes and source locations are shown;
+  exact lineage requires stable source IDs, otherwise the UI must label the result as an inferred
+  spatial match.
+- [!] Support independent verdict dimensions, notes, and screenshots through the canonical CSV
+  store. Remove or explicitly deprecate the legacy JSON `append_verdict` path so it cannot create
+  a second verdict format.
+- [x] Preserve previous/next and next-unreviewed navigation.
+- [!] Synchronize user documentation and configuration templates with actual behavior.
+  `qc/README.md` still describes coordinate lookup as snapping to the nearest cell and must be
+  corrected before this phase is accepted.
 
 验收：在合成 run 中定位一个抽样之外的细胞和一个没有细胞的任意坐标，两者都能
 正确裁图；空点层、空框层和缺少某一级结果时窗口不崩溃。
@@ -485,6 +523,14 @@ z 起点和通道偏移后，仍能精确还原输入全局坐标。
 - [ ] fragment reposition 样本。
 - [ ] 大型 CSV 的内存受控分块读取。
 - [ ] GUI 中切换位置、切换 tile、截图和保存判定。
+- [ ] `qc_visualization.py --xyz` agrees with `LabelVolume.lookup` for non-identity direction.
+- [ ] s4/cell reconciliation covers reordered rows, duplicate keys, missing rows, and class
+  mismatches.
+- [ ] `tile_shifts` rejects missing fields, non-finite values, and non-integer pixel shifts.
+- [ ] Legacy verdict CSV coverage includes missing columns, coordinate-target reload, and recovery
+  from a failed atomic replacement.
+- [ ] Closing a session on Windows releases all TIFF/memmap handles so its temporary directory can
+  be deleted immediately.
 
 ## 14. 最终验收流程
 
@@ -514,6 +560,10 @@ z 起点和通道偏移后，仍能精确还原输入全局坐标。
 - 不把 napari 的 `(z, y, x)` 顺序泄漏到核心坐标 API。
 - 不在坐标验证失败后继续静默显示可能错位的边界或检测框。
 - 不把非盲 QC 判定与盲 crop 标注输出混在同一目录。
+- All newly added or modified source code, identifiers, comments, docstrings, configuration
+  comments, UI strings, logs, tests, and documentation must be written in English. Existing
+  Chinese text may remain until touched; any touched Chinese passage must be translated as part
+  of the same change. Proper nouns and externally defined labels may retain their canonical form.
 - 每个阶段完成后运行对应 headless 测试；涉及 GUI 的改动还需运行实际 napari 窗口
   smoke test。
 

@@ -156,6 +156,27 @@ def test_per_tile_alignment_shifts_are_used_by_cut_and_locate():
     print("  ok  per-tile alignment shifts agree for cut and locate")
 
 
+def test_tile_shift_validation_rejects_unsafe_array_origins():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for payload in (
+            {"GFP": {"dx": 1, "dy": 2}},
+            {"GFP": {"dx": float("nan"), "dy": 0, "dz": 0}},
+            {"GFP": {"dx": 0.5, "dy": 0, "dz": 0}},
+        ):
+            align = root / "alignment"
+            align.mkdir(exist_ok=True)
+            (align / "tile_offsets.json").write_text(json.dumps(payload))
+            try:
+                geom.load_tile_shifts(align, "GFP")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(payload)
+            (align / "tile_offsets.json").unlink()
+    print("  ok  tile shifts reject missing, non-finite, and fractional pixels")
+
+
 def test_offset_px_shifts_the_read():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -305,6 +326,7 @@ if __name__ == "__main__":
     test_tile_grid_cut_matches_global_frame()
     test_source_slice_location()
     test_per_tile_alignment_shifts_are_used_by_cut_and_locate()
+    test_tile_shift_validation_rejects_unsafe_array_origins()
     test_offset_px_shifts_the_read()
     test_frame_conversion_round_trip()
     test_pick_crop_sites_stays_inside_the_region()
