@@ -1,6 +1,6 @@
 """The wide "region under the cursor" bar along the bottom of a window.
 
-Shared by tools/atlas_view.py and paint_mask.py's `mode: labels`, for the
+Shared by visualization/atlas_view.py and paint_mask.py's `mode: labels`, for the
 same reason shared/ontology_tree_ui.py is shared: it is one widget with a
 fair amount of behaviour in it (fold the chain to fit, scale the type to the
 dock's height, paint the strip in the region's own colour) and two copies
@@ -295,7 +295,7 @@ def add_hover_bar(viewer, structures, colour_of, below=None,
 # selftests -- the fitting/colour maths, no Qt, no window
 # =====================================================================================
 def selftest_ancestry_line():
-    """Asserts only, no printing: tools/atlas_view.py runs this as one of its
+    """Asserts only, no printing: visualization/atlas_view.py runs this as one of its
     own numbered selftests, and prints its own heading around it."""
     labels = ["root", "grey matter", "cerebrum", "cortex", "motor area", "layer 5"]
 

@@ -3,8 +3,8 @@
 #
 #   cp configs/paint_mask.example.yaml configs/paint_mask.yaml
 #   conda activate antsreg
-#   python paint_mask.py                                     # 用 configs/paint_mask.yaml
-#   python paint_mask.py configs/paint_mask.guide_s12t.yaml  # 或显式指定另一份
+#   python mask/paint_mask.py                                     # 用 configs/paint_mask.yaml
+#   python mask/paint_mask.py configs/paint_mask.guide_s12t.yaml  # 或显式指定另一份
 
 # =====================================================================================
 # 模式开关：guide | labels | section2d

@@ -11,7 +11,7 @@ import numpy as np
 import yaml
 
 from registration_ants import atlas_utils, config as config_mod, section2d, section_io
-import section_masks
+from tools import section_masks
 
 
 def load_section_config(path, name):

@@ -176,7 +176,7 @@ def _widget(viewer, name_fragment):
 
 
 def _button(widget, text_fragment):
-    import paint_mask as pm
+    from mask import paint_mask as pm
     matches = [b for b in widget.findChildren(pm.QPushButton) if text_fragment in b.text()]
     assert matches, f"no button matching {text_fragment!r}"
     return matches[0]
@@ -189,7 +189,7 @@ def _tree_item(tree, structure_id):
     too, and matching on a name substring is exactly the ambiguity the whole
     ids-not-names convention exists to avoid.
     """
-    import paint_mask as pm
+    from mask import paint_mask as pm
     stack = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
     while stack:
         item = stack.pop()
@@ -205,7 +205,7 @@ def _tree_item(tree, structure_id):
 def test_guide_mode_window(tmp, inputs):
     print("1. paint_mask mode: guide -- window, fill/outline switch, export...")
     import napari
-    import paint_mask as pm
+    from mask import paint_mask as pm
 
     from shared import atlas_reference
 
@@ -283,7 +283,7 @@ def test_labels_mode_window(tmp, inputs):
     print("2. paint_mask mode: labels -- raw-grid canvas, partition panel, export...")
     import napari
     import SimpleITK as sitk
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference, hover_bar
 
     out = tmp / "corrected_guide.nii.gz"
@@ -399,7 +399,7 @@ def test_labels_mode_window(tmp, inputs):
         # (z, y, x) = (5, 10, 1) is in the first slab, i.e. Isocortex (315).
         assert int(regions.data[5, 10, 1]) == atlas_ref.index_of_id[315], \
             "the layer must hold compact present_ids indices, which is what makes the "\
-            "colours identical to tools/atlas_view.py's"
+            "colours identical to visualization/atlas_view.py's"
 
         # ...and the bottom bar reads that region's whole ancestor chain off
         # it, in the colour the layer is drawing it in. Driven through the
@@ -490,7 +490,7 @@ def test_labels_mode_window(tmp, inputs):
 def test_labels_mode_resume(tmp, inputs):
     print("3. paint_mask mode: labels -- reopening restores the keyframes and the partition...")
     import napari
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     out = tmp / "corrected_guide.nii.gz"
@@ -527,7 +527,7 @@ def test_labels_mode_resume(tmp, inputs):
 def test_labels_mode_resume_from(tmp, inputs):
     print("4. paint_mask mode: labels -- resume_from reads one archive, writes another...")
     import napari
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     # Round 1's archive, written by tests 2/3. Resuming from it while exporting
@@ -1049,7 +1049,7 @@ def _assert_resizable(widget, what):
 def test_panels_are_resizable(tmp, inputs):
     print("6. both tools: every side panel can be dragged to any width...")
     import napari
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference, ontology_tree_ui
 
     # The helper itself, against a real napari dock.
@@ -1138,7 +1138,7 @@ def _open_guide(pm, tmp, inputs, atlas_reference, name, **overrides):
 
 def test_assignment_panel_drops_one_region(tmp, inputs):
     print("7. paint_mask guide mode: drop ONE region off a label, and hear about an empty one...")
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     # Three regions on one brush label -- the case the panel exists for: a
@@ -1187,7 +1187,7 @@ def test_assignment_panel_drops_one_region(tmp, inputs):
 
 def test_panels_are_tabbed_and_short(tmp, inputs):
     print("20. paint_mask guide mode: one left tab bar, one right panel, controls free to shrink...")
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from PyQt5.QtWidgets import QScrollArea
     from shared import atlas_reference
 
@@ -1277,7 +1277,7 @@ def _pin_pose(tools):
     is also the deterministic one to drive from a test, since setValue with an
     unchanged value emits nothing at all.
     """
-    import paint_mask as pm
+    from mask import paint_mask as pm
     tools.findChild(pm.QDoubleSpinBox, "reposition_tx").editingFinished.emit()
 
 
@@ -1298,7 +1298,7 @@ def _reposition_section(pm, viewer):
 
 def test_reposition_panel(tmp, inputs):
     print("8. paint_mask: the Reposition section in guide mode -- pose, keyframe, export, resume...")
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
     from registration_ants import reposition as rp
 
@@ -1458,7 +1458,7 @@ def test_reposition_grab_from_click(tmp, inputs):
     print("9. paint_mask: grabbing a piece from a click, cleanly across the crack...")
     import numpy as np
     import tifffile
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     # A slab with a flap along its top edge, separated by a two-voxel crack on
@@ -1501,7 +1501,7 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
     print("11. paint_mask: cortex split in three -- three fragments closing toward the middle...")
     import numpy as np
     import tifffile
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     # One band of "cortex" cut into three by two gaps. Each piece is a third of
@@ -1551,7 +1551,7 @@ def test_reposition_three_pieces_each_move_their_own_way(tmp, inputs):
 def test_reposition_refuses_a_plan_with_no_voxel_size(tmp, inputs):
     print("12. paint_mask: no voxel_size_um -> the panel opens but will not export a plan...")
     import numpy as np
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from pathlib import Path
     from shared import atlas_reference
 
@@ -1590,7 +1590,7 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
     print("14. paint_mask: per-plane grab for pieces that overlap in xy at different z...")
     import numpy as np
     import tifffile
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     # Two pieces at the SAME xy, far apart in z. Nothing infers an extent here:
@@ -1645,7 +1645,7 @@ def test_reposition_single_plane_grab_keeps_pieces_apart(tmp, inputs):
 def test_export_is_what_the_pipeline_reads(tmp, inputs):
     print("23. paint_mask -> Registration_ants: the exported plan loads and applies...")
     import numpy as np
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
     from registration_ants import pipeline, reposition as rp
 
@@ -1730,7 +1730,7 @@ def test_old_plans_drop_their_line_pairs(tmp, inputs):
     print("22. paint_mask: a plan written when lines existed loads and re-exports without them...")
     import numpy as np
     import SimpleITK as sitk
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
     from registration_ants import reposition as rp
 
@@ -1778,7 +1778,7 @@ def test_reposition_resume_redraws_the_ghosts(tmp, inputs):
     print("25. paint_mask: a resumed plan comes back as draggable ghosts, not just numbers...")
     import numpy as np
     import SimpleITK as sitk
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
     from registration_ants import reposition as rp
 
@@ -1863,7 +1863,7 @@ def test_reposition_resume_redraws_the_ghosts(tmp, inputs):
 def test_reposition_drag_the_outline(tmp, inputs):
     print("21. paint_mask: copy the fragment outline, drag it, read the pose back...")
     import numpy as np
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     viewer = _open_guide(pm, tmp, inputs, atlas_reference, "ghost.nii.gz", voxel_size_um=RAW_UM)
@@ -2035,7 +2035,7 @@ def test_reposition_export_stays_sparse(tmp, inputs):
     import numpy as np
     import SimpleITK as sitk
     from pathlib import Path
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
     from registration_ants import reposition as rp
 
@@ -2082,7 +2082,7 @@ def test_reposition_grab_is_armed_then_clicked(tmp, inputs):
     import numpy as np
     import tifffile
     from types import SimpleNamespace
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     stack = np.full((8, 200, 220), 50, dtype=np.uint16)
@@ -2132,7 +2132,7 @@ def test_reposition_grab_prefers_the_painted_mask(tmp, inputs):
     print("18. paint_mask: a grab takes the painted outline, not a threshold of the image...")
     import numpy as np
     import tifffile
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     # The image and the painted outline DISAGREE on purpose: the bright region
@@ -2191,7 +2191,7 @@ def test_reposition_grab_prefers_the_painted_mask(tmp, inputs):
 def test_reposition_names_follow_their_fragment(tmp, inputs):
     print("19. paint_mask: a fragment's name stays with it when the number changes...")
     import numpy as np
-    import paint_mask as pm
+    from mask import paint_mask as pm
     from shared import atlas_reference
 
     viewer = _open_guide(pm, tmp, inputs, atlas_reference, "names.nii.gz", voxel_size_um=RAW_UM)
@@ -2270,7 +2270,7 @@ def main():
               "         To force the current display anyway: GUI_SMOKE_USE_DISPLAY=1")
         return 0
 
-    import paint_mask  # noqa: F401  -- fail loudly here if the env is wrong
+    from mask import paint_mask  # noqa: F401  -- fail loudly here if the env is wrong
     paint_mask._import_gui()
 
     with tempfile.TemporaryDirectory() as tmp:

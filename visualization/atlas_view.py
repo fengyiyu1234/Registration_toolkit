@@ -48,13 +48,13 @@ SimpleITK requirement as paint_mask.py): edit configs/atlas_view.yaml
 then just run the file -- no command-line arguments.
 
     conda activate antsreg
-    python tools/atlas_view.py
-    python tools/atlas_view.py configs/atlas_view.devccf.yaml   # or point at another config
+    python visualization/atlas_view.py
+    python visualization/atlas_view.py configs/atlas_view.devccf.yaml   # or point at another config
 
 The plane geometry (frames, bounds, resampling, crosshairs) is separately
 runnable with no display and no config, on purely synthetic data:
 
-    python tools/atlas_view.py --selftest
+    python visualization/atlas_view.py --selftest
 """
 
 import argparse
@@ -2650,7 +2650,7 @@ def selftest_locked_pane_axes():
 
 
 def run_selftests():
-    print("=== tools/atlas_view.py selftests (synthetic data only, no GUI) ===")
+    print("=== visualization/atlas_view.py selftests (synthetic data only, no GUI) ===")
     selftest_ortho_panes_geometry()
     selftest_frame_algebra()
     selftest_plane_bounds()

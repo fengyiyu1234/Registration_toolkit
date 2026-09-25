@@ -10,7 +10,7 @@
 样本各留一份，互相不覆盖：
 
     python single_sample.py configs/single_sample.local.yaml
-    python tools/atlas_view.py configs/atlas_view.devccf.yaml
+    python visualization/atlas_view.py configs/atlas_view.devccf.yaml
 
 configs/ 和 .dialog_state/ 都在仓库根目录，不在这个包里 —— 下面的路径锚点用的是
 `parents[1]`，所以 tools/ 里的工具和根目录的主脚本找到的是同一份配置。
@@ -22,7 +22,7 @@ configs/ 和 .dialog_state/ 都在仓库根目录，不在这个包里 —— �
 弹表单的交互式工具（tools/edit_sample_labels.py）走 `resolve_inputs()`：配置是
 **可选**的，有就用来预填表单（优先于 .dialog_state/ 里上次用过的值），`--no-form`
 则完全不弹窗、直接用配置。其余工具（single_sample.py / paint_mask.py /
-tools/atlas_view.py / tools/qc_guide_mask.py）直接用 `load_config()`。
+visualization/atlas_view.py / tools/qc_guide_mask.py）直接用 `load_config()`。
 
 Not runnable on its own -- imported by paint_mask.py, single_sample.py and the
 tools in tools/.

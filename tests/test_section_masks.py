@@ -7,8 +7,8 @@ import numpy as np
 import tifffile
 
 from registration_ants import section2d
-from section_masks import auto_mask_raw
-import section_masks
+from tools.section_masks import auto_mask_raw
+from tools import section_masks
 
 
 class SectionMaskTests(unittest.TestCase):

@@ -18,9 +18,16 @@ dependency only points one way.
 Three kinds of file, kept apart:
 
 ```
-paint_mask.py            the three main scripts, run from the repo root
-single_sample.py
-registration_eval.py
+mask/                    mask painting and 2D section annotation
+  paint_mask.py            3D guide/label editor and shared entry point
+  paint_section2d.py       full-resolution 2D section editor
+
+visualization/           interactive viewers
+  atlas_view.py
+  single_sample_vis.py
+
+stats/                   registration metrics and evaluation
+  registration_eval.py
 
 shared/                  imported, never run
   local_config.py          configs/<tool>.yaml -> a dict, + the form window
@@ -33,13 +40,13 @@ shared/                  imported, never run
   hover_bar.py             the wide "region under the cursor" strip along the
                              bottom, shared by atlas_view and paint_mask
 
-tools/                   the smaller runnable tools
-  atlas_view.py
+tools/                   smaller tools and reusable tool backends
   edit_sample_labels.py
   qc_guide_mask.py
   convert_regions_ontology.py
+  section_masks.py         persistence and validation backend for mask/paint_section2d.py
 
-qc/                      QC subsystems (qc/README.md)
+final_pipeline_qc/                      QC subsystems (final_pipeline_qc/README.md)
   view_region_cells.py     post-registration QC: cells by region, back on the raw data
   region_cells.py          its GUI-free half: selection, geometry, depth, frame check
   view_detection_qc.py     whole-chain QC: every detector stage's boxes, by region
@@ -53,16 +60,16 @@ configs/                 <tool>.example.yaml tracked, <tool>.yaml gitignored
 tests/                   headless, plus test_gui_smoke.py which builds real windows
 ```
 
-`qc/` is kept apart from `tools/` on purpose: the scripts run at
+`final_pipeline_qc/` is kept apart from `tools/` on purpose: the scripts run at
 different times, on different machines, and the annotation step is deliberately
 unable to reach the sample/group/prediction manifest the other two share. See
-`qc/README.md` -- blinding there is a property of what the annotator is handed,
+`final_pipeline_qc/README.md` -- blinding there is a property of what the annotator is handed,
 not of their self-discipline.
 
-`qc/view_detection_qc.py` is the one tool here that reaches across into
+`final_pipeline_qc/view_detection_qc.py` is the one tool here that reaches across into
 `brain_detector`'s own output (`1_tile_2d_filtered/`, `2_global_2d_raw/`,
 `3_channel_3d/`, `4_colocalization/`). It still does not *import* that repo --
-the frame conventions and display colours are copied, as `qc/crop_geometry.py`
+the frame conventions and display colours are copied, as `final_pipeline_qc/crop_geometry.py`
 already copies the tile grid, and each copy names its source. Start with
 `--funnel`: it reads no images and reports where in the chain a class
 proportion changes, plus the one reconciliation that must come out exact
@@ -72,17 +79,17 @@ registered cell, reporting its distance and the source TIFF paths and local tile
 coordinates for every overlapping tile in each channel (`source: tiles`).
 
 `configs/` and `.dialog_state/` live at the **repo root**, not inside `shared/`,
-so a tool in `tools/` and a main script in the root find the same ones. Anything
+so a tool in `tools/` and a script in another category directory find the same ones. Anything
 `__file__`-relative in `shared/` therefore anchors on `parents[1]`.
 
 Run everything from the repo root:
 
 ```bash
-python paint_mask.py
-python tools/atlas_view.py
+python mask/paint_mask.py
+python visualization/atlas_view.py
 ```
 
-Scripts in `tools/` put the repo root on `sys.path` themselves before importing
+Runnable scripts in category directories put the repo root on `sys.path` themselves before importing
 from `shared/`, so this works with no `PYTHONPATH` and no package install.
 
 ---
@@ -153,7 +160,7 @@ terminal (Anaconda Prompt or PowerShell); it is a native GUI, no X11 involved.
     described — and the atlas-side subtraction that nesting requires
     (`atlas_exclude_ids`) is derived rather than maintained by hand. Alongside
     the brush labels there is a read-only layer holding *every* region the
-    registration produced, in `tools/atlas_view.py`'s own colours, and a hover
+    registration produced, in `visualization/atlas_view.py`'s own colours, and a hover
     bar along the bottom reading that region's ancestor chain off it. See
     `shared/label_partition.py` for the measured reason a uniform ontology
     depth is not a usable knob.
@@ -239,7 +246,7 @@ python tools/edit_sample_labels.py              # opens a path form
 python tools/edit_sample_labels.py --no-form    # straight from the config
 ```
 
-### `tools/atlas_view.py` — browse an atlas against its ontology
+### `visualization/atlas_view.py` — browse an atlas against its ontology
 
 Read-only. Three synced ortho panes (grayscale template, full annotation in
 colour, and whatever the ontology tree selects), an ontology panel that can
@@ -277,9 +284,9 @@ about the atlas's voxel size unless `sample_downsample` says otherwise, so a
 interactive.
 
 ```bash
-python tools/atlas_view.py
-python tools/atlas_view.py configs/atlas_view.devccf.yaml
-python tools/atlas_view.py --selftest      # plane geometry, no display needed
+python visualization/atlas_view.py
+python visualization/atlas_view.py configs/atlas_view.devccf.yaml
+python visualization/atlas_view.py --selftest      # plane geometry, no display needed
 ```
 
 ### `tools/qc_guide_mask.py` — check a guide mask before you register with it
@@ -408,18 +415,18 @@ luck — which is why the selftests use **anisotropic** spacing and shift along
 
 ## 2D sagittal section masks
 
-The 2D editor is `paint_section2d.py`; its mask composition and session
-roundtrip code is in `section_masks.py`. It reads a section from the same
+The 2D editor is `mask/paint_section2d.py`; its mask composition and session
+roundtrip code is in `tools/section_masks.py`. It reads a section from the same
 sections2d YAML used by `Registration_ants/scripts/register_sections_2d.py`:
 
 ```bash
 conda activate antsreg
-python paint_section2d.py /path/to/sections2d.yaml m1_sec03 --output-dir /path/to/masks
+python mask/paint_section2d.py /path/to/sections2d.yaml m1_sec03 --output-dir /path/to/masks
 ```
 
 Alternatively, set `mode: section2d` in `configs/paint_mask.yaml` with
 `section2d.sections_config`, `section2d.section_name`, and
-`section2d.output_dir`, then run `python paint_mask.py`. The editor
+`section2d.output_dir`, then run `python mask/paint_mask.py`. The editor
 saves a full-resolution tissue TIFF, a damage TIFF, editable tissue state,
 numbered region labels, and a JSON assignment record. Tissue and damage TIFFs
 feed the existing 2D registration config. Region labels currently stay in the
@@ -437,8 +444,8 @@ python -m unittest discover -s tests -p test_section_masks.py -v
 
 ```bash
 conda activate antsreg
-python paint_mask.py --selftest
-python tools/atlas_view.py --selftest
+python mask/paint_mask.py --selftest
+python visualization/atlas_view.py --selftest
 python shared/atlas_reference.py --selftest
 python shared/label_partition.py --selftest
 python shared/hover_bar.py --selftest

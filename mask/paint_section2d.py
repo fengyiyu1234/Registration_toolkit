@@ -1,0 +1,351 @@
+"""Annotate one sagittal section on its original Y,X pixel grid.
+
+Usage: python mask/paint_section2d.py /path/to/sections2d.yaml SECTION_NAME --output-dir masks
+Requires the antsreg environment with napari, PyQt5 and antspyx.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Keep direct execution (`python mask/paint_section2d.py`) equivalent to
+# package execution (`python -m mask.paint_section2d`).
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import yaml
+
+from registration_ants import atlas_utils, config as config_mod, section2d, section_io
+from tools import section_masks
+
+
+def load_section_config(path, name):
+    with open(path, encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    sections = {s["name"]: s for s in cfg.get("sections", [])}
+    if name not in sections and not cfg.get("input_dir"):
+        raise ValueError(f"section {name!r} is absent from sections and no input_dir is set")
+    sec = {**(cfg.get("section_defaults") or {}), **sections.get(name, {}), "name": name}
+    if not sec.get("image"):
+        matches = [p for p in section_io.find_section_images(cfg["input_dir"], cfg.get("input_pattern"))
+                   if p.stem == name]
+        if len(matches) != 1:
+            raise ValueError(f"expected one image named {name} in {cfg['input_dir']}, found {len(matches)}")
+        sec["image"] = str(matches[0])
+    if not sec.get("pixel_size_um") or float(sec["pixel_size_um"]) <= 0:
+        raise ValueError("set a positive pixel_size_um in section_defaults or this section")
+    atlas_cfg = config_mod.resolve_atlas_preset(cfg["atlas"])
+    ontology = atlas_cfg.get("ontology_path")
+    if not ontology:
+        raise ValueError("2D region painting requires atlas.ontology_path")
+    return sec, Path(ontology), cfg.get("registration") or {}
+
+
+auto_mask_raw = section_masks.auto_mask_raw
+
+
+def launch(config_path, name, output_dir):
+    import napari
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                                 QPushButton, QSpinBox, QTreeWidget, QTreeWidgetItem,
+                                 QVBoxLayout, QWidget)
+
+    sec, ontology_path, reg = load_section_config(config_path, name)
+    raw = section_io.load_registration_image(sec["image"], sec.get("channel"),
+                                              sec.get("panel_colors"), sec.get("z_projection", "max"))
+    if raw.ndim != 2:
+        raise ValueError(f"registration image must be 2D: {raw.shape}")
+    px = float(sec["pixel_size_um"])
+    structures = atlas_utils.load_ccf_ontology_json(ontology_path)
+    output_dir = Path(output_dir)
+    saved = section_masks.load_session(output_dir, name, sec["image"], raw.shape, px,
+                                       sec.get("channel"), sec.get("z_projection", "max"), ontology_path)
+    register_um = float(reg.get("register_res_um", section2d.REGISTRATION_DEFAULTS["register_res_um"]))
+    if saved is None:
+        tissue = auto_mask_raw(raw, px, register_um, sec.get("tissue_threshold"))
+        damage = np.zeros(raw.shape, np.uint8)
+        regions = np.zeros(raw.shape, np.uint32)
+        assignments = {}
+    else:
+        tissue, damage, regions, assignments = saved
+        for label, value in assignments.items():
+            for sid in value["region_ids"]:
+                if sid not in structures or structures[sid]["name"] not in value["names"]:
+                    raise ValueError(f"saved assignment {label} does not match current ontology: {sid}")
+
+    viewer = napari.Viewer(title=f"2D masks — {name} — channel {sec.get('channel')} — {px:g} µm/px — {output_dir}")
+    viewer.add_image(raw, name="registration channel", colormap="gray")
+    tissue_layer = viewer.add_labels(tissue.copy(), name="brain tissue (editable)", opacity=0.45)
+    damage_layer = viewer.add_labels(damage.copy(), name="exclude / damage", opacity=0.55)
+    regions_layer = viewer.add_labels(regions.copy(), name="guide regions", opacity=0.55)
+    for layer in (tissue_layer, damage_layer, regions_layer):
+        layer.n_edit_dimensions = 2
+        layer.brush_size = max(1, layer.brush_size)
+    tissue_layer.selected_label = 1
+    damage_layer.selected_label = 1
+    viewer.layers.selection = {tissue_layer}
+
+    panel = QWidget()
+    layout = QVBoxLayout(panel)
+    status = QLabel("区域标签已保存，但当前 2D 配准尚不使用它们。")
+    status.setWordWrap(True)
+    layout.addWidget(status)
+
+    def show_report():
+        report = section_masks.mask_report(tissue_layer.data, damage_layer.data, regions_layer.data)
+        status.setText(f"组织 {report['tissue_fraction']:.1%}；连通域 {report['components']}；"
+                       f"最大面积 {report['largest_components'][:5]}；排除 {report['damage_pixels']} px；"
+                       f"区域在组织外 {report['region_outside_tissue_pixels']} px。"
+                       "区域标签当前未接入 2D 配准。")
+
+    def save():
+        try:
+            report = section_masks.mask_report(tissue_layer.data, damage_layer.data, regions_layer.data)
+            confirm = False
+            if report["tissue_fraction"] < 0.02 or report["tissue_fraction"] > 0.90:
+                if QMessageBox.question(
+                    panel, "组织面积异常",
+                    f"最终组织占全图 {report['tissue_fraction']:.1%}，请检查轮廓。仍然保存？",
+                    QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                    return
+            if report["damage_pixels"] > 0.2 * raw.size:
+                if QMessageBox.question(
+                    panel, "排除面积较大",
+                    f"排除区占全图 {report['damage_pixels'] / raw.size:.1%}，请确认没有把背景涂成排除区。仍然保存？",
+                    QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                    return
+            if report["region_outside_tissue_pixels"]:
+                confirm = QMessageBox.question(
+                    panel, "区域超出组织", f"{report['region_outside_tissue_pixels']} 个区域像素位于最终组织外。仍然保存？",
+                    QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+                if not confirm:
+                    return
+            paths, report = section_masks.save_session(
+                output_dir, name, sec["image"], px, sec.get("channel"),
+                sec.get("z_projection", "max"), tissue_layer.data, damage_layer.data,
+                regions_layer.data, assignments, ontology_path, confirm_outside=confirm,
+                init_parameters={"register_res_um": register_um,
+                                 "tissue_threshold": sec.get("tissue_threshold")})
+            snippet = f"sections:\n  - name: {name}\n    tissue_mask: {paths['tissue']}\n"
+            if report["damage_pixels"]:
+                snippet += f"    damage_mask: {paths['damage']}\n"
+            status.setText(f"已保存到 {output_dir}。\n{snippet}区域标签当前未接入 2D 配准。")
+            print(snippet)
+        except Exception as exc:
+            QMessageBox.critical(panel, "无法保存", str(exc))
+
+    buttons = QHBoxLayout()
+    save_btn = QPushButton("保存全部图层")
+    save_btn.clicked.connect(save)
+    report_btn = QPushButton("检查面积和连通域")
+    report_btn.clicked.connect(show_report)
+    buttons.addWidget(save_btn)
+    buttons.addWidget(report_btn)
+    layout.addLayout(buttons)
+
+    candidate = {"data": None}
+    preview = viewer.add_labels(np.zeros(raw.shape, np.uint8), name="auto candidate (preview)",
+                                opacity=0.25, visible=False)
+    def preview_auto():
+        try:
+            candidate["data"] = auto_mask_raw(raw, px, register_um, threshold.value() if fixed.isChecked() else None)
+            preview.data = candidate["data"]
+            preview.visible = True
+            status.setText("自动分割候选已预览；点击“采用候选”才会替换手工组织层。")
+        except Exception as exc:
+            QMessageBox.critical(panel, "自动分割失败", str(exc))
+
+    def accept_auto():
+        if candidate["data"] is None:
+            return
+        if QMessageBox.question(panel, "替换组织层", "采用候选并覆盖当前组织层的手工修改？",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        tissue_layer.data = candidate["data"].copy()
+        preview.visible = False
+        viewer.layers.selection = {tissue_layer}
+
+    fixed = QCheckBox("固定原始强度阈值")
+    threshold = QSpinBox()
+    threshold.setRange(0, 2_000_000_000)
+    threshold.setValue(int(sec.get("tissue_threshold") or 0))
+    layout.addWidget(fixed)
+    layout.addWidget(threshold)
+    p_btn = QPushButton("预览自动组织候选")
+    p_btn.clicked.connect(preview_auto)
+    a_btn = QPushButton("采用候选")
+    a_btn.clicked.connect(accept_auto)
+    layout.addWidget(p_btn)
+    layout.addWidget(a_btn)
+
+    def polygon_erase():
+        layer = next((x for x in viewer.layers.selection if x in (tissue_layer, damage_layer, regions_layer)), tissue_layer)
+        layer.selected_label = 0
+        layer.mode = "polygon"
+
+    erase_btn = QPushButton("当前图层：多边形擦除")
+    erase_btn.clicked.connect(polygon_erase)
+    layout.addWidget(erase_btn)
+
+    def back_to_brush():
+        layer = next((x for x in viewer.layers.selection if x in (tissue_layer, damage_layer, regions_layer)), tissue_layer)
+        layer.selected_label = max(1, int(layer.selected_label))
+        layer.mode = "paint"
+
+    brush_btn = QPushButton("当前图层：画笔")
+    brush_btn.clicked.connect(back_to_brush)
+    layout.addWidget(brush_btn)
+    viewer.window.add_dock_widget(panel, area="left", name="2D mask tools")
+
+    right = QWidget()
+    rlayout = QVBoxLayout(right)
+    rlayout.addWidget(QLabel("搜索本体，选区域并赋给画笔号；可给同一号赋多个结构。"))
+    search = QLineEdit()
+    search.setPlaceholderText("名称 / 缩写 / ID")
+    rlayout.addWidget(search)
+    tree = QTreeWidget()
+    tree.setHeaderLabels(["结构", "ID"])
+    items = {}
+    for sid, info in sorted(structures.items(), key=lambda pair: len(pair[1]["structure_id_path"])):
+        item = QTreeWidgetItem([f"{info['acronym']} — {info['name']}", str(sid)])
+        item.setData(0, Qt.UserRole, sid)
+        parent_id = info["structure_id_path"][-2] if len(info["structure_id_path"]) > 1 else None
+        if parent_id in items:
+            items[parent_id].addChild(item)
+        else:
+            tree.addTopLevelItem(item)
+        items[sid] = item
+    rlayout.addWidget(tree, 3)
+
+    def filter_tree(query):
+        query = query.strip().lower()
+        visible = set()
+        for sid, info in structures.items():
+            if not query or any(query in str(x).lower() for x in (sid, info["name"], info["acronym"])):
+                visible.update(info["structure_id_path"])
+        for sid, item in items.items():
+            item.setHidden(sid not in visible)
+        if query:
+            tree.expandAll()
+
+    search.textChanged.connect(filter_tree)
+    label_row = QHBoxLayout()
+    label_spin = QSpinBox()
+    label_spin.setRange(1, 65535)
+    label_row.addWidget(QLabel("画笔号"))
+    label_row.addWidget(label_spin)
+    rlayout.addLayout(label_row)
+    assigned = QTreeWidget()
+    assigned.setHeaderLabels(["已赋值画笔号 / 结构", "ID"])
+    rlayout.addWidget(assigned, 2)
+
+    def refresh_assignments():
+        assigned.clear()
+        for label, value in sorted(assignments.items()):
+            top = QTreeWidgetItem([str(label), ""])
+            top.setData(0, Qt.UserRole, label)
+            assigned.addTopLevelItem(top)
+            for sid in value["region_ids"]:
+                child = QTreeWidgetItem([structures[sid]["name"], str(sid)])
+                child.setData(0, Qt.UserRole, label)
+                child.setData(1, Qt.UserRole, sid)
+                top.addChild(child)
+        assigned.expandAll()
+
+    def new_label():
+        used = set(assignments) | set(int(x) for x in np.unique(regions_layer.data))
+        label = next(i for i in range(1, 65536) if i not in used)
+        assignments[label] = {"region_ids": [], "names": []}
+        label_spin.setValue(label)
+        regions_layer.selected_label = label
+        viewer.layers.selection = {regions_layer}
+        refresh_assignments()
+
+    def assign():
+        item = tree.currentItem()
+        if item is None:
+            status.setText("先从本体树选结构。")
+            return
+        sid, label = int(item.data(0, Qt.UserRole)), label_spin.value()
+        value = assignments.setdefault(label, {"region_ids": [], "names": []})
+        if sid not in value["region_ids"]:
+            value["region_ids"].append(sid)
+            value["names"].append(structures[sid]["name"])
+        regions_layer.selected_label = label
+        viewer.layers.selection = {regions_layer}
+        refresh_assignments()
+
+    def remove_assignment():
+        item = assigned.currentItem()
+        if item is None:
+            return
+        label = int(item.data(0, Qt.UserRole))
+        sid = item.data(1, Qt.UserRole)
+        if sid is None:
+            assignments[label] = {"region_ids": [], "names": []}
+        else:
+            idx = assignments[label]["region_ids"].index(int(sid))
+            assignments[label]["region_ids"].pop(idx)
+            assignments[label]["names"].pop(idx)
+        refresh_assignments()
+
+    new_btn = QPushButton("新增区域标签")
+    new_btn.clicked.connect(new_label)
+    assign_btn = QPushButton("赋给画笔号")
+    assign_btn.clicked.connect(assign)
+    remove_btn = QPushButton("移除所选赋值")
+    remove_btn.clicked.connect(remove_assignment)
+    rlayout.addWidget(new_btn)
+    rlayout.addWidget(assign_btn)
+    rlayout.addWidget(remove_btn)
+
+    relabel_row = QHBoxLayout()
+    from_spin, to_spin = QSpinBox(), QSpinBox()
+    for spin in (from_spin, to_spin):
+        spin.setRange(1, 65535)
+    to_spin.setValue(2)
+    relabel_row.addWidget(QLabel("从"))
+    relabel_row.addWidget(from_spin)
+    relabel_row.addWidget(QLabel("到"))
+    relabel_row.addWidget(to_spin)
+    rlayout.addLayout(relabel_row)
+
+    def relabel():
+        src, dst = from_spin.value(), to_spin.value()
+        if src == dst:
+            return
+        if dst in assignments and assignments[dst]["region_ids"]:
+            QMessageBox.warning(right, "无法重编号", "目标画笔号已有赋值，请先移除或选空号。")
+            return
+        data = np.asarray(regions_layer.data).copy()
+        data[data == src] = dst
+        regions_layer.data = data
+        value = assignments.pop(src, None)
+        if value is not None:
+            assignments[dst] = value
+        regions_layer.selected_label = dst
+        refresh_assignments()
+
+    relabel_btn = QPushButton("重编号区域像素及赋值")
+    relabel_btn.clicked.connect(relabel)
+    rlayout.addWidget(relabel_btn)
+    viewer.window.add_dock_widget(right, area="right", name="Atlas / Ontology")
+    refresh_assignments()
+    show_report()
+    napari.run()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config", help="sections2d YAML config")
+    parser.add_argument("section", help="section name")
+    parser.add_argument("--output-dir", help="mask folder (default: <config-dir>/masks2d)")
+    args = parser.parse_args()
+    launch(args.config, args.section, args.output_dir or Path(args.config).resolve().parent / "masks2d")
+
+
+if __name__ == "__main__":
+    main()

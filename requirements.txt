@@ -6,7 +6,7 @@
 # belong in that env rather than getting one of their own:
 #
 #   paint_mask.py  single_sample.py  registration_eval.py
-#   tools/atlas_view.py  tools/edit_sample_labels.py
+#   visualization/atlas_view.py  tools/edit_sample_labels.py
 #   tools/qc_guide_mask.py  tools/convert_regions_ontology.py
 #
 # If antsreg ever has to be rebuilt, these are what they need on top of

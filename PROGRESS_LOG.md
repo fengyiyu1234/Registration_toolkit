@@ -45,3 +45,20 @@ GUI 启动、ontology 赋值、保存和重新打开。尚未用真实切片对�
 **下一步**：用代表性真实切片检查碎片清除、组织边缘和坐标对齐；
 若要让区域标签影响配准，需在 Registration_ants 增加二维图谱区域
 配对与区域约束消费端，并用合成及真实样本确定其权重。
+
+---
+
+## 2026-09-25（续）：2D mask 编辑器及会话模块归入本仓库
+
+从相邻 Registration_ants 移入 `paint_section2d.py`、
+`section_masks.py` 和 `tests/test_section_masks.py`。
+`paint_mask.py` 的 `mode: section2d` 现在直接导入本仓库的
+`paint_section2d.launch()`；不再通过 `runpy` 查找相邻仓库脚本。
+读图、自动 Otsu 分割和原图/工作网格映射仍调用已安装的
+`registration_ants.section_io` / `section2d`，保持
+Toolkit → Registration_ants 的依赖方向。保存的 TIFF/JSON 名称与
+语义不变，之前的 2D 标注会话可按原路径恢复。
+
+`README.md` 已改为从本仓库运行 `python paint_section2d.py ...`。
+迁移后 3 项 mask unittest 全过；原 `paint_mask.py --selftest`
+全过。区域标签依旧未接入 2D 配准的搜索、Affine 或 SyN。

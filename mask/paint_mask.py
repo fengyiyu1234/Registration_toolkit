@@ -1,0 +1,4891 @@
+"""Interactive tool: paint a guide outline on a 3D sample volume.
+
+Three modes, chosen by `mode:` in configs/paint_mask.yaml. The guide and
+labels modes export 3D guides for mask.guide_regions; section2d opens a single
+sagittal section and exports full-resolution TIFF masks for 2D registration.
+The config is `mode:` plus a `common:` section and one section per mode;
+only the running mode's section is read (flatten_config_sections).
+
+  mode: section2d -- open one section from a sections2d config, edit tissue,
+    damage, and numbered region layers, and export YX TIFFs. This mode runs
+    paint_section2d.py in this toolkit; registration image IO and auto-mask
+    routines still come from the installed Registration_ants package.
+
+  mode: guide (default) -- paint on the raw sample, from blank planes.
+    You trace each region by hand and say which atlas structure(s) each brush
+    number stands for, in the ontology tree. Use it when there is no
+    registration yet, or when the one you have is too far off to correct.
+    Everything below this header describes this mode.
+
+  mode: labels -- paint on a registration RESULT, and correct it.
+    Starts from <name>_labels_in_sample.nii.gz collapsed into a partition of
+    brush labels, so the whole brain is already outlined and you only fix
+    what came out wrong, on a handful of planes. Exports two volumes: a
+    sparse guide to re-register with, and a dense one to re-open and carry
+    on from. The partition is refined per region rather than at a fixed
+    ontology depth: pick ANY node in the ontology tree -- at any depth --
+    and it lights up on the sample where the registration put it; split it
+    out and it gets its own brush label to be corrected under, without
+    touching how coarsely the cerebellum is described. Two more layers make
+    that decidable: EVERY atlas region the registration produced, read-only
+    and in visualization/atlas_view.py's own colours, and a hover bar along the
+    bottom naming the region under the cursor with its whole ancestor chain
+    (shared/hover_bar.py). See the "mode: labels" section further down, and
+    shared/label_partition.py for the measured reason a uniform ontology
+    depth is not a usable knob.
+
+    THE CANVAS IS STILL THE RAW STACK. The registration output arrives on
+    the isotropic grid registration ran on (the pipeline's fine_target_um --
+    20 um for both atlas presets here, 25 if it is left unset), and is
+    regridded up onto image_path's grid to be overlaid -- never the other
+    way round. Painting on the isotropic grid would mean drawing at 20 um on
+    planes that were interpolated into existence, instead of at 2.6 um on
+    the planes that were actually imaged; pipeline.py's _build_guide_regions_from_labels
+    says the same thing about where a painted volume has to live. So
+    image_path, the exported grid, and the voxel_size_um that goes into the
+    pipeline config are identical to guide mode's.
+
+A guide outline marks a structure that is genuinely present in both images
+but needs help being aligned correctly (e.g. a bulged/deformed patch of
+cortex that keeps ending up mapped to background). It is NOT an
+inclusion/exclusion mask -- it marks tissue to *actively align*, consumed
+as a paired sample+atlas outline feeding ants.registration()'s
+multivariate_extras (see register.register_to_atlas's `guide_regions`
+parameter and ../Registration_ants/scripts/project_outline.py), never as a
+`mask`/`moving_mask` argument.
+
+Sparse keyframes only: you paint a handful of representative planes and the
+rest is interpolated between them, since a guide outline is a bounded 3D
+blob rather than something that needs a meaningful value on every plane.
+
+  Only the SAMPLE side is painted. The atlas side is not drawn by hand at
+    all: the atlas ships a complete annotation volume (e.g.
+    P04_DevCCF_Annotations_20um.nii.gz) from which Registration_ants builds
+    the matching atlas-side outline by looking the region up. That is what
+    makes the label->region mapping load-bearing rather than cosmetic -- it
+    is the only thing tying "the blob I painted" to "which atlas structure
+    to pair it with".
+
+  Picking the region: point `atlas_annotation_path` + `ontology_path` at an
+    atlas and the tool grows an ontology tree in its own dedicated panel
+    (see "A large, dedicated region panel" below). Selecting any node
+    assigns that structure AND all its descendants to a brush label -- the
+    only way a high-level node means anything, since the annotation's own
+    labels sit at ontology depths 2-12 and a depth-3 node owns no voxels
+    under its own id. The export records the ontology IDS (see
+    write_guide_sidecars for why ids rather than names). The tree's top
+    entry, "damage / no atlas counterpart" (DAMAGE_ID), is the one
+    pseudo-region: assign it to a label painted over sample tissue the
+    atlas cannot match (e.g. contralateral tissue past the midline on a
+    hemisphere sample) and the export records that label under the
+    sidecar's damage_labels key -- the pipeline excludes those voxels
+    from the registration metric (mask.guide_regions.damage_labels)
+    instead of building a guide pair.
+
+    This panel only picks and assigns -- it draws nothing. To actually SEE
+    the atlas (three synced ortho panes, a region highlighted among its
+    neighbours, hover-to-read-the-full-ontology-chain), run the separate
+    visualization/atlas_view.py against the same atlas_annotation_path / ontology_path.
+    The two tools used to be one window pair, with the atlas side driven
+    live from this tree; they are independent scripts now, so nothing
+    painted or assigned here reaches visualization/atlas_view.py and nothing selected
+    there reaches this tool.
+
+    The atlas grid is INDEPENDENT of the sample's: a half-brain sample
+    against a whole-brain atlas is the normal case. The atlas is never
+    registered to the sample -- what is exported is ids plus voxel indices
+    on the sample's own grid, so nothing about the atlas (its extent,
+    orientation, downsampling) can reach the output. The one thing that
+    must match the pipeline's atlas is the ONTOLOGY, since ids are what
+    crosses over.
+
+  A large, dedicated region panel: the ontology tree lives on its own side
+    of the window (right) rather than sharing a column with Relabel/Export
+    (left), because it is 2-12 levels deep and a tree squeezed into a
+    fraction of a shared dock leaves most of it scrolled out of view. Under
+    it, behind a draggable splitter, is what has been assigned so far --
+    brush label -> its regions, as a tree whose rows are the handles: select
+    any single region there and Remove takes just that one off the label,
+    without hunting it down in the ontology again. A label whose last region
+    is removed does not disappear, it stays listed as empty with a warning,
+    because something is probably still painted with that number.
+
+  THE REGION PANEL OWNS THE RIGHT COLUMN, alone. Export / Relabel / Erase /
+    Display are one panel on the LEFT (_add_tools_panel), each a foldable
+    section: click a header to open it, and it stays open while you use it.
+    They were four tabbed docks; each is a handful of controls, so tabs meant
+    one small panel on screen and three hidden behind labels that had to be
+    remembered. The left side is also where napari's own layer controls
+    live, tabbed together with this panel (see _tab_the_panels) so the two
+    do not stack into slivers; napari's layer list sits stacked below that
+    tab group instead of inside it, since it is what you check after
+    painting and should not need a tab click to see.
+
+  THE SAMPLE IS NAMED ON SCREEN: the window title carries it, and the strip
+    pinned above those sections repeats it with the files this session reads
+    and writes -- image, resume, and where the export is going
+    (_sample_banner). Both modes' windows are otherwise identical whichever
+    brain is in them, and the only record of which one that was used to be
+    the config, off in a terminal that had scrolled away.
+
+  A "Relabel" section: click-to-fill a single already-painted blob into
+    another label, or renumber one label across the whole volume. A bulk
+    renumber carries that label's ontology assignment with it, so the number
+    keeps meaning the same region.
+
+  An "Erase" section: lasso a polygon around a mistake and everything inside
+    it is erased on that plane, whatever label it carried -- rubbing a whole
+    wrong blob out with the eraser brush is the slow way to do the same
+    thing. The brush/eraser size slider is also widened past napari's own
+    1..40 ceiling (see MAX_BRUSH_SIZE), since 40 voxels is a dot on a plane
+    several hundred voxels across.
+
+  Several regions at once: the paint layer is a napari Labels layer, so
+    label 1/2/3/... are different brush values, one per brain region (see
+    `region_labels` in configs/paint_mask.example.yaml). One label can carry
+    SEVERAL atlas regions -- DevCCF has no single "cortex" structure, only 36
+    separate `layer N of <area>` ones. They are exported as ONE multi-label
+    volume plus a `.regions.json` sidecar naming each label, and each label
+    is interpolated on its own -- see interpolate_labels_separately for why
+    they must not be interpolated together.
+
+TWO FACTS THIS TOOL DELIBERATELY DOES NOT PAPER OVER
+
+  1. The raw registration.tif carries no voxel size in its header.
+     SimpleITK reads spacing=(1.0, 1.0, 1.0) for it even though the real
+     voxel size is e.g. [2.6, 2.6, 32.0] um (x, y, z), and the export's
+     CopyInformation() copies that same (1,1,1) onto the output -- on
+     purpose, so the outline stays on exactly the input's grid. The
+     consequence is that NOTHING downstream can learn the voxel size by
+     reading either file's header; it has to be passed explicitly. The
+     `.regions.json` sidecar says so in writing (voxel_size_um_note), and
+     the config's `voxel_size_um: [x, y, z]` is the ONE place it is stated:
+     napari's display aspect is that triple reversed, the pasteable pipeline
+     snippet quotes it verbatim, and `mode: labels` regrids with it. It
+     never changes the exported values (those are voxel indices).
+
+  2. Axis order: images are read via SimpleITK
+     (`sitk.GetArrayFromImage`), giving the natural (z,y,x) array order
+     with axis 0 = the actual imaging/atlas planes -- deliberately NOT
+     `ants.image_read().numpy()`, which gives the reverse axis order for
+     the same file (verified against real pipeline output), so axis 0 would
+     scroll through a left-right cross-section instead of the actual
+     z-planes, and you'd paint on the wrong slices without any error to
+     warn you.
+
+Usage (needs a display; runs in the antsreg conda env, which has
+napari+PyQt5+SimpleITK alongside antspyx and the pip-installed-editable
+registration_ants package this file imports from): edit
+configs/paint_mask.yaml (gitignored -- copy it from
+configs/paint_mask.example.yaml the first time, which has every key filled in
+under common:/guide:/labels: rather than commented out), then just run the
+file -- no command-line arguments.
+
+    conda activate antsreg
+    python mask/paint_mask.py
+    python mask/paint_mask.py configs/paint_mask.guide_s12t.yaml  # or point at another config
+
+To actually look at the atlas (not just assign regions to brush labels),
+run the separate visualization/atlas_view.py -- see its own docstring.
+
+The export logic is separately runnable with no display and no config, on
+purely synthetic data:
+
+    python mask/paint_mask.py --selftest
+
+shared/atlas_reference.py --selftest and visualization/atlas_view.py --selftest cover
+the atlas loading / ontology math and the ortho-view geometry that used to be
+tested here.
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+# `python mask/paint_mask.py` puts mask/ rather than the repository root on
+# sys.path. Add the root explicitly so direct-script and `python -m` launches
+# resolve the same project packages.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import SimpleITK as sitk
+import yaml
+
+from shared import atlas_reference   # GUI-free atlas loading + ontology math
+from shared import local_config      # configs/<tool>.yaml
+from shared import label_partition   # brush-label <-> ontology-region partitions
+from shared import ontology_tree_ui  # the shared Qt ontology tree widget
+from shared import hover_bar         # the shared bottom 'region under cursor' bar
+# The reposition data model lives in Registration_ants, not here: the pipeline
+# applies these plans too, and the dependency between the two repos runs one
+# way only -- this one imports that one through its editable install.
+from registration_ants import reposition
+
+# napari/PyQt5 are imported lazily by _import_gui() rather than here, and
+# mask_utils by _interpolate_sparse_mask(), so that --selftest (pure numpy +
+# scipy, no window) runs with no display and without the ../Registration_ants
+# editable install. Both are hard requirements for the actual painting GUI,
+# which only ever runs in antsreg.
+napari = QLabel = QPushButton = QVBoxLayout = QWidget = None
+QCheckBox = QHBoxLayout = QLineEdit = QSpinBox = QListWidget = None
+QTreeWidget = QTreeWidgetItem = QSplitter = QFrame = Qt = None
+
+
+def _import_gui():
+    """Bind the napari/Qt names used by the viewer code. Called once at the
+    top of the GUI entry points; import errors surface there rather than at
+    module import, which is what keeps --selftest env-independent."""
+    global napari, QLabel, QPushButton, QVBoxLayout, QWidget
+    global QCheckBox, QHBoxLayout, QLineEdit, QSpinBox, QListWidget, QListWidgetItem
+    global QTreeWidget, QTreeWidgetItem, QSplitter, QFrame, Qt
+    global QSlider, QDoubleSpinBox
+    import napari as _napari
+    from PyQt5.QtCore import Qt as _Qt
+    from PyQt5.QtWidgets import (QCheckBox as _QCheckBox, QFrame as _QFrame,
+                                 QHBoxLayout as _QHBoxLayout,
+                                 QLabel as _QLabel, QLineEdit as _QLineEdit,
+                                 QListWidget as _QListWidget,
+                                 QListWidgetItem as _QListWidgetItem,
+                                 QPushButton as _QPushButton,
+                                 QSpinBox as _QSpinBox,
+                                 QSplitter as _QSplitter,
+                                 QTreeWidget as _QTreeWidget,
+                                 QTreeWidgetItem as _QTreeWidgetItem,
+                                 QSlider as _QSlider,
+                                 QDoubleSpinBox as _QDoubleSpinBox,
+                                 QVBoxLayout as _QVBoxLayout, QWidget as _QWidget)
+    napari, QLabel, QPushButton = _napari, _QLabel, _QPushButton
+    QVBoxLayout, QWidget = _QVBoxLayout, _QWidget
+    QCheckBox, QHBoxLayout, QLineEdit, QSpinBox = _QCheckBox, _QHBoxLayout, _QLineEdit, _QSpinBox
+    QListWidget, QListWidgetItem = _QListWidget, _QListWidgetItem
+    QTreeWidget, QTreeWidgetItem, QSplitter, Qt = _QTreeWidget, _QTreeWidgetItem, _QSplitter, _Qt
+    QFrame = _QFrame
+    QSlider, QDoubleSpinBox = _QSlider, _QDoubleSpinBox
+
+
+def _interpolate_sparse_mask():
+    """registration_ants.mask_utils.interpolate_sparse_mask -- resolved
+    through the editable install of ../Registration_ants (pip install -e
+    there puts it on sys.path for the antsreg env), no path hacking needed.
+    mask_utils is pure numpy/scipy, so this import does NOT drag in
+    antspyx."""
+    from registration_ants import mask_utils
+    return mask_utils.interpolate_sparse_mask
+
+
+def _interpolate_sparse_label_correction():
+    """registration_ants.mask_utils.interpolate_sparse_label_correction --
+    the multi-label sibling of the above, used by `mode: labels`. Same lazy
+    import for the same reason (--selftest must not need the editable
+    install)."""
+    from registration_ants import mask_utils
+    return mask_utils.interpolate_sparse_label_correction
+
+# This config used to live in the repo root; it now sits in configs/ like every
+# other tool's. The old location is still read, with a migration note printed.
+_LEGACY_CONFIG_PATHS = (ROOT / "paint_mask_local.yaml",)
+
+
+MODES = ("guide", "labels", "section2d")
+
+
+def flatten_config_sections(cfg, mode):
+    """`common:` plus the running mode's own section, flattened into one dict.
+
+    The config file is written as mode + common/guide/labels sections because a
+    single flat list of every key gave no way to see which of them the mode you
+    are about to run actually reads -- the mode-specific ones had to be left
+    commented out to stay out of the way, which is not a state a config file
+    should have to be in. Sections make "filled in but not used right now" the
+    normal state: the INACTIVE mode's section is dropped rather than merged, so
+    labels_path can sit there with a real path while mode: guide runs, and
+    switching modes is a one-line edit.
+
+    Top-level keys are still read (that is what every config looked like before
+    the sections existed, and a one-mode config needs no ceremony); common:
+    overrides them and the mode section overrides both, so the more specific
+    place always wins.
+    """
+    flat = {k: v for k, v in cfg.items() if k not in ("mode", "common") + MODES}
+    for name in ("common", mode):
+        block = cfg.get(name)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            raise ValueError(f"`{name}:` in the config should be a key: value mapping, "
+                             f"got {type(block).__name__}")
+        flat.update(block)
+    return flat
+
+
+def _load_local_config(cli_path=None):
+    """Paths live in a gitignored configs/paint_mask.yaml instead of constants
+    here, so editing them for a new sample never shows up as a git diff."""
+    raw = local_config.load_config(
+        "paint_mask", cli_path=cli_path, legacy_paths=_LEGACY_CONFIG_PATHS)
+    mode = (raw.get("mode") or "guide").strip().lower()
+    if mode not in MODES:
+        raise ValueError(f"mode must be guide, labels, or section2d, got {mode!r}")
+    # After flattening, not before: image_path/output_path normally live under
+    # `common:` now, and load_config's own required= check only sees the top
+    # level. Same message it would have printed.
+    cfg = flatten_config_sections(raw, mode)
+    if mode == "section2d":
+        missing_2d = [k for k in ("sections_config", "section_name") if not cfg.get(k)]
+        if missing_2d:
+            raise ValueError(f"section2d config is missing: {missing_2d}")
+        return SimpleNamespace(mode=mode, sections_config=cfg["sections_config"],
+                               section_name=cfg["section_name"], output_dir=cfg.get("output_dir"))
+    missing = [k for k in ("image_path", "output_path") if not cfg.get(k)]
+    if missing:
+        raise ValueError(
+            f"config is missing: {', '.join(missing)} (looked at the top level, in "
+            f"`common:` and in `{mode}:`)\n"
+            f"(what each key means: {local_config.example_path('paint_mask')})")
+    return SimpleNamespace(
+        mode=mode,
+        image_path=cfg["image_path"],
+        output_path=cfg["output_path"],
+        existing_mask_path=cfg.get("existing_mask_path") or None,
+        region_labels=_normalize_region_labels(cfg.get("region_labels") or {}),
+        region_ids=_normalize_region_ids(cfg.get("region_ids") or {}),
+        damage_labels=_normalize_damage_labels(
+            cfg.get("damage_labels") or [],
+            cfg.get("region_labels") or {}, cfg.get("region_ids") or {}),
+        atlas=atlas_reference.atlas_reference_config(cfg),
+        # mode: labels only -- see the "painting on a registration result"
+        # section of the module docstring.
+        labels_path=cfg.get("labels_path") or None,
+        # Where the dense working file is WRITTEN, and -- separately -- which
+        # one is read back to carry on from. They used to be one key, which
+        # meant a key named "..._output_path" was also the tool's main input:
+        # continuing from last session's file while writing this session's
+        # under a new name was impossible without copying files by hand.
+        # `resume_from` defaults to the write path, i.e. the old behaviour.
+        # atlas_output_path is that old name, still accepted -- it was never
+        # in atlas SPACE either (the dense volume is on the raw stack's grid,
+        # like everything else this tool writes); "dense" is what it is.
+        dense_output_path=(cfg.get("dense_output_path")
+                           or cfg.get("atlas_output_path") or None),
+        resume_from=cfg.get("resume_from") or None,
+        partition_path=cfg.get("partition_path") or None,
+        min_region_mm3=float(cfg.get("min_region_mm3") or label_partition.DEFAULT_MIN_MM3),
+        # (x,y,z) um for image_path. Optional in mode: guide (only the
+        # display aspect and the pasteable snippet want it), REQUIRED in
+        # mode: labels, where the registration output has to be regridded
+        # onto the raw stack before it can be overlaid on it and the raw
+        # stack's header does not carry a voxel size (module docstring).
+        voxel_size_um=_config_voxel_size_um(cfg),
+        labels_voxel_size_um=(list(cfg["labels_voxel_size_um"])
+                              if cfg.get("labels_voxel_size_um") else None),
+    )
+
+
+def _normalize_label_map(raw, key_name, coerce, describe):
+    """{brush label -> [entry, ...]}, label keys forced to int, values always
+    a list.
+
+    A label maps to a LIST, not a single entry, because one guide region
+    routinely needs several ontology entries: DevCCF has no single "cortex"
+    structure, only 36 separate `layer N of <area>` ones, and the pipeline's
+    mask.guide_regions.atlas_names/atlas_ids union a list per label for
+    exactly that reason. A bare scalar is accepted as a one-element list --
+    `1: cortex` is the obvious spelling and reads identically to `1: [cortex]`.
+
+    YAML gives `1: cortex` as an int key but `"1": cortex` as a string one,
+    and both spellings look identical in the file, so everything downstream
+    would silently miss half the mapping if this didn't normalize.
+    """
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{key_name} should be a {{label: {describe}}} mapping, "
+                         f"got {type(raw).__name__}")
+
+    normalized = {}
+    for key, entries in raw.items():
+        try:
+            label = int(key)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{key_name} keys must be brush labels (integers), got {key!r}") from None
+        if label < 1:
+            raise ValueError(f"{key_name} labels must be >= 1 (0 is background/eraser), "
+                             f"got {label}")
+        if label in normalized:
+            raise ValueError(f"{key_name} lists label {label} twice "
+                             "(once as an int key and once as a str key?)")
+        if isinstance(entries, (str, int)):
+            entries = [entries]
+        try:
+            entries = [coerce(e) for e in entries]
+        except (TypeError, ValueError):
+            raise ValueError(f"{key_name} label {label} should map to {describe}, "
+                             f"got {entries!r}") from None
+        if not entries:
+            raise ValueError(f"{key_name} label {label} has an empty {describe}")
+        normalized[label] = entries
+    return normalized
+
+
+def _region_name(value):
+    name = str(value).strip()
+    if not name:
+        raise ValueError(value)
+    return name
+
+
+def _normalize_region_labels(raw):
+    """{brush label -> [brain region name, ...]}. Whether a name actually
+    resolves in the atlas ontology is checked by the ontology picker when an
+    atlas is configured, and on the Registration_ants side otherwise."""
+    return _normalize_label_map(raw, "region_labels", _region_name, "brain region name")
+
+
+def _normalize_region_ids(raw):
+    """{brush label -> [ontology structure id, ...]}. Normally written by the
+    GUI's ontology picker rather than by hand; ids beat names downstream
+    because they are matched exactly instead of as substrings."""
+    return _normalize_label_map(raw, "region_ids", int, "ontology structure id (integer)")
+
+
+def _normalize_damage_labels(raw, region_labels, region_ids):
+    """Sorted brush labels marking tissue with NO atlas counterpart (see
+    DAMAGE_ID). Refuses a label that also has region_labels/region_ids -- the
+    same contradiction mask.guide_regions.damage_labels-vs-atlas_ids is
+    refused on the Registration_ants side."""
+    try:
+        labels = sorted({int(v) for v in raw})
+    except (TypeError, ValueError):
+        raise ValueError(f"damage_labels must be a list of brush labels (integers), got {raw!r}") from None
+    if any(label < 1 for label in labels):
+        raise ValueError("damage_labels must be >= 1 (0 is background)")
+    conflict = set(labels) & {int(k) for k in list(region_labels) + list(region_ids)}
+    if conflict:
+        raise ValueError(
+            f"label(s) {sorted(conflict)} are in damage_labels AND region_labels/region_ids -- "
+            "a label cannot both mark tissue with no atlas counterpart and be paired with a region.")
+    return labels
+
+
+def _normalize_voxel_size_um(raw, key="voxel_size_um"):
+    """Optional (x, y, z) micron voxel size -- None if unset.
+
+    (x,y,z) like every other micron triple in the pipeline configs, and the
+    REVERSE of the (z,y,x) axis order SimpleITK hands the arrays back in;
+    display_scale_from_voxel_size does that one reversal, so nobody has to
+    keep two spellings of the same voxel in the config in sync.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        size = [float(v) for v in raw]
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} should be three numbers [x, y, z], got {raw!r}") from None
+    if len(size) != 3:
+        raise ValueError(f"{key} needs exactly 3 numbers [x, y, z], got {len(size)}")
+    if any(v <= 0 for v in size):
+        raise ValueError(f"{key} must be all positive numbers, got {size}")
+    return size
+
+
+def _config_voxel_size_um(cfg):
+    """voxel_size_um from the config, accepting the retired display_scale_zyx.
+
+    display_scale_zyx was a second spelling of the same physical voxel in the
+    opposite axis order, so a config could carry both and have them disagree.
+    Only voxel_size_um survives; an old config's display_scale_zyx is still
+    read (reversed) with a note, and having both is an error rather than a
+    silent pick, because which one won would decide whether mode: labels
+    regrids against 2.6 um or 32 um planes.
+    """
+    voxel = _normalize_voxel_size_um(cfg.get("voxel_size_um"))
+    legacy = _normalize_voxel_size_um(
+        list(reversed(cfg["display_scale_zyx"]))
+        if cfg.get("display_scale_zyx") else None, key="display_scale_zyx (reversed)")
+    if legacy and voxel and legacy != voxel:
+        raise ValueError(
+            f"config has both voxel_size_um {voxel} (x,y,z) and display_scale_zyx "
+            f"{list(reversed(legacy))} (z,y,x), and they describe different voxels. "
+            f"display_scale_zyx is retired -- delete it and keep voxel_size_um.")
+    if legacy and not voxel:
+        print(f"NOTE: display_scale_zyx is retired; using it as voxel_size_um: {legacy} "
+              f"(x,y,z). Rename it in the config -- the display scale is now derived "
+              f"from voxel_size_um.")
+        return legacy
+    return voxel
+
+
+def _read_sitk_array(path):
+    image = sitk.ReadImage(str(path))
+    return image, sitk.GetArrayFromImage(image)
+
+
+def _load_mask_array(path, expected_shape):
+    """Read + binarize an existing mask/guess file. Returns None (with a
+    warning) if its shape doesn't match -- caller decides the fallback."""
+    arr = (sitk.GetArrayFromImage(sitk.ReadImage(str(path))) > 0).astype(np.uint8)
+    if arr.shape != expected_shape:
+        print(f"WARNING: existing-mask shape {arr.shape} != image shape {expected_shape}, not pre-filling.")
+        return None
+    return arr
+
+
+# napari 0.8 builds its brush-size slider with a hardcoded 1..40 range
+# (_qt/layer_controls/widgets/_labels/qt_brush_size_slider.py). A guide
+# outline is painted on planes several hundred voxels across, so 40 is a
+# small dot -- both to fill a region and, mostly, to rub one out again.
+# Starting width of the region panels, in px. A STARTING width, not a cap:
+# the panels are ontology_tree_ui.shrinkable, so both edges stay draggable --
+# a 12-deep tree of region names needs whatever width the names need, and
+# that is not something a constant can know.
+_ONTOLOGY_PANEL_START_PX = 380
+
+MAX_BRUSH_SIZE = 100
+
+
+def _widen_brush_size_slider(paint_layer, maximum=MAX_BRUSH_SIZE):
+    """Raise the ceiling of napari's brush/eraser size slider to `maximum`.
+
+    Two paths, because each on its own has a hole:
+
+      the layer side -- the slider widens its own maximum whenever the layer
+        reports a brush_size above it (QtBrushSizeSliderControl.
+        _on_brush_size_change) and never narrows it again, so pushing the
+        value up and putting it straight back leaves a 1..maximum slider
+        behind. That only reaches controls that already exist.
+
+      the class side -- napari builds a fresh controls widget per layer, and
+        a new one starts from the hardcoded 40 again, so the widget class
+        itself is patched to widen on construction. That is a private module
+        path, hence the guarded import: if it ever moves, the layer-side bump
+        still covers the one layer this tool creates.
+    """
+    try:
+        from napari._qt.layer_controls.widgets._labels.qt_brush_size_slider import (
+            QtBrushSizeSliderControl)
+    except ImportError:
+        QtBrushSizeSliderControl = None
+
+    if QtBrushSizeSliderControl is not None and not getattr(
+            QtBrushSizeSliderControl, "_paint_mask_widened", False):
+        original_init = QtBrushSizeSliderControl.__init__
+
+        def _init(self, parent, layer, _original=original_init):
+            _original(self, parent, layer)
+            if self.brush_size_slider.maximum() < maximum:
+                self.brush_size_slider.setMaximum(maximum)
+
+        QtBrushSizeSliderControl.__init__ = _init
+        QtBrushSizeSliderControl._paint_mask_widened = True
+
+    previous = paint_layer.brush_size
+    paint_layer.brush_size = maximum
+    paint_layer.brush_size = previous
+
+
+def _sample_name(image_path):
+    """What to call the open sample: the image file name with the image
+    suffix taken off (s12t_raw.nii.gz -> s12t_raw).
+
+    Nothing computed depends on it. It exists because both modes used to open
+    a window that looked identical whichever sample the config named, so two
+    sessions side by side -- or one reopened a day later against a config
+    that was never edited -- had nothing on screen saying which brain was
+    being painted."""
+    return _output_stem(image_path).name if image_path else ""
+
+
+def _short_path(path):
+    """The tail of a path, for a dock too narrow for the whole thing: the
+    parent directory and the file name. The full path goes in the tooltip;
+    these are absolute and several levels deep, and the tail is the part that
+    differs between samples."""
+    path = Path(path)
+    return f"\u2026/{path.parent.name}/{path.name}" if path.parent.name else path.name
+
+
+def _launch_viewer(arr, prefill, scale=None, title="Paint guide outline",
+                   layer_name="guide outline (paint here)", image_path=None):
+    """The sample window: the grayscale volume plus the layer painted on.
+
+    scale: optional (z, y, x) physical size per voxel, applied to BOTH layers
+    so they stay registered to each other. Without it a raw 2.6/2.6/32 um
+    stack is drawn as if it were isotropic, i.e. squashed 12x along z, which
+    makes the orthogonal views unusable. Purely a display transform -- layer
+    .data, and therefore the export, is untouched.
+
+    image_path: only to put the sample's name in the window title (see
+    _sample_name). The layer keeps its fixed "sample" name -- that is what
+    the rest of the code and the tests look it up by."""
+    sample = _sample_name(image_path)
+    viewer = napari.Viewer(title=f"{title}  \u2014  {sample}" if sample else title)
+    scale_kwargs = {"scale": scale} if scale is not None else {}
+    viewer.add_image(arr, name="sample", colormap="gray", **scale_kwargs)
+    paint_layer = viewer.add_labels(prefill.copy(), name=layer_name, **scale_kwargs)
+    _widen_brush_size_slider(paint_layer)
+    return viewer, paint_layer
+
+
+def assignment_rows(assignment, structures):
+    """The assignment panel's rows: [(label, [(sid, name), ...]), ...].
+
+    Split out of the widget so the one thing worth checking -- that a label
+    whose last region was removed is still REPORTED rather than silently
+    vanishing -- is testable without a window. A label maps to an empty list
+    exactly when it was assigned regions and they were all removed again;
+    see empty_assignment_labels.
+    """
+    return [(label, [(sid, DAMAGE_NAME if sid == DAMAGE_ID else structures[sid]["name"])
+                     for sid in assignment[label]])
+            for label in sorted(assignment)]
+
+
+def empty_assignment_labels(assignment):
+    """Brush labels left with no region at all.
+
+    These are kept in `assignment` rather than deleted on the way out,
+    precisely so the panel can say so: a label that is still being painted
+    with but has lost its region exports an outline nothing downstream can
+    pair with an atlas structure (guide_export_warnings says the same thing
+    at export time, which is far too late to be the first mention of it).
+    Removing an already-empty label forgets it for good.
+    """
+    return sorted(label for label, ids in assignment.items() if not ids)
+
+
+def display_scale_from_voxel_size(voxel_size_um):
+    """voxel_size_um (x,y,z) -> the napari layer scale (z,y,x), or None when
+    no voxel size was configured.
+
+    The array axes and the pipeline's micron triples run in OPPOSITE orders
+    -- sitk.GetArrayFromImage gives (z,y,x), while mask.guide_regions.
+    voxel_size_um is (x,y,z) like every other micron triple here. Doing the
+    reversal here rather than asking the config for both spellings is the
+    point: a reversed voxel_size_um does not error, it just resamples the
+    outline against the wrong physical size.
+    """
+    return list(reversed(voxel_size_um)) if voxel_size_um else None
+
+
+def guide_regions_yaml_snippet(region_ids, region_names, output_path, voxel_size_um=None,
+                               atlas_exclude_ids=None, voxel_size_note=None,
+                               damage_labels=None):
+    """A ready-to-paste mask.guide_regions block for the pipeline config.
+
+    Emitted on export because the ids are the whole point of picking regions
+    in the GUI and retyping them by hand from a JSON sidecar is exactly where
+    they would get corrupted. atlas_names is emitted alongside as a comment
+    only: two sources of truth that can disagree is precisely the failure
+    ids were chosen to remove, so the pipeline reads the ids and the names
+    stay human-facing.
+    """
+    voxel = list(voxel_size_um) if voxel_size_um else ["?", "?", "?"]
+    note = voxel_size_note or (
+        "# source image (x,y,z) um, copied from the paint_mask config's voxel_size_um"
+        if voxel_size_um else
+        "# source image (x,y,z) um -- not in the tif header, fill it in by hand")
+    lines = [
+        "mask:",
+        "  guide_regions:",
+        f"    regions_mask: {output_path}",
+        f"    voxel_size_um: [{voxel[0]}, {voxel[1]}, {voxel[2]}]   {note}",
+    ]
+    if region_ids:
+        lines.append("    atlas_ids:")
+    for label in sorted(region_ids):
+        names = ", ".join(region_names.get(label, []))
+        lines.append(f"      {label}: {list(region_ids[label])}" + (f"   # {names}" if names else ""))
+    if damage_labels:
+        lines.append(f"    damage_labels: {sorted(damage_labels)}   # {DAMAGE_NAME} -> moving_mask hole")
+    if atlas_exclude_ids:
+        # Only `mode: labels` emits this, because only a nested partition can
+        # produce it -- see label_partition.Partition.atlas_exclude_ids for
+        # why a residual parent's atlas outline has to have its split-out
+        # children subtracted back out.
+        lines.append("    # subtract each split-out child back out of its parent's atlas")
+        lines.append("    # outline -- without this the same atlas voxels are pulled towards")
+        lines.append("    # two different sample outlines at once.")
+        lines.append("    atlas_exclude_ids:")
+        for label in sorted(atlas_exclude_ids):
+            names = ", ".join(region_names.get(label, []))
+            lines.append(f"      {label}: {list(atlas_exclude_ids[label])}"
+                         + (f"   # out of {names}" if names else ""))
+    lines.append("    weight: 1.0")
+    return "\n".join(lines)
+
+
+def _tab_the_panels(viewer, left, right):
+    """Fold the left side into a TAB BAR (layer controls + the tools panel)
+    sitting above napari's own layer list, instead of three docks stacked
+    down the column.
+
+    napari stacks docks vertically, and stacking is only usable while there
+    are two of them: three slivers each had to be dragged open (at the cost
+    of the ones above it) before it could be used. Layer controls and the
+    tools panel (Export/Relabel/Erase/Display) are tabbed together --
+    whichever is in front gets the whole tab's height, and the other is one
+    click away. The layer list is kept OUT of that tab group and left
+    stacked below it instead: it is what you check after painting to see
+    what layers exist, so it stays visible at all times rather than being a
+    tab someone has to remember to click over to.
+
+    The right side is the region panel alone, so `right` is normally one
+    entry and this leaves it alone; it stays a list because tabify is exactly
+    what a second panel there would need.
+
+    The layer-controls height unclamp goes here too, because it is the same
+    complaint: that dock stops shrinking while it still fills half the column
+    (see ontology_tree_ui.free_layer_controls_height), which is precisely
+    what makes a stacked left column unusable.
+
+    Which tab starts in front: this tool's own panel rather than napari's
+    layer controls, i.e. the tools panel on the left.
+    """
+    ontology_tree_ui.free_layer_controls_height(viewer)
+    left = [dock for dock in left if dock is not None]
+    right = [dock for dock in right if dock is not None]
+    layer_controls_dock, layer_list_dock = ontology_tree_ui.napari_layer_docks(viewer)
+    tab_group = [dock for dock in [layer_controls_dock] + left if dock is not None]
+    ontology_tree_ui.tabify(viewer, tab_group, current=left[0] if left else None)
+    if layer_list_dock is not None:
+        layer_list_dock.show()
+    ontology_tree_ui.tabify(viewer, right, current=right[0] if right else None)
+
+
+def _export_controls(on_export, button_text):
+    """The Export section: the button, and nothing else.
+
+    It used to carry a scrolling report -- what was written, the warnings,
+    and the ready-to-paste guide_regions block -- which made the export panel
+    by far the tallest thing on the right and pushed everything else out of
+    reach. All of it still goes to the TERMINAL (every caller prints the same
+    string it used to show), where it can be scrolled back to and copied from
+    after the fact instead of being trimmed to fit a dock.
+    """
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
+    export_btn = QPushButton(button_text)
+    export_btn.clicked.connect(on_export)
+    layout.addWidget(export_btn)
+    layout.addWidget(QLabel("Report, warnings and the pasteable config\nblock go to the terminal."))
+    return section
+
+
+def _sample_banner(image_path, rows):
+    """The strip at the top of the tools dock naming which sample is open,
+    and the files this session reads and writes.
+
+    The window title carries the name (see _sample_name); this carries the
+    paths behind it, which is the half that answers the question actually
+    worth asking before painting for an hour -- not just "which sample" but
+    "which FILE of it", i.e. was the resume picked up, is the registration
+    being corrected the one that was just re-run, where is this about to be
+    written. All of it is in the config and none of it was on screen.
+
+    It sits above the foldable sections and does not fold: it is three or
+    four lines, and a fact you want to be able to glance at is not one to put
+    behind a click.
+
+    `rows` is [(caption, path or None), ...]; a row with no path is dropped,
+    so callers can list an optional input unconditionally.
+    """
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 4)
+    layout.setSpacing(2)
+    heading = QLabel(_sample_name(image_path) or "(no image_path)")
+    heading.setStyleSheet("font-weight: bold; font-size: 14px;")
+    heading.setToolTip(str(image_path))
+    layout.addWidget(heading)
+    for caption, path in rows:
+        if not path:
+            continue
+        line = QLabel(f"{caption}: {_short_path(path)}")
+        # Wrapped, not clipped: the dock is shrinkable (its minimum width is 1),
+        # so a path too long for the current width would otherwise be cut off
+        # mid-word with nothing to say it had been.
+        line.setWordWrap(True)
+        line.setStyleSheet("color: rgba(255, 255, 255, 150);")
+        line.setToolTip(str(path))          # the whole path, on hover
+        line.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(line)
+    ontology_tree_ui.shrinkable(section)
+    return section
+
+
+def _add_tools_panel(viewer, sections, name="Export & tools", area="left", open_first=True,
+                     header=None):
+    """Export, Relabel, Erase and Display as COLLAPSIBLE SECTIONS of one dock,
+    on the LEFT, rather than four tab pages on the right.
+
+    Two changes, one after the other, and both for the same reason -- these
+    four are a handful of controls each, and the panel that matters is the
+    region panel:
+
+      tabs -> sections: a tab page shows one small panel and hides three
+        others behind labels that have to be remembered. (What made a single
+        column possible at all was the export report moving to the terminal;
+        as a scrolling text box it was the tallest thing in the window.)
+
+      right -> left, folded: the region panel (ontology tree, 12 levels deep,
+        plus the group list) is what this tool is FOR and now gets the right
+        column to itself. These fold up next to napari's own layer list, and
+        the one you are using stays open while the others take a header's
+        worth of height each.
+
+    `sections` is [(title, widget), ...], drawn in order; the first opens,
+    the rest start folded (open_first=False folds them all). Clicking a
+    header toggles it -- several can be open at once, since they are
+    independent controls rather than pages of one thing.
+
+    `header` is an optional widget pinned above them all, unfoldable (the
+    sample banner -- see _sample_banner).
+
+    The dock is scroll-wrapped so it can still be dragged short on a laptop
+    screen (the same helper napari's own layer controls get, for the same
+    reason).
+    """
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    if header is not None:
+        layout.addWidget(header)
+    for index, (title, widget) in enumerate(sections):
+        if index:
+            # Painted rather than a sunken QFrame line: napari's dark theme
+            # draws that as one nearly invisible dark-on-dark pixel row.
+            rule = QFrame()
+            rule.setFrameShape(QFrame.NoFrame)
+            rule.setFixedHeight(1)
+            rule.setStyleSheet("background: rgba(255, 255, 255, 40);")
+            layout.addWidget(rule)
+        # A checkable button, not a QLabel with a mouse handler: it carries
+        # the open/closed state itself, and Qt gives it keyboard focus and a
+        # hover cue for free, so a header reads as something to click.
+        head = QPushButton()
+        head.setCheckable(True)
+        head.setFlat(True)
+        head.setStyleSheet("text-align: left; font-weight: bold; letter-spacing: 1px;"
+                           "padding: 4px 0px; border: none;")
+
+        def fold(open_, title=title, head=head, widget=widget):
+            head.setText(("\u25be  " if open_ else "\u25b8  ") + title.upper())
+            widget.setVisible(open_)
+
+        head.toggled.connect(fold)
+        layout.addWidget(head)
+        layout.addWidget(widget)
+        ontology_tree_ui.shrinkable(widget)
+        head.setChecked(open_first and index == 0)
+        fold(head.isChecked())          # toggled does not fire when the state did not change
+    layout.addStretch(1)
+    ontology_tree_ui.shrinkable(dock)
+    dock_widget = viewer.window.add_dock_widget(dock, area=area, name=name)
+    ontology_tree_ui.scroll_wrap_dock(dock_widget)
+    return dock_widget
+
+
+def _relabel_controls(viewer, paint_layer, on_change=None):
+    """The Relabel section: "change what an already-painted region is
+    labelled".
+
+    Two operations, because "the label of this blob is wrong" splits into
+    two different jobs and only one of them is a bulk edit:
+
+      pick + fill: click a blob, it takes the target label. This is napari's
+        own FILL mode, exposed as a button because the tool is otherwise a
+        keyboard shortcut people do not find. n_edit_dimensions is pinned to
+        2 -- the fill spreads across x and y, i.e. the plane on screen, and
+        stops there. 3 would flood across z, which on a sparse keyframe
+        stack either does nothing (the planes are not connected) or --
+        once the interpolated resume of a previous export is loaded --
+        silently eats neighbouring planes.
+
+      relabel all: renumber every voxel of one label at once, for when a
+        whole region was drawn under the wrong number.
+
+    on_change is called after a bulk relabel so the caller can refresh
+    anything keyed on label numbers (the guide mode's assignment panel).
+    """
+    from_spin, to_spin = QSpinBox(), QSpinBox()
+    for spin in (from_spin, to_spin):
+        spin.setRange(0, MAX_LABEL)
+    from_spin.setValue(1)
+    to_spin.setValue(2)
+
+    note = QLabel("Change the label of an already-painted region")
+    status = QLabel("")
+    status.setWordWrap(True)
+    # Hidden until it has something to say: four sections share one column
+    # now, so a message box that reserves its height while empty costs every
+    # section below it (see _add_tools_panel).
+    status_box = ontology_tree_ui.scrollable(status, 60)
+    status_box.setVisible(False)
+
+    def say(text):
+        status.setText(text)
+        status_box.setVisible(bool(text))
+
+    def start_fill():
+        # selected_label is what FILL paints with, so set it from `to`.
+        # 2 = the fill spans x and y, the plane on screen. 1 would span only
+        # the last displayed axis, filling a single row of pixels.
+        paint_layer.n_edit_dimensions = 2
+        paint_layer.selected_label = int(to_spin.value())
+        paint_layer.mode = "fill"
+        say(f"Fill mode: click any blob and it becomes label {int(to_spin.value())}. "
+            "(switch back to the paint brush before drawing again)")
+
+    def relabel_all():
+        src, dst = int(from_spin.value()), int(to_spin.value())
+        if src == dst:
+            say("from and to are the same -- nothing to change.")
+            return
+        n = relabel_volume(paint_layer.data, src, dst)
+        paint_layer.refresh()
+        if on_change is not None:
+            on_change(src, dst)
+        say(f"label {src} -> {dst}: {n} voxels changed."
+            + ("" if n else " (nothing was ever painted with that label)"))
+
+    fill_btn = QPushButton("Click-to-fill one blob")
+    fill_btn.clicked.connect(start_fill)
+    all_btn = QPushButton("Relabel the whole label")
+    all_btn.clicked.connect(relabel_all)
+
+    row = QWidget()
+    row_layout = QHBoxLayout(row)
+    row_layout.addWidget(QLabel("from"))
+    row_layout.addWidget(from_spin)
+    row_layout.addWidget(QLabel("to"))
+    row_layout.addWidget(to_spin)
+
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(note)
+    layout.addWidget(row)
+    layout.addWidget(fill_btn)
+    layout.addWidget(all_btn)
+    layout.addWidget(status_box)
+    return section
+
+
+def _display_controls(layers):
+    """The Display section: a fill/outline switch for the region layers.
+
+    napari's Labels layers are FILLED by default (contour = 0) and this tool
+    has never changed that -- filled is what shows which region a blob
+    actually is. The switch is here for the other half of the job: dropping
+    to a 1-voxel contour uncovers the raw stack underneath, which is how you
+    check whether a boundary sits where the tissue boundary sits. napari's
+    own layer controls carry the same `contour` field per layer; this drives
+    every region layer at once and puts it where it gets used.
+
+    single_sample.py has the same checkbox, with the same default, so the two
+    tools agree about what "showing a region" looks like.
+    """
+    layers = [layer for layer in layers if layer is not None]
+
+    def on_toggled(checked):
+        for layer in layers:
+            layer.contour = 1 if checked else 0
+
+    checkbox = QCheckBox("Region outline only (unchecked = filled)")
+    checkbox.setChecked(False)
+    checkbox.toggled.connect(on_toggled)
+
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(checkbox)
+    layout.addWidget(QLabel(
+        "Filled shows what each region IS; outline uncovers the image under it,\n"
+        "for checking a boundary against the tissue."))
+    return section
+
+
+def _erase_controls(viewer, paint_layer):
+    """The Erase section: lasso a polygon and everything inside it, on the
+    plane you are looking at, is erased.
+
+    napari's own eraser is the brush painting label 0 -- fine for nudging an
+    edge, painful for taking out a whole wrong blob, which is exactly what a
+    keyframe drawn on the wrong plane or a region that bled into its
+    neighbour needs. napari 0.8's Labels layer already carries a POLYGON mode
+    (click the corners, double-click or Enter to close); pointing it at label
+    0 turns it into an eraser, which is all this panel wires up -- no new
+    editing path, so undo/redo and the keyframe bookkeeping are unchanged.
+
+    n_edit_dimensions is set to 2 on the way in: polygon painting is 2D-only
+    (Labels._get_polygon_mask_and_bbox raises otherwise), and 2 also means
+    the erase stays on the plane you can see -- every other plane is
+    hand-drawn work that a polygon dragged somewhere else must not touch.
+
+    It erases every label inside the polygon, not just the selected one:
+    that is what "eraser" means everywhere else in the tool, and the blob
+    you are rubbing out is often exactly the one that came out under the
+    wrong number. Set napari's own "preserve labels" if you need the other
+    behaviour.
+    """
+    # The label to come back to. Remembered rather than read on the way out,
+    # because by then selected_label is 0 (the eraser) and the number the
+    # user was painting with would be lost.
+    last_label = {"value": max(1, int(paint_layer.selected_label))}
+
+    status = QLabel("")
+    status.setWordWrap(True)
+    status_box = ontology_tree_ui.scrollable(status, 80)
+    status_box.setVisible(False)          # same as Relabel's: no blank strip
+
+    def say(text):
+        status.setText(text)
+        status_box.setVisible(bool(text))
+
+    def start_polygon_erase():
+        if paint_layer.selected_label:
+            last_label["value"] = int(paint_layer.selected_label)
+        viewer.layers.selection = {paint_layer}   # modes belong to the active layer
+        paint_layer.n_edit_dimensions = 2
+        paint_layer.selected_label = 0            # 0 = background = erase
+        paint_layer.mode = "polygon"
+        say(
+            "Polygon erase on this plane: left-click each corner, then double-click "
+            "(or press Enter) to close it -- everything inside is erased, whatever "
+            "label it had. Right-click drops the last corner, Esc drops the whole "
+            "polygon, Ctrl+Z undoes a finished erase.")
+
+    def back_to_brush():
+        viewer.layers.selection = {paint_layer}
+        # 2 = napari's default, i.e. the brush paints the plane on screen.
+        paint_layer.n_edit_dimensions = 2
+        paint_layer.selected_label = last_label["value"]
+        paint_layer.mode = "paint"
+        say(f"Back to the brush, painting label {last_label['value']}.")
+
+    polygon_btn = QPushButton("Polygon erase")
+    polygon_btn.clicked.connect(start_polygon_erase)
+    brush_btn = QPushButton("Back to brush")
+    brush_btn.clicked.connect(back_to_brush)
+
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(QLabel(
+        "Erase a mistake with a polygon instead of scrubbing it out with the\n"
+        f"eraser brush. The brush/eraser size slider goes up to {MAX_BRUSH_SIZE}."))
+    layout.addWidget(polygon_btn)
+    layout.addWidget(brush_btn)
+    layout.addWidget(status_box)
+    return section
+
+
+# =====================================================================================
+# guide export: sparse multi-label keyframes -> dense multi-label volume
+# =====================================================================================
+MAX_LABEL = 255           # the exported volume is uint8, as is the paint layer
+
+# Pseudo-"region" for tissue that exists in the sample but has NO counterpart
+# in the atlas (e.g. a sliver of contralateral tissue past the midline on a
+# hemisphere sample). Assignable from the ontology picker like any region, but
+# it is never a real ontology id: the export strips it out of region_ids and
+# records the label under a separate `damage_labels` sidecar key, which the
+# pipeline turns into a moving_mask hole (mask.guide_regions.damage_labels)
+# instead of a guide pair. Negative so it can never collide with an ontology
+# structure id.
+DAMAGE_ID = -1
+DAMAGE_NAME = "damage / no atlas counterpart"
+
+VOXEL_SIZE_UM_NOTE = (
+    "Voxel size is NOT in this file's header, by design. The source image (a raw "
+    "registration.tif) carries no spacing, so SimpleITK reads spacing=(1,1,1) for it, "
+    "and this mask copies the source's geometry verbatim (CopyInformation) so that both "
+    "sit on exactly the same grid. The real voxel size (e.g. [2.6, 2.6, 32.0] um in x,y,z) "
+    "therefore cannot be recovered from either header and must be passed explicitly by "
+    "whatever consumes this mask. All indices in this sidecar are voxel indices along "
+    "array axis 0 (the imaging planes, i.e. z), matching sitk.GetArrayFromImage's (z,y,x) order."
+)
+
+
+# =====================================================================================
+# The Reposition section -- closing the gaps left by tissue that split open
+# =====================================================================================
+# Offered in BOTH modes, as one more foldable section of the same left dock.
+# It is not a mode of its own because it is not an alternative to painting a
+# guide: a cracked brain needs the flaps closed AND its regions outlined, and
+# forcing those into separate sessions would mean painting the guide on
+# geometry that is about to move. Exported together, the plan moves the guide
+# outline along with the stack (apply_reposition.py does both), so what was
+# traced stays on the tissue it was traced on.
+#
+# FRAGMENTS ARE THEIR OWN LAYER, NOT BRUSH LABELS
+# A flap of cortex IS cortex: it belongs in the cortex guide label like the
+# rest of it. "Which region is this" and "does this move" are independent
+# questions about the same voxels, and a single-valued raster cannot answer
+# both -- painting the flap as its own brush label to move it would take it
+# out of the region it is part of. So fragments get a second Labels layer,
+# whose numbers mean fragments rather than regions.
+#
+# BUT IT IS NOT NORMALLY PAINTED. Tracing every piece a second time, after the
+# guide outline already covers that tissue, is work with nothing in it. On the
+# planes where a piece is open it is ALREADY its own connected component --
+# that is what a crack is -- so one click takes it. A grab is ONE PLANE: the
+# extent along z is whichever planes get clicked, filled between when the plan
+# is applied, so nothing infers how far a piece goes and several pieces sharing
+# an xy footprint at different z stay separate by construction. A crack too
+# tight to separate at any threshold is painted in by hand on the fragments
+# layer instead -- a grab takes ONE connected component, and two pieces still
+# touching are one of them.
+#
+# WHAT THE CONTROLS ARE
+# Per fragment, per z plane: an in-plane rigid transform (tx, ty, theta) plus
+# a whole-plane dz. Out-of-plane rotation is deliberately absent -- see
+# shared/reposition.py's module docstring for why 3 measurable degrees of
+# freedom beat 6 where three of them are decided by noise.
+#
+#   Drag the outline       the coarse pose, the quick way. Copy this
+#                          fragment's own silhouette on this plane and drag
+#                          and rotate the copy onto where the tissue belongs.
+#                          The pose is read back from where every vertex ended
+#                          up (reposition.fit_from_points, an orthogonal
+#                          Procrustes fit) AS THE SHAPE MOVES -- the drag is
+#                          the input, there is nothing to press after it, and
+#                          the numbers it produces are what the plan holds: a
+#                          drawing cannot be interpolated between planes,
+#                          applied to cells on a finer grid, or inverted.
+#                          napari's selection box will RESIZE if a corner
+#                          handle is dragged; a resize is not a rigid move, so
+#                          it is measured and reported instead of absorbed.
+#                          (There was a second way in: draw a line across a
+#                          feature on the piece, drag a copy onto where that
+#                          feature belongs, fit from the pair. Exact, and it
+#                          needed no shape -- but it asked for "this piece goes
+#                          there" to be restated as two abstract endpoints
+#                          first, which was the whole of the fiddliness. Plans
+#                          from then record the pair each keyframe was fitted
+#                          from; it is dropped on load and not written again.)
+#   The four sliders       the fine pose. There is deliberately no live image
+#                          preview here: judging a reposition means looking at
+#                          every plane it touches, which is a batch job with
+#                          numbers attached, not something to squint at one
+#                          slice at a time while dragging. tools/qc_guide_mask.py
+#                          renders the before/after strip and the boundary
+#                          report, off the same code the export uses.
+#   Rotation centre        put it ON the hinge. The tear a rigid move opens is
+#                          exactly the displacement at the still-attached
+#                          point, so pivoting there makes it zero.
+#   (no Set button)        the pose is recorded as soon as it is set: fitting,
+#                          dragging a slider or typing a number records this
+#                          plane, and so does touching a control and putting it
+#                          back, which is how a plane is pinned at identity.
+#                          There was a "Set keyframe on this plane" button and
+#                          it was a step that could only be forgotten -- a pose
+#                          fitted, looked at and scrolled away from reverted to
+#                          the interpolation without saying so. Planes between
+#                          keyframes interpolate; outside them nothing moves,
+#                          and nothing tapers to identity on its own, so the
+#                          plane a piece stops moving on is one to pin.
+#                          "Delete keyframe on this plane" takes one back off.
+#
+# WHAT SURVIVES A REOPEN. Two files, written next to the mode's own export:
+# <stem>_fragments.nii.gz (the outlines, sparse -- the planes with voxels ARE
+# the grabbed planes) and <stem>.reposition.json (the plan). Both go out as
+# soon as anything has been GRABBED, keyframes or not, because separating the
+# pieces is the slow half of the work and losing it to "nothing has moved yet"
+# is losing the afternoon. The ghosts are not written and do not need to be:
+# reopening redraws one per resumed keyframe, at the pose that keyframe holds,
+# so a plan comes back as something to keep DRAGGING rather than as numbers to
+# type at (restore_ghosts). Coming back the other way, the plan is looked for
+# next to output_path AND next to the file this session is resuming from
+# (load_reposition_resume) -- rounds are normally given new output names, and
+# keying only on the new one left every fragment behind at the old stem. Cuts
+# are the exception and do not survive: they steer a grab, the pipeline has no
+# fragment for them, and redrawing one takes a second.
+
+_REPOSITION_FRAGMENTS_LAYER = "fragments to reposition (paint here)"
+_REPOSITION_GHOST_LAYER = "fragment ghost (drag and rotate)"
+# Cycled over the `fragment` feature so a line's colour says which flap it
+# belongs to. Distinct at a glance against grayscale tissue, and enough of
+# them that the samples with several cracks do not wrap round.
+_FRAGMENT_COLOURS = ("#ffd166", "#06d6a0", "#ef476f", "#118ab2", "#c77dff", "#f78c6b")
+# Reserved: the one brush number on the fragments layer that is never a
+# fragment. It used to be painted by a "Draw a cut" button, to take voxels out
+# of the tissue before a grab walked it; that button is gone, and the number
+# stays reserved so a stray 255 -- hand-painted, or in a file from back then --
+# can never become a piece that moves. The spin box stops one below it and the
+# export strips it.
+_REPOSITION_CUT_LABEL = 255
+
+
+def _slider_row(text, lo, hi, decimals=1, suffix=" um", name=None):
+    """A labelled slider paired with a spin box, both editing one value.
+
+    Both, not either: a slider is how a pose is found (drag, watch, stop when
+    it meshes) and a number is how one is recorded and re-entered, and the
+    step size that suits dragging is far coarser than the one that suits
+    typing a value back in from a previous session.
+    """
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(QLabel(text))
+    box = QDoubleSpinBox()
+    box.setRange(lo, hi)
+    box.setDecimals(decimals)
+    box.setSingleStep(10 ** -decimals * 10)
+    box.setSuffix(suffix)
+    box.setMinimumWidth(90)
+    if name:
+        # Named so the GUI smoke test can address one control instead of
+        # indexing into findChildren(), which silently re-points at a
+        # different slider the moment another one is added above it.
+        box.setObjectName(name)
+    slider = QSlider(Qt.Horizontal)
+    step = 10 ** -decimals
+    slider.setRange(int(round(lo / step)), int(round(hi / step)))
+    guard = {"busy": False}
+
+    def from_slider(v):
+        if not guard["busy"]:
+            guard["busy"] = True
+            box.setValue(v * step)
+            guard["busy"] = False
+
+    def from_box(v):
+        if not guard["busy"]:
+            guard["busy"] = True
+            slider.setValue(int(round(v / step)))
+            guard["busy"] = False
+
+    slider.valueChanged.connect(from_slider)
+    box.valueChanged.connect(from_box)
+    layout.addWidget(slider, 1)
+    layout.addWidget(box)
+    # The slider hangs off the box rather than being returned beside it: every
+    # caller wants the box, one caller (the pose controls, which record a plane
+    # as soon as it is touched) also needs sliderReleased, and widening the
+    # return would touch six call sites to serve one.
+    box.slider = slider
+    return row, box
+
+
+def _export_reposition(state, output_path):
+    """`state.export`, with a refusal reported instead of raised.
+
+    An exception out of a Qt button handler does not surface as a message, it
+    takes the process down -- and the guide outline, which is fine and has
+    nothing to do with the plan, would go unwritten with it. So a plan that
+    cannot be denominated is a loud warning next to a successful guide export,
+    not a crash.
+    """
+    try:
+        return state.export(output_path)
+    except ValueError as exc:
+        print(f"WARNING: the reposition plan was NOT written -- {exc}")
+        return []
+
+
+def _reposition_controls(viewer, image_arr, voxel_size_um, scale=None, resume=None,
+                         paint_layer=None):
+    """Build the Reposition section. Returns (widget, state), where state
+    carries `export(output_path)` for the mode's own export to call and
+    `plan()` for anything else that wants the current transforms."""
+    scale_kwargs = {"scale": scale} if scale is not None else {}
+    # voxel_size_um is OPTIONAL for painting a guide -- there it only sets the
+    # display aspect -- but a reposition plan is denominated in microns on this
+    # grid, and the cell path converts centroids through it. Falling back to
+    # (1,1,1) keeps the panel usable for a look around, and `has_voxel_size`
+    # stops an export: a plan written in voxels-called-microns applies to the
+    # image self-consistently and moves the cells by the wrong scale, which is
+    # a discrepancy nothing downstream can see.
+    has_voxel_size = bool(voxel_size_um)
+    voxel_um = list(voxel_size_um) if voxel_size_um else [1.0, 1.0, 1.0]
+    n_planes = image_arr.shape[0]
+
+    fragments = {}          # label -> {"name": str, "center_um": [x, y], "keyframes": {z: kf}}
+    if resume is not None and tuple(resume["plan"]["image_shape_zyx"]) != tuple(image_arr.shape):
+        # A plan found next to a previous round's stem is not necessarily this
+        # sample's (see load_reposition_resume): plane numbers and micron
+        # offsets only mean anything on the grid they were drawn on.
+        print(f"WARNING: the reposition plan was drawn on a {tuple(resume['plan']['image_shape_zyx'])} "
+              f"volume but this sample is {tuple(image_arr.shape)} -- not resuming it.")
+        resume = None
+    if resume is not None:
+        for frag in resume.get("plan", {}).get("fragments", []):
+            label = int(frag["label"])
+            # `segments` is dropped rather than read: plans written before the
+            # two-line fit was removed carry the pair each keyframe was fitted
+            # from, and there is no longer a layer to draw it on. Stripping it
+            # here also keeps it out of anything this session exports -- the
+            # transform itself was always the record, the pair only provenance.
+            kfs = {int(k["z"]): {key: value for key, value in k.items() if key != "segments"}
+                   for k in frag["keyframes"]}
+            centre = (kfs[min(kfs)]["center_um"] if kfs else [0.0, 0.0])
+            fragments[label] = {"name": frag.get("name", ""), "center_um": list(centre),
+                                "keyframes": kfs}
+
+    prefill = np.zeros(image_arr.shape, dtype=np.uint8)
+    if resume is not None and resume.get("fragments") is not None:
+        prefill = resume["fragments"]
+    frag_layer = viewer.add_labels(prefill, name=_REPOSITION_FRAGMENTS_LAYER,
+                                   visible=False, opacity=0.55, **scale_kwargs)
+    _widen_brush_size_slider(frag_layer)
+    # Every line records the fragment it was drawn for. Without that, a pair is
+    # just "the last two shapes in the layer" -- which is fine for one flap and
+    # wrong the moment there are three: lines drawn for fragment 2 would be
+    # read as fragment 1's, and the fit would be a plausible number computed
+    # from the wrong pair, with nothing to notice it. Colouring by the same
+    # feature makes the grouping visible instead of only enforced.
+    # HOW A POSE IS ENTERED: drag the piece's own silhouette.
+    #
+    # There was a second way -- draw a line across a feature on the fragment,
+    # drag a copy of it onto where that feature belongs, fit from the pair. It
+    # was exact and needed no shape at all, but it asked for the judgement
+    # "this piece goes there" to be re-expressed as two abstract endpoints
+    # before it could be entered, and that re-expression was the whole of the
+    # fiddliness. A copy of the OUTLINE is the same three degrees of freedom
+    # entered directly: put the shape where the tissue goes.
+    #
+    # The ghost is scratch: replaced every time the outline is copied, never
+    # leaving the window. What gets exported is the label volume and the
+    # numbers the drag produced -- and because those numbers say exactly where
+    # the ghost was, a resumed plan gets its ghosts drawn back onto their
+    # keyframe planes (restore_ghosts) rather than saved.
+    ghost = viewer.add_shapes(
+        name=_REPOSITION_GHOST_LAYER, ndim=3, visible=False,
+        features={"fragment": np.zeros(0, dtype=int), "plane": np.zeros(0, dtype=int)},
+        feature_defaults={"fragment": 1, "plane": 0},
+        edge_color="fragment", edge_color_cycle=list(_FRAGMENT_COLOURS),
+        face_color="transparent", edge_width=2, **scale_kwargs)
+    ghost.text = {"string": "f{fragment} ghost", "size": 9, "color": "white",
+                  "anchor": "upper_left"}
+    ghost_source = {}       # (label, z) -> (N, 2) xy microns, as copied
+    # (label, z) -> the same ghost's vertices as they were last READ, in
+    # voxels. ghost_source answers "what pose is this ghost showing"; this one
+    # answers "which ghost did the hand just move", and they cannot be the
+    # same dict -- see moved_ghosts.
+    ghost_seen = {}
+    dropping = {"busy": False}   # set while a ghost is being removed, not dragged
+
+    section = QWidget()
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(0, 0, 0, 0)
+
+    label_row = QWidget()
+    label_layout = QHBoxLayout(label_row)
+    label_layout.setContentsMargins(0, 0, 0, 0)
+    label_layout.addWidget(QLabel("fragment"))
+    label_spin = QSpinBox()
+    label_spin.setRange(1, _REPOSITION_CUT_LABEL - 1)
+    # Named for the same reason the sliders are: the tools dock holds several
+    # spin boxes (Relabel has its own), and findChild() would hand a test
+    # whichever came first.
+    label_spin.setObjectName("reposition_fragment")
+    label_layout.addWidget(label_spin)
+    name_edit = QLineEdit()
+    name_edit.setPlaceholderText("name (optional)")
+    # Named for the same reason the spin box and sliders are: the tools dock
+    # holds several line edits, and findChild() hands back whichever is first.
+    name_edit.setObjectName("reposition_name")
+    label_layout.addWidget(name_edit, 1)
+    layout.addWidget(label_row)
+
+    extent_um = (image_arr.shape[2] * voxel_um[0], image_arr.shape[1] * voxel_um[1])
+    tx_row, tx_box = _slider_row("tx", -extent_um[0], extent_um[0], name="reposition_tx")
+    ty_row, ty_box = _slider_row("ty", -extent_um[1], extent_um[1], name="reposition_ty")
+    th_row, th_box = _slider_row("rot", -180.0, 180.0, suffix=" deg", name="reposition_rot")
+    dz_row, dz_box = _slider_row("dz", -(n_planes - 1), n_planes - 1, decimals=0,
+                                 suffix=" planes", name="reposition_dz")
+    for row in (tx_row, ty_row, th_row, dz_row):
+        layout.addWidget(row)
+
+    # WHERE A GRAB LOOKS FOR TISSUE. The outline already painted is the better
+    # answer wherever it exists: it is a hand-drawn boundary, so it follows the
+    # anatomy and carries no debris, no specks and no threshold to tune. What
+    # it does not do is exist on every plane -- a guide is painted on keyframes
+    # -- so the raw stack, thresholded, is the fallback and stays selectable
+    # for a plane that was never painted, or for an outline drawn as one rough
+    # blob straight across the crack (a component cannot separate what was
+    # painted together).
+    from_painted = QCheckBox("grab from the painted mask (else image threshold)")
+    from_painted.setChecked(paint_layer is not None)
+    from_painted.setEnabled(paint_layer is not None)
+    layout.addWidget(from_painted)
+    grab_row, grab_box = _slider_row("tissue", float(image_arr.min()), float(image_arr.max()),
+                                     decimals=0, suffix="", name="reposition_threshold")
+    grab_box.setValue(reposition.otsu_threshold(image_arr))
+    layout.addWidget(grab_row)
+    if not has_voxel_size:
+        warning = QLabel("voxel_size_um is not set in the config, so offsets here are in "
+                         "VOXELS, not microns. Exporting a plan is blocked until it is set.")
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #ffd166;")
+        layout.addWidget(warning)
+
+    centre_label = QLabel("rotation centre: fragment centroid")
+    centre_label.setWordWrap(True)
+    layout.addWidget(centre_label)
+
+    status = QLabel("")
+    status.setWordWrap(True)
+
+    interpolate_box = QCheckBox("interpolate between keyframes")
+    interpolate_box.setChecked(True)
+    feather_row, feather_box = _slider_row("feather", 0.0, 200.0, name="reposition_feather")
+    keyframes_list = QListWidget()
+    keyframes_list.setMaximumHeight(140)
+
+    def goto_keyframe(item):
+        """A row is a place, not just a readout: clicking it selects that
+        fragment and scrolls to that plane, which is the only way to look at
+        what a keyframe did without hunting for its z by hand."""
+        label, z = item.data(Qt.UserRole)
+        label_spin.setValue(int(label))
+        viewer.dims.set_current_step(0, int(z))
+
+    keyframes_list.itemClicked.connect(goto_keyframe)
+
+    # ---------------------------------------------------------------- helpers
+
+    def current_z():
+        return int(viewer.dims.current_step[0])
+
+    def entry(label, create=True):
+        label = int(label)
+        if label not in fragments and create:
+            fragments[label] = {"name": "", "center_um": None, "keyframes": {}}
+        return fragments.get(label)
+
+    def default_centre(label):
+        """The fragment's own centroid, in microns -- a pivot that is at least
+        inside the tissue, for the common case where the hinge is out of plane
+        and there is no in-plane point that has to stay put."""
+        mask = frag_layer.data == int(label)
+        if not mask.any():
+            return [extent_um[0] / 2, extent_um[1] / 2]
+        _, iy, ix = np.nonzero(mask)
+        return [float(ix.mean() * voxel_um[0]), float(iy.mean() * voxel_um[1])]
+
+    def centre_for(label):
+        e = entry(label)
+        if e.get("center_um") is None:
+            e["center_um"] = default_centre(label)
+        return e["center_um"]
+
+    def build_plan():
+        frags = []
+        for label, e in sorted(fragments.items()):
+            kfs = []
+            for z, kf in sorted(e["keyframes"].items()):
+                built = reposition.make_keyframe(z, kf["tx_um"], kf["ty_um"], kf["theta_deg"],
+                                                 kf["dz_planes"], kf["center_um"])
+                kfs.append(built)
+            frags.append(reposition.make_fragment(label, kfs, e["name"]))
+        return reposition.make_plan(image_arr.shape, voxel_um, frags,
+                                    interpolate=interpolate_box.isChecked(),
+                                    feather_um=feather_box.value())
+
+    # Which planes each fragment is on, cached. Recomputing it is a pass over
+    # the whole fragments volume -- 1.4e9 voxels on a raw grid -- and the
+    # summary below wants it every time a keyframe changes, which is now every
+    # time a pose control is touched. One pass on demand, thrown away whenever
+    # the layer is edited, instead of one pass PER LABEL per refresh.
+    plane_cache = {"by_label": None}
+
+    def invalidate_planes(*_):
+        plane_cache["by_label"] = None
+
+    frag_layer.events.data.connect(invalidate_planes)
+    frag_layer.events.paint.connect(invalidate_planes)
+
+    def grabbed_planes(label):
+        if plane_cache["by_label"] is None:
+            found = {}
+            for z, plane in enumerate(frag_layer.data):
+                for value in np.unique(plane):
+                    if value and int(value) != _REPOSITION_CUT_LABEL:
+                        found.setdefault(int(value), []).append(int(z))
+            plane_cache["by_label"] = found
+        return plane_cache["by_label"].get(int(label), [])
+
+    def refresh_keyframes():
+        """The keyframe list only -- cheap, and runs on every pose edit."""
+        keyframes_list.clear()
+        for label, e in sorted(fragments.items()):
+            for z, kf in sorted(e["keyframes"].items()):
+                item = QListWidgetItem(
+                    f"label {label}  z={z}  tx={kf['tx_um']:.0f} ty={kf['ty_um']:.0f} "
+                    f"rot={kf['theta_deg']:.1f}  dz={kf['dz_planes']:+d}")
+                item.setData(Qt.UserRole, (label, z))
+                keyframes_list.addItem(item)
+
+    def refresh_summary():
+        """...and the per-fragment tally under it, which has to look at the
+        volume (see grabbed_planes) and so runs only when the SET of planes or
+        keyframes changes, not on every value."""
+        rows = []
+        for lab, e in sorted(fragments.items()):
+            planes = grabbed_planes(lab)
+            if not planes and not e["keyframes"]:
+                continue
+            rows.append(f"{lab}{' ' + e['name'] if e['name'] else ''}: "
+                        f"{len(planes)} grabbed plane(s)"
+                        + (f" {planes[0]}..{planes[-1]}" if planes else "")
+                        + f", {len(e['keyframes'])} keyframe(s)")
+        status.setText("\n".join(rows) if rows else
+                       "No fragments yet: pick a number, Grab this plane, then click a piece.")
+
+    def refresh_list(*_):
+        refresh_keyframes()
+        refresh_summary()
+
+    def load_plane(*_):
+        """Sliders follow the plane being looked at, so scrolling through a
+        fragment shows what each plane is actually set to instead of leaving
+        the last edited pose on screen next to a different section."""
+        e = entry(label_spin.value())
+        # Only the transform fields: an old keyframe read back from a plan can
+        # still carry keys make_keyframe does not take (see the resume above).
+        tf = reposition.plane_transform(
+            reposition.make_fragment(
+                label_spin.value(),
+                [reposition.make_keyframe(
+                    z, kf["tx_um"], kf["ty_um"], kf["theta_deg"], kf["dz_planes"], kf["center_um"])
+                 for z, kf in sorted(e["keyframes"].items())]),
+            current_z(), interpolate_box.isChecked()) if e["keyframes"] else None
+        # `posing`, not blockSignals: the box's own valueChanged is what drags
+        # the slider along with it (see _slider_row), so silencing the box
+        # leaves the slider parked at the previous plane's pose while the
+        # number next to it reads the new one. The flag stops the pose being
+        # RECORDED (commit_pose) without stopping the two halves of one control
+        # from staying in step.
+        posing["busy"] = True
+        try:
+            for box, key in ((tx_box, "tx_um"), (ty_box, "ty_um"), (th_box, "theta_deg")):
+                box.setValue(tf[key] if tf else 0.0)
+            dz_box.setValue(tf["dz_planes"] if tf else 0)
+        finally:
+            posing["busy"] = False
+        # The name follows the fragment too, and is stored as it is typed
+        # (name_edit.editingFinished) -- leaving the previous fragment's name in
+        # the box would mean the next one silently inherits it: two pieces
+        # called the same thing, in the plan and in every QC line quoting it.
+        name_edit.blockSignals(True)
+        name_edit.setText(e.get("name", ""))
+        name_edit.blockSignals(False)
+        c = centre_for(label_spin.value())
+        centre_label.setText(f"rotation centre: x={c[0]:.0f} y={c[1]:.0f} um")
+
+    # ---------------------------------------------------------------- actions
+
+    # Set while the panel is writing the pose controls itself (scrolling to a
+    # plane, or filling them from a fit), so those writes are not read back as
+    # somebody posing this plane. See commit_pose.
+    posing = {"busy": False}
+
+    def commit_pose(*_):
+        """Record the pose showing for the plane showing -- automatically.
+
+        There used to be a "Set keyframe on this plane" button and this was
+        behind it. It is now wired to the pose controls themselves (the four
+        sliders and their boxes, and both Fit buttons), because the button was
+        a step that could only be FORGOTTEN: a pose that is fitted, looked at
+        and then scrolled away from silently reverts to the interpolation, and
+        nothing says so.
+
+        Touching a control counts, not only changing its value: that is how a
+        plane gets pinned at identity -- click a slider handle and release, or
+        press Enter in its box, on a plane the piece must NOT move on, and the
+        zeros are recorded like any other pose. Interpolation runs BETWEEN
+        keyframes, so a piece that has to ramp in from an unmoved plane needs
+        that plane said out loud.
+
+        Silent on a plane the fragment is not on: a transform there would move
+        nothing, and there is no reason to write one down.
+        """
+        if posing["busy"]:
+            return                        # the panel is loading a plane, not being posed
+        label = label_spin.value()
+        if not (frag_layer.data[current_z()] == label).any():
+            status.setText(f"Plane {current_z()} has no fragment {label} on it, so nothing was "
+                           f"recorded. Grab the fragment on this plane first -- the planes you "
+                           f"grab are the outline's keyframes, and the planes between them are "
+                           f"filled when the plan is applied.")
+            return
+        e = entry(label)
+        was_new = current_z() not in e["keyframes"]
+        e["keyframes"][current_z()] = dict(
+            tx_um=tx_box.value(), ty_um=ty_box.value(), theta_deg=th_box.value(),
+            dz_planes=int(dz_box.value()), center_um=list(centre_for(label)))
+        refresh_keyframes()
+        if was_new:
+            # Only when the SET changed: the tally counts planes, which costs a
+            # pass over the volume, and this runs on every slider tick.
+            refresh_summary()
+
+    def delete_keyframe():
+        e = entry(label_spin.value(), create=False)
+        if e and e["keyframes"].pop(current_z(), None) is not None:
+            refresh_list()
+            load_plane()
+        else:
+            status.setText(f"No keyframe on plane {current_z()} for fragment "
+                           f"{label_spin.value()}.")
+
+    def centre_from_cursor():
+        """Pin the pivot to the hinge. The cursor rather than a typed number
+        because the hinge is a place you can see and cannot name.
+
+        Moving the pivot must not move the tissue. The same rigid map written
+        about a different fixed point needs a different translation -- leaving
+        tx/ty alone would swing the piece by (R - I)(c_new - c_old), i.e. the
+        moment you pin the hinge on a piece already posed, it jumps. So tx/ty
+        are re-expressed here: where the tissue lands is unchanged, only the
+        two numbers it is written down as.
+        """
+        pos = viewer.cursor.position
+        label = label_spin.value()
+        new_centre = [float(pos[2] / (scale[2] if scale else 1.0) * voxel_um[0]),
+                      float(pos[1] / (scale[1] if scale else 1.0) * voxel_um[1])]
+        # The new pivot's own image under the pose as it stands: about a pivot,
+        # the translation IS where that pivot goes (R(c - c) = 0).
+        landed = reposition.transform_points_um(
+            [new_centre],
+            reposition.make_keyframe(current_z(), tx_box.value(), ty_box.value(),
+                                     th_box.value(), int(dz_box.value()), centre_for(label)))[0]
+        entry(label)["center_um"] = new_centre
+        posing["busy"] = True
+        try:
+            tx_box.setValue(float(landed[0] - new_centre[0]))
+            ty_box.setValue(float(landed[1] - new_centre[1]))
+        finally:
+            posing["busy"] = False
+        centre_label.setText(f"rotation centre: x={new_centre[0]:.0f} y={new_centre[1]:.0f} um  "
+                             f"(from cursor)")
+        commit_pose()
+
+    def arm_grab():
+        """Wait for a click ON THE IMAGE, then grab what is under it.
+
+        The button cannot read the cursor when it is pressed: to press it the
+        mouse has to leave the image, so "hover the fragment, then press the
+        button" is an ordering the interaction actively fights, and pressing
+        first grabs whatever the cursor last happened to be over -- usually
+        nothing, which looks exactly like a button that does not work.
+        Arming a one-shot canvas click puts the two in the order they are
+        thought in: say what you want, then point at it.
+
+        The fragments layer is selected in pan_zoom while armed, so the click
+        lands as a click and not as a brush stroke on whatever layer happened
+        to be active.
+        """
+        previous = (set(viewer.layers.selection), frag_layer.mode)
+        frag_layer.visible = True
+        viewer.layers.selection = {frag_layer}
+        frag_layer.mode = "pan_zoom"
+
+        def on_click(_source, event):
+            try:
+                viewer.mouse_drag_callbacks.remove(on_click)
+            except ValueError:
+                pass
+            viewer.layers.selection, frag_layer.mode = previous
+            do_grab(event.position)
+
+        viewer.mouse_drag_callbacks.append(on_click)
+        status.setText(f"Now click the piece in the image, on this plane, as fragment "
+                       f"{label_spin.value()}.")
+        return on_click
+
+    def do_grab(position):
+        """Take the fragment from a click instead of a traced outline.
+
+        On the planes where it is open, a flap is already its own connected
+        component -- the crack is a gap -- so it does not need drawing twice,
+        once as a region on the guide layer and again here. Clicking it walks
+        that component along z and stops where the flap stops being separate,
+        which is the hinge; the z extent falls out of the same walk rather
+        than being another thing to judge by eye.
+
+        ONE PLANE, always. The extent along z comes from grabbing each piece's
+        planes and letting the fill between them happen when the plan is
+        applied -- the same sparse-keyframe idiom the guide outlines use. A
+        grab replaces only THIS plane for this fragment, so the planes already
+        grabbed for it survive and clicking a second one accumulates.
+
+        Where "tissue" comes from is the `grab from the painted mask` switch
+        above: the outline already painted on this plane when there is one, the
+        raw stack thresholded otherwise. Painted wins by default because it is
+        a boundary someone drew -- it follows the anatomy, has no specks in it
+        and needs no threshold tuned. It is not always available (a guide lives
+        on keyframe planes only) and not always usable (an outline drawn as one
+        blob across the crack has already joined what a component would have to
+        separate), which is what the fallback is for. The status line always
+        says which was used.
+        """
+        seed = tuple(int(round(position[axis] / (scale[axis] if scale else 1.0)))
+                     for axis in (0, 1, 2))
+        label = label_spin.value()
+        try:
+            painted = (paint_layer.data if (from_painted.isChecked() and paint_layer is not None)
+                       else None)
+            if painted is not None and painted[seed[0]].any():
+                source = "the painted mask"
+                tissue = reposition.threshold_planes(painted, 0)
+            else:
+                source = ("the image threshold" if painted is None else
+                          f"the image threshold (nothing painted on plane {seed[0]})")
+                tissue = reposition.threshold_planes(image_arr, grab_box.value())
+            mask, note = reposition.grab_plane(tissue, seed)
+        except ValueError as exc:
+            status.setText(str(exc))
+            return
+        data = frag_layer.data.copy()
+        data[seed[0]][data[seed[0]] == label] = 0    # this plane only; other planes survive
+        data[mask] = label
+        frag_layer.data = data
+        # Shown, not just filled: the layer starts hidden (most samples never
+        # cracked) and a grab whose result cannot be seen reads as a button
+        # that did nothing.
+        frag_layer.visible = True
+        entry(label)["center_um"] = None         # the centroid moved with the new outline
+        print(f"Grabbed fragment {label} at (z={seed[0]}, y={seed[1]}, x={seed[2]}) "
+              f"using {source}: {note}")
+        planes_now = sorted(int(z) for z in np.unique(np.nonzero(data == label)[0]))
+        status.setText(f"Fragment {label}: {note}, from {source}.\n"
+                       f"Now spans plane(s) {planes_now[0]}..{planes_now[-1]} "
+                       f"({len(planes_now)} grabbed).\n\nWrong shape? Untick 'grab from the "
+                       f"painted mask' to use the image instead (the 'tissue' slider then "
+                       f"decides what counts). If the pieces touch on this plane either way, "
+                       f"paint the piece in by hand on the fragments layer -- a grab takes one "
+                       f"connected component, and two pieces that touch are one.")
+        load_plane()
+
+    def ghost_index(label, z):
+        """The index of the ghost for this fragment ON THIS PLANE, or None.
+
+        Per (fragment, plane), not per fragment: a ghost describes one plane's
+        pose, so plane 12's copy has no business being read, moved or thrown
+        away while plane 20 is being worked on. Each stays on the plane it was
+        copied on -- which is also where napari draws it -- so scrolling back
+        shows what was done there.
+        """
+        tags, planes = ghost.features.get("fragment"), ghost.features.get("plane")
+        if tags is None or planes is None:
+            return None
+        found = [i for i in range(len(ghost.data))
+                 if int(tags.iloc[i]) == int(label) and int(planes.iloc[i]) == int(z)]
+        return found[-1] if found else None
+
+    def drop_ghost(label, z):
+        index = ghost_index(label, z)
+        if index is not None:
+            dropping["busy"] = True       # removing a shape is not somebody dragging one
+            try:
+                ghost.selected_data = {index}
+                ghost.remove_selected()
+            finally:
+                dropping["busy"] = False
+        ghost_source.pop((int(label), int(z)), None)
+        ghost_seen.pop((int(label), int(z)), None)
+
+    def place_ghost(label, z, tf=None):
+        """Draw a ghost of fragment `label` on plane `z`, and register the
+        outline it is a copy of. Returns its vertex count; raises ValueError
+        (from outline_polygon) if the fragment has nothing on that plane.
+
+        `tf`, when given, is a pose to put it AT rather than on the tissue --
+        the shared half of copying an outline (dropped on the piece, tf None)
+        and rebuilding one from a keyframe (dropped where that keyframe sends
+        the piece). What gets REGISTERED is the unmoved outline either way,
+        because that is what a later drag is fitted against: the fit answers
+        "where did this piece go", not "how much further did it go", so a
+        restored ghost nudged a millimetre reports the whole pose, not the
+        nudge.
+        """
+        poly = reposition.outline_polygon(frag_layer.data, label, z)
+        drop_ghost(label, z)                 # this plane's ghost only, replaced by the new one
+        source = np.column_stack([poly[:, 1] * voxel_um[0], poly[:, 0] * voxel_um[1]])
+        if tf is None:
+            at = poly                        # on the tissue: the copy starts where it is
+        else:
+            moved = reposition.transform_points_um(source, tf)
+            at = np.column_stack([moved[:, 1] / voxel_um[1], moved[:, 0] / voxel_um[0]])
+        ghost.feature_defaults = {"fragment": int(label), "plane": int(z)}
+        ghost.add([np.column_stack([np.full(len(poly), float(z)), at[:, 0], at[:, 1]])],
+                  shape_type="polygon")
+        ghost_source[(int(label), int(z))] = source
+        # Where it was PUT is where it was last seen: a ghost dropped on the
+        # tissue, and a resumed one dropped where its keyframe sends the piece,
+        # have both said nothing yet.
+        ghost_seen[(int(label), int(z))] = np.asarray(ghost.data[-1], dtype=float)
+        return len(poly)
+
+    def copy_outline():
+        """Copy this fragment's outline on this plane, ready to be dragged.
+
+        The alternative to the two-line fit, and usually the quicker one: the
+        thing being positioned is the piece, so hand over the piece's own
+        shape rather than asking for two endpoints that stand in for it.
+        Dropped exactly on top of the fragment, not offset like the line copy
+        -- it IS the fragment, and where it starts is where the tissue is.
+        """
+        label = label_spin.value()
+        z = current_z()
+        try:
+            n_vertices = place_ghost(label, z)
+        except ValueError as exc:
+            status.setText(str(exc))
+            return
+        ghost.visible = True
+        viewer.layers.selection = {ghost}
+        ghost.mode = "select"
+        ghost.selected_data = {len(ghost.data) - 1}
+        status.setText(
+            f"Fragment {label}'s outline copied on plane {z} ({n_vertices} vertices) and "
+            f"selected. Drag it onto where the tissue belongs; the handle above the box "
+            f"rotates it. The pose follows the drag and is recorded as you go -- there is "
+            f"nothing to press. Do NOT drag a corner of the box: that resizes, and a resize "
+            f"is not a rigid move (it is reported, never applied).")
+
+    def restore_ghosts():
+        """Rebuild a draggable ghost for every keyframe resumed from a plan.
+
+        A pose that comes back as four numbers can only be edited as four
+        numbers -- but the way it was ENTERED was by dragging the piece's own
+        silhouette onto where it belongs, so without this the second session
+        on a sample is a worse tool than the first, for exactly the poses that
+        are hardest to get right by typing. The ghosts themselves are still
+        scratch (nothing writes them to disk; the plan holds the transforms),
+        and scratch that can be regenerated exactly should be: this session's
+        outline of the tissue, mapped through the keyframe that was recorded
+        for it, IS where last session left the ghost.
+
+        Registered against the UNMOVED outline (see place_ghost), so nudging a
+        restored ghost re-fits the whole pose rather than composing a second
+        one on top of it.
+
+        Quiet about the planes it cannot draw: a keyframe whose fragment has
+        no voxels there -- a plan resumed without its _fragments.nii.gz, or
+        one hand-edited -- still applies and is still editable on the sliders,
+        it just has no silhouette to make a handle out of.
+        """
+        drawn, missing = 0, 0
+        for label, e in sorted(fragments.items()):
+            for z, kf in sorted(e["keyframes"].items()):
+                try:
+                    place_ghost(label, z, kf)
+                except ValueError:
+                    missing += 1
+                else:
+                    drawn += 1
+        if drawn:
+            ghost.visible = True
+            print(f"[resume] redrew {drawn} fragment ghost(s) on their keyframe planes -- drag "
+                  f"one to re-pose that plane, no need to type into the sliders.")
+        if missing:
+            print(f"[resume] {missing} resumed keyframe(s) have no fragment voxels on their "
+                  f"plane, so no ghost was drawn for them (the sliders still edit them).")
+
+    def moved_ghosts():
+        """Every ghost ON THIS PLANE that has been dragged since it was last
+        read, as [(label, vertices), ...].
+
+        Measured against ghost_seen -- where each ghost was when this last ran
+        -- and NOT against ghost_source, the unmoved outline it is a copy of.
+        The two are the same only until a ghost is posed; after that it sits
+        off its copy FOR GOOD, and for good was the bug. Read against the copy,
+        "has this been dragged" meant "has this ever been dragged", so on a
+        plane carrying two pieces the first one posed answered for everything
+        that happened there afterwards: dragging the second piece re-fitted the
+        first (invisibly -- its ghost had not moved, so the same numbers were
+        written again) and the piece actually under the mouse got NO keyframe,
+        not that session and not any later one, because a resume redraws the
+        ghosts already posed and puts the trap straight back. Copying the
+        second outline was enough on its own: ghost.add emits a data event too,
+        and the fragment selector jumped to the other piece on the spot.
+
+        Restricted to the plane on screen, and that restriction is the whole
+        point of keying ghosts by plane. A ghost on a plane nobody is looking
+        at is not being dragged, and reading one would record its pose against
+        the plane on screen.
+
+        A list rather than one: napari moves every SELECTED shape together, so
+        two ghosts can change on a single event.
+        """
+        moved = []
+        for label, z in list(ghost_source):
+            if z != current_z():
+                continue
+            index = ghost_index(label, z)
+            if index is None:
+                continue                  # its polygon was dropped, entry not yet cleaned up
+            poly = np.asarray(ghost.data[index], dtype=float)
+            seen = ghost_seen.get((label, z))
+            if seen is not None and poly.shape == seen.shape and np.allclose(poly, seen):
+                continue                  # where it was left: nothing new said
+            ghost_seen[(label, z)] = poly
+            moved.append((label, poly))
+        return moved
+
+    def fit_from_outline(*_):
+        """Read the pose back off each dragged ghost -- as it is dragged.
+
+        Wired to the ghost's own data event rather than to a button, for the
+        same reason the Set-keyframe button went: a drawing moved and not
+        converted is a pose that LOOKS set and is not. The plan does not
+        contain shapes, it contains numbers -- tx/ty/theta per plane, in
+        microns -- because those are what interpolate between planes, what
+        apply_to_cells uses on a grid four times finer than this one, and what
+        invert_plan takes back. This is where the drawing becomes them.
+
+        Vertex-for-vertex against the copy that was made, so the answer is the
+        rigid move that best explains where every point went -- not a match of
+        two shapes, which is a harder problem with a worse answer.
+        """
+        if posing["busy"] or dropping["busy"]:
+            return
+        for label, moved in moved_ghosts():
+            fit_one_ghost(label, moved)
+
+    def fit_one_ghost(label, moved):
+        """One dragged ghost -> that fragment's keyframe on this plane."""
+        if label != label_spin.value():
+            # Dragging a ghost IS picking that fragment. Several pieces on one
+            # plane each carry their own ghost, and reading the pose off
+            # whichever number the spin box happened to be left on would fit
+            # the wrong piece -- or, more often, silently fit nothing.
+            label_spin.setValue(int(label))
+        source = ghost_source[(int(label), current_z())]
+        dst = np.column_stack([moved[:, 2] * voxel_um[0], moved[:, 1] * voxel_um[1]])
+        e = entry(label)
+        try:
+            tx, ty, theta, centre, scale = reposition.fit_from_points(
+                source, dst, e.get("center_um"))
+        except ValueError as exc:
+            status.setText(str(exc))
+            return
+        e["center_um"] = list(centre)
+        posing["busy"] = True
+        try:
+            for box, value in ((tx_box, tx), (ty_box, ty), (th_box, theta)):
+                box.setValue(value)
+        finally:
+            posing["busy"] = False
+        commit_pose()                     # a fit IS the pose, recorded as one edit
+        # dz is deliberately left alone: dragging in the canvas is in-plane by
+        # construction, so the ghost can never report a z move, and zeroing the
+        # box would silently undo one that was set on the slider.
+        centre_label.setText(f"rotation centre: x={centre[0]:.0f} y={centre[1]:.0f} um")
+        status.setText(
+            f"Fitted from {len(dst)} outline vertices: tx={tx:.0f} ty={ty:.0f} um, "
+            f"rot={theta:.1f} deg (dz left as it was -- the drag is in-plane)."
+            + (f"\nWARNING: the outline was also resized {100 * (scale - 1):+.1f}% on the way. "
+               f"A reposition is rigid, so that resize is NOT in the numbers above and the "
+               f"tissue will not land where the ghost is. Copy the outline again and move it "
+               f"without touching the box corners."
+               if abs(scale - 1.0) > 0.01 else ""))
+
+    def check_boundaries():
+        plan = build_plan()
+        rows = reposition.boundary_report(plan, frag_layer.data)
+        if not rows:
+            status.setText("No fragment moves yet.")
+            return
+        lines = [f"label {r['label']} {r['edge']} edge z={r['z']}: {r['voxels']} voxels, "
+                 f"moves {r['step_um']:.0f} um" for r in rows if not r["neighbour_moves"]]
+        warnings = reposition.boundary_warnings(rows)
+        print("\n".join(["Reposition boundary report:"] + ["  " + line for line in lines]
+                        + [f"WARNING: {w}" for w in warnings]))
+        status.setText("\n".join(lines) + ("\n\nSee the terminal for the full warning."
+                                           if warnings else "\n\nNo step worth flagging."))
+
+    # ---------------------------------------------------------------- wiring
+
+    buttons = [("Grab this plane: then click the piece", arm_grab),
+               ("Copy this outline -- then drag and rotate it", copy_outline),
+               ("Rotation centre <- cursor", centre_from_cursor),
+               ("Delete keyframe on this plane", delete_keyframe),
+               ("Boundary check", check_boundaries)]
+    for text, handler in buttons:
+        btn = QPushButton(text)
+        btn.clicked.connect(handler)
+        layout.addWidget(btn)
+
+    layout.addWidget(interpolate_box)
+    layout.addWidget(feather_row)
+    layout.addWidget(QLabel("keyframes"))
+    layout.addWidget(keyframes_list)
+    layout.addWidget(status)
+
+    def fragment_selected(*_):
+        frag_layer.selected_label = label_spin.value()
+        load_plane()
+
+    label_spin.valueChanged.connect(fragment_selected)
+    # BEFORE the data event below is connected, deliberately: adding a shape
+    # emits it, and fit_from_outline would read each restored ghost back as a
+    # drag -- refitting the pose it was just drawn from, and dragging the spin
+    # box, the keyframe list and the status line along with it.
+    if resume is not None:
+        restore_ghosts()
+    # Dragging the ghost IS setting the pose: napari emits this on every move,
+    # rotate and resize of a shape, so the sliders and the keyframe follow the
+    # drag instead of waiting for a button that could be forgotten. Connected
+    # down here rather than beside the layer, because the handler is defined
+    # further down and a connect runs immediately.
+    ghost.events.data.connect(fit_from_outline)
+    for pose_box in (tx_box, ty_box, th_box, dz_box):
+        # valueChanged for a drag or a typed number; editingFinished and
+        # sliderReleased for a control that was touched and put back where it
+        # was, which is how a plane is pinned at identity (see commit_pose).
+        pose_box.valueChanged.connect(commit_pose)
+        pose_box.editingFinished.connect(commit_pose)
+        pose_box.slider.sliderReleased.connect(commit_pose)
+
+    def name_typed(*_):
+        """The name belongs to the fragment, not to a keyframe, and is stored
+        AS IT IS TYPED -- there is no longer a button that reads it, and
+        editingFinished alone would lose a name typed into a field that never
+        got a chance to lose focus. load_plane blocks this box's signals while
+        it fills it in, so following a fragment around does not count as
+        renaming it."""
+        entry(label_spin.value())["name"] = name_edit.text().strip()
+
+    name_edit.textChanged.connect(name_typed)
+    # The tally is only worth redrawing once the typing stops.
+    name_edit.editingFinished.connect(refresh_summary)
+    viewer.dims.events.current_step.connect(load_plane)
+    refresh_list()
+
+    # ---------------------------------------------------------------- export
+
+    def export(output_path):
+        """Write the fragment outlines and the plan next to the mode's own
+        export, and return the paths.
+
+        Written as soon as anything has been GRABBED, not only once something
+        moves. Separating the pieces is the slow half of the work and the
+        keyframes are the quick half, so a session that grabbed three
+        fragments and stopped before posing them used to export NOTHING --
+        and reopened with a blank fragments layer, the grabs gone. A plan with
+        no keyframes is meaningful in its own right (see
+        reposition.make_fragment: a fragment without them does not move), so
+        there is one to write.
+
+        A sample that never cracked still writes nothing, which is what that
+        rule was protecting: its fragments layer is empty, so there is nothing
+        to describe and no file to decide about later."""
+        # The reserved number is never shipped: it is not a fragment, and the
+        # pipeline has nothing to move it with (see _REPOSITION_CUT_LABEL).
+        outlines = np.where(frag_layer.data == _REPOSITION_CUT_LABEL, 0, frag_layer.data)
+        drawn = [int(v) for v in np.unique(outlines) if v]
+        plan = build_plan()
+        if not drawn and not any(f["keyframes"] for f in plan["fragments"]):
+            return []
+        # Every label ON THE CANVAS gets a fragment entry, keyframes or not:
+        # that entry is what carries the number (and the name) back into next
+        # session's panel. build_plan only knows the labels the panel has an
+        # entry for, which a label painted straight onto the layer with the
+        # brush, rather than grabbed, never gets.
+        described = {int(f["label"]) for f in plan["fragments"]}
+        plan["fragments"] += [reposition.make_fragment(label, [], "")
+                              for label in drawn if label not in described]
+        plan["fragments"].sort(key=lambda f: int(f["label"]))
+        if not has_voxel_size:
+            raise ValueError(
+                "Reposition needs voxel_size_um in the paint_mask config -- it is optional "
+                "for painting a guide (display aspect only) but load-bearing here: the plan's "
+                "offsets are microns on this grid, and cell centroids are converted through "
+                "it. Add e.g. `voxel_size_um: [2.6, 2.6, 32.0]` (x, y, z, matching the "
+                "pipeline's sample.voxel_size_um) and export again.")
+        stem = _output_stem(output_path)
+        fragments_path = f"{stem}_fragments.nii.gz"
+        # Written SPARSE, exactly as grabbed. The planes carrying voxels are
+        # the keyframes, and that is the only record of which planes were
+        # decided rather than inferred -- filling here would erase it, and a
+        # reopened session could not tell the two apart. The pipeline and
+        # scripts/apply_reposition.py fill it on load instead.
+        sitk.WriteImage(sitk.GetImageFromArray(outlines.astype(np.uint8)), fragments_path)
+        plan["labels_path"] = fragments_path
+        plan_path = f"{stem}.reposition.json"
+        reposition.write_plan(plan_path, plan)
+        return [fragments_path, plan_path]
+
+    state = SimpleNamespace(export=export, plan=build_plan, fragments_layer=frag_layer)
+    # Reachable from the viewer, not only from this closure: the GUI smoke
+    # test needs to read back what the controls built, and a layer's metadata
+    # is the handle napari already provides for exactly that.
+    frag_layer.metadata["reposition_state"] = state
+    return section, state
+
+def sparse_keyframes_by_label(paint_data):
+    """{label: {z: 2D bool plane}} for every nonzero brush label present.
+
+    One entry per label per plane the user actually painted that label on;
+    planes they never touched are absent, which is what makes the outline
+    "sparse keyframes + interpolation" rather than a dense mask (see
+    interpolate_labels_separately).
+    """
+    keyframes = {}
+    for z, plane in enumerate(paint_data):
+        for label in np.unique(plane):
+            label = int(label)
+            if label == 0:
+                continue
+            keyframes.setdefault(label, {})[z] = (plane == label)
+    return keyframes
+
+
+def interpolate_labels_separately(keyframes_by_label, full_shape, interpolate=None):
+    """Sparse per-label keyframes -> one dense uint8 multi-label volume.
+
+    Each label is interpolated on its OWN keyframes and only then written
+    into the shared output. Handing a multi-label array to
+    interpolate_sparse_mask as one binarized blob instead would be wrong,
+    not merely lossy. That function interpolates between *consecutive*
+    keyframe planes via a signed distance field, and once the labels are
+    merged, "consecutive" means consecutive across all regions: region A's
+    plane gets blended into region B's plane whenever the two regions'
+    keyframes interleave along z, which they normally do (you pick each
+    region's own representative planes). The signed-distance blend of two
+    cross-sections that don't overlap is empty, so what actually comes out
+    is that both regions vanish on every plane between such a pair, and the
+    planes that survive are the ones that happened to be bracketed by two
+    keyframes of the same region -- silently, with no error. Per-label
+    interpolation also confines each region to its own [first plane, last
+    plane] span rather than the union's span.
+    selftest_per_label_beats_merged_interpolation() measures exactly this.
+
+    Returns a SimpleNamespace:
+      volume          uint8 (z,y,x) array, 0 = background
+      slices_by_label {label: [z, ...]} planes actually painted, ascending
+      voxels_by_label {label: n} voxel count in the final volume (i.e.
+                      AFTER overwrites, so these always sum to the nonzero
+                      count of `volume`)
+      overlap_pairs   {(earlier_label, later_label): n voxels} where two
+                      labels' interpolated volumes collided
+      n_contested     distinct voxels claimed by more than one label
+
+    Labels are written in ascending order, so on a collision the HIGHER
+    label id wins. That is silent in the volume itself, hence overlap_pairs
+    / n_contested and the warnings guide_export_warnings() builds from them.
+    n_contested is exact; overlap_pairs attributes each contested voxel to
+    the pair that collided over it *in write order*, so a voxel claimed by
+    three labels is reported as (1,2) and (2,3) rather than also (1,3) --
+    enough to point at the regions to go look at, which is the job.
+    """
+    if interpolate is None:
+        interpolate = _interpolate_sparse_mask()
+
+    labels = sorted(keyframes_by_label)
+    too_big = [lab for lab in labels if lab > MAX_LABEL or lab < 1]
+    if too_big:
+        raise ValueError(f"labels must be within 1..{MAX_LABEL} (the export is uint8), "
+                         f"got {too_big}")
+
+    volume = np.zeros(full_shape, dtype=np.uint8)
+    contested = None
+    overlap_pairs = {}
+
+    for label in labels:
+        painted = interpolate(keyframes_by_label[label], full_shape)
+        # Compare against what is already claimed BEFORE overwriting, so the
+        # collision is attributable to a specific pair of labels. Only one
+        # interpolated volume is alive at a time here: at the real 2273x3974x157
+        # this loop is already several GB per array.
+        clash = np.logical_and(painted, volume != 0)
+        if clash.any():
+            prior, counts = np.unique(volume[clash], return_counts=True)
+            for other, count in zip(prior, counts):
+                key = (int(other), label)
+                overlap_pairs[key] = overlap_pairs.get(key, 0) + int(count)
+            contested = clash if contested is None else np.logical_or(contested, clash)
+        volume[painted] = label
+
+    return SimpleNamespace(
+        volume=volume,
+        slices_by_label={lab: sorted(keyframes_by_label[lab]) for lab in labels},
+        voxels_by_label={lab: int(np.count_nonzero(volume == lab)) for lab in labels},
+        overlap_pairs=overlap_pairs,
+        n_contested=int(contested.sum()) if contested is not None else 0,
+    )
+
+
+def _label_name(label, region_labels):
+    """One label's region name(s) as display text -- a label can carry several
+    (see _normalize_label_map), so this joins rather than indexes."""
+    names = region_labels.get(label)
+    return ", ".join(names) if names else "unnamed"
+
+
+def guide_export_warnings(result, region_labels):
+    """Everything worth shouting about in an export, as a list of strings.
+
+    All of these are warnings, never refusals: painting a few regions today
+    and the rest tomorrow is a normal way to use this tool, and refusing to
+    write the file would just lose the work already done.
+    """
+    warnings = []
+    painted = set(result.slices_by_label)
+    named = set(region_labels)
+
+    for label in sorted(painted):
+        planes = result.slices_by_label[label]
+        if len(planes) < 2:
+            warnings.append(
+                f"label {label} ({_label_name(label, region_labels)}) was painted on only "
+                f"{len(planes)} plane ({planes}) -- there is nothing to interpolate between, "
+                f"so it exports as that single flat slice, not a volume. Paint at least 2 planes.")
+
+    if result.n_contested:
+        breakdown = "; ".join(
+            f"{a} ({_label_name(a, region_labels)}) vs {b} ({_label_name(b, region_labels)}): "
+            f"{n} voxels"
+            for (a, b), n in sorted(result.overlap_pairs.items()))
+        warnings.append(
+            f"{result.n_contested} voxels are claimed by more than one label after "
+            f"interpolation; the higher label id silently wins there. Overlaps: {breakdown}")
+
+    for label in sorted(named - painted):
+        warnings.append(
+            f"region_labels lists label {label} ({_label_name(label, region_labels)}) but nothing was "
+            f"painted with it -- that region has no outline in this export.")
+
+    # A single unnamed label with no region_labels at all is the original
+    # one-region-per-file usage, not a mistake -- don't nag about it.
+    legacy_single_region = not region_labels and painted == {1}
+    if not legacy_single_region:
+        for label in sorted(painted - named):
+            warnings.append(
+                f"label {label} was painted but has no region_labels entry -- nothing "
+                f"downstream can tell which atlas region to pair it with, so this outline "
+                f"cannot be used.")
+    return warnings
+
+
+def _output_stem(output_path):
+    """Path with the image suffix removed, for hanging sidecars off.
+    .nii.gz is special-cased the same way tools/edit_sample_labels.py's
+    _annotation_sidecar_path does it, so the names line up with the sidecar
+    convention already in use."""
+    path = Path(output_path)
+    name = path.name
+    name = name[: -len(".nii.gz")] if name.endswith(".nii.gz") else Path(name).stem
+    return path.with_name(name)
+
+
+def write_guide_sidecars(output_path, image_path, result, region_labels, total_z,
+                         spacing_xyz=None, region_ids=None, atlas_info=None,
+                         damage_labels=None):
+    """Write the two sidecars next to the exported outline, and return their paths.
+
+    <stem>.regions.json is the one that matters for this tool: it is the
+    only record of which brush label is which brain region, and
+    Registration_ants needs exactly that to pull the matching region out of
+    the atlas annotation volume.
+
+    It records both `region_ids` (ontology structure ids, when the region was
+    picked in the GUI's ontology tree) and `regions` (the names, always).
+    Feed the IDS to mask.guide_regions.atlas_ids: they are matched exactly,
+    descendants included, so the region registration pairs against is the one
+    that was highlighted while painting. The names are for reading -- as
+    mask.guide_regions.atlas_names they would be matched as case-insensitive
+    substrings, which can pull in unrelated structures ("Cerebellum" also
+    matches "cerebellum related fiber tracts").
+
+    Both are {label: LIST}, because one guide region often needs several
+    ontology entries -- DevCCF has no single "cortex", only 36 `layer N of
+    <area>` structures.
+
+    <stem>.annotated_slices.json is the repo's pre-existing per-mask
+    sidecar (written by tools/edit_sample_labels.py, read by
+    registration_eval.py's load_region_annotation_hint) -- same
+    {"hand_drawn_slices": [...]} shape, holding the union over all labels
+    of the planes actually painted. It is written so this output drops into
+    the evaluation path unchanged; the per-label breakdown that format has
+    no room for lives in .regions.json.
+    """
+    stem = _output_stem(output_path)
+    regions_path = stem.with_name(stem.name + ".regions.json")
+    slices_path = stem.with_name(stem.name + ".annotated_slices.json")
+
+    region_ids = region_ids or {}
+    all_planes = sorted({z for planes in result.slices_by_label.values() for z in planes})
+    regions = {str(lab): list(region_labels[lab]) for lab in sorted(region_labels)}
+    regions_path.write_text(json.dumps({
+        "regions": regions,
+        "region_ids": {str(lab): list(region_ids[lab]) for lab in sorted(region_ids)},
+        # Labels marked as tissue with NO atlas counterpart (DAMAGE_NAME in
+        # the GUI). Deliberately not in region_ids/regions: they carry no
+        # ontology id, and the pipeline reads this key as a fallback for
+        # mask.guide_regions.damage_labels (a moving_mask hole).
+        "damage_labels": sorted(int(v) for v in (damage_labels or [])),
+        "annotated_slices": {str(lab): planes
+                             for lab, planes in sorted(result.slices_by_label.items())},
+        "image_path": str(image_path),
+        "mask_path": str(output_path),
+        "total_z": int(total_z),
+        "header_spacing_xyz": list(spacing_xyz) if spacing_xyz is not None else None,
+        "voxel_size_um_note": VOXEL_SIZE_UM_NOTE,
+        "atlas": atlas_info,
+    }, indent=2, ensure_ascii=False))
+    slices_path.write_text(json.dumps({
+        "hand_drawn_slices": all_planes,
+        "total_z": int(total_z),
+        "regions": regions,
+    }, indent=2, ensure_ascii=False))
+    return regions_path, slices_path
+
+
+def load_reposition_resume(output_path, *previous_paths):
+    """Re-open last session's reposition work -- the plan and the fragment
+    outlines its export wrote -- as {"plan": ..., "fragments": array}, or None.
+
+    Keyed off a PATH rather than a config key of its own, because the plan is
+    not a separate document: it is part of what a session exports, and
+    pointing the two at different stems is a way to silently pair a plan with
+    the wrong outlines.
+
+    Which path, though, is the whole reason this takes several.
+    `output_path` is where THIS session will write, and looking only there was
+    wrong for the way rounds are actually done: each round is given a new
+    output name so the last one survives as a snapshot (configs/
+    paint_mask.example.yaml says to do exactly that for mode: labels), and the
+    previous round is named by a different key -- existing_mask_path in guide
+    mode, the resumed dense file's own record of its guide in labels mode. So
+    the paint layer came back and the fragments did not: their plan was next
+    to a stem nothing was looking at. `previous_paths` are those keys, tried
+    in order after `output_path`.
+
+    A missing or unreadable set is not an error: most samples never cracked,
+    and the first session on one that did has nothing to resume from.
+    """
+    for candidate in (output_path,) + previous_paths:
+        if not candidate:
+            continue
+        stem = _output_stem(candidate)
+        plan_path = Path(f"{stem}.reposition.json")
+        fragments_path = Path(f"{stem}_fragments.nii.gz")
+        if plan_path.exists():
+            break
+    else:
+        return None
+    try:
+        plan = reposition.read_plan(plan_path)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: ignoring {plan_path}: {exc}")
+        return None
+    fragments = None
+    if fragments_path.exists():
+        fragments = sitk.GetArrayFromImage(sitk.ReadImage(str(fragments_path))).astype(np.uint8)
+        if tuple(plan["image_shape_zyx"]) != fragments.shape:
+            print(f"WARNING: {fragments_path} is {fragments.shape} but its plan was drawn on "
+                  f"{tuple(plan['image_shape_zyx'])}; not resuming reposition.")
+            return None
+    n = sum(len(f["keyframes"]) for f in plan["fragments"])
+    print(f"[resume] restored {n} reposition keyframe(s) across "
+          f"{len(plan['fragments'])} fragment(s) from {plan_path.name}.")
+    if output_path and _output_stem(output_path) != stem:
+        # Say it, because it is the one thing about this that can surprise:
+        # the plan just read belongs to the PREVIOUS round's stem, and this
+        # session will write its own next to the new output rather than back
+        # into the file it came from.
+        print(f"[resume]   (read from {plan_path}, which is last round's stem; this "
+              f"session's plan will be written next to {output_path})")
+    if fragments is None:
+        print(f"WARNING: {fragments_path} is missing, so the fragment OUTLINES could not be "
+              f"restored -- only the keyframes above. Grab the pieces again before exporting, "
+              f"or the plan will move nothing.")
+    return {"plan": plan, "fragments": fragments}
+
+
+def load_guide_resume(existing_path, expected_shape):
+    """Restore a previous guide export as EDITABLE keyframes, or None if it
+    can't be resumed that way.
+
+    Reloading the exported volume directly is wrong twice over, which is why
+    this exists rather than reusing _load_mask_array:
+
+      1. That function binarizes (`> 0`), collapsing a multi-label outline
+         into a single label -- every region you separated would merge.
+      2. The exported volume is DENSE: interpolation already filled every
+         plane between the first and last keyframe. Re-reading it makes all
+         of those look hand-drawn, so the next export interpolates on top of
+         the previous export's own guess instead of on your real keyframes.
+         A 5-plane job comes back as 11 planes and drifts further every round.
+
+    So only the planes the `.regions.json` sidecar recorded as hand-drawn are
+    restored, at their original label values -- the same "overlay only the
+    real keyframes onto a fresh baseline" rule tools/edit_sample_labels.py's
+    _load_prior_hand_drawn follows, for the same reason.
+
+    Note the restored plane holds what SURVIVED export: where two labels'
+    interpolations collided, the higher label id won (see
+    interpolate_labels_separately), so a keyframe overlapped by a
+    higher-numbered region comes back missing those voxels. The export
+    warning about contested voxels is what flags that at the time.
+
+    Returns SimpleNamespace(prefill, region_ids, region_labels,
+    slices_by_label) -- region_* being what the sidecar recorded, ready to
+    re-seed the assignment panel so the label numbers keep their meaning.
+    """
+    sidecar = _output_stem(existing_path)
+    sidecar = sidecar.with_name(sidecar.name + ".regions.json")
+    if not sidecar.exists():
+        return None
+
+    meta = json.loads(sidecar.read_text())
+    annotated = meta.get("annotated_slices") or {}
+    if not annotated:
+        return None
+
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(existing_path)))
+    if arr.shape != expected_shape:
+        print(f"WARNING: resume file shape {arr.shape} != image shape {expected_shape}, "
+              f"not pre-filling.")
+        return None
+
+    prefill = np.zeros(expected_shape, dtype=np.uint8)
+    slices_by_label = {}
+    for raw_label, planes in annotated.items():
+        label = int(raw_label)
+        planes = [z for z in planes if 0 <= z < expected_shape[0]]
+        for z in planes:
+            prefill[z][arr[z] == label] = label
+        slices_by_label[label] = sorted(planes)
+
+    return SimpleNamespace(
+        prefill=prefill,
+        slices_by_label=slices_by_label,
+        region_ids=_normalize_region_ids(meta.get("region_ids") or {}),
+        region_labels=_normalize_region_labels(meta.get("regions") or {}),
+        damage_labels=sorted(int(v) for v in meta.get("damage_labels") or []),
+        sidecar=sidecar,
+    )
+
+
+def relabel_volume(volume, from_label, to_label):
+    """Renumber one brush label across a whole painted volume, in place.
+
+    Returns the number of voxels changed. Separate from the GUI so the
+    selftests can pin the semantics: it is a pure renumber, so pointing two
+    labels at the same number MERGES them rather than erroring -- the
+    keyframe bookkeeping downstream is per-label, and a merge is a thing you
+    might actually want (two halves of one region drawn separately).
+    """
+    if not (0 <= to_label <= MAX_LABEL):
+        raise ValueError(f"to_label must be within 0..{MAX_LABEL} (the export is uint8), "
+                         f"got {to_label}")
+    hit = volume == from_label
+    n = int(np.count_nonzero(hit))
+    volume[hit] = to_label
+    return n
+
+
+def _region_legend(region_labels):
+    """The label -> region-name mapping, shown in the side panel so the
+    brush number you're about to paint with is never a guess. Only used when
+    there is no atlas configured -- with one, the assignment panel built by
+    _add_ontology_picker replaces this and is editable."""
+    if not region_labels:
+        return ("No region_labels in the config: paint one region with label 1.\n"
+                "For several regions, add region_labels to the config, or configure\n"
+                "an atlas (atlas_annotation_path) to pick them from the tree here --\n"
+                "an unnamed label cannot be paired with an atlas region.\n")
+    lines = "\n".join(f"  label {lab} = {_label_name(lab, region_labels)}"
+                      for lab in sorted(region_labels))
+    return f"Brush label -> brain region:\n{lines}\n"
+
+
+def _seed_assignment(region_labels, region_ids, structures, damage_labels=()):
+    """Pre-fill the GUI assignment from the config.
+
+    region_ids is taken as-is. Names from region_labels are resolved to ids
+    only on an exact, unique name match -- the substring matching the
+    pipeline does for names is precisely what ids are here to avoid, so
+    guessing on the operator's behalf would reintroduce it. A name that
+    doesn't resolve is reported, not silently dropped, and stays usable as a
+    name-only entry.
+
+    damage_labels get the DAMAGE_ID sentinel instead of ontology ids; a label
+    listed there AND carrying region ids/names is a config contradiction
+    (mirrors the pipeline's damage_labels-vs-atlas_ids refusal) and raises.
+    """
+    damage_labels = {int(v) for v in damage_labels}
+    conflict = damage_labels & {lab for lab in set(region_labels) | set(region_ids)
+                                if region_ids.get(lab) or region_labels.get(lab)}
+    if conflict:
+        raise ValueError(
+            f"label(s) {sorted(conflict)} are listed under damage_labels AND have "
+            "region_ids/region_labels entries -- a label cannot both mark tissue with no "
+            "atlas counterpart and be paired with an atlas region.")
+
+    by_name = {}
+    for sid, info in structures.items():
+        by_name.setdefault(info["name"].strip().lower(), []).append(sid)
+
+    assignment, unresolved = {}, []
+    for label in sorted(set(region_labels) | set(region_ids)):
+        ids = list(region_ids.get(label, []))
+        for name in region_labels.get(label, []):
+            matches = by_name.get(name.strip().lower(), [])
+            if len(matches) == 1 and matches[0] not in ids:
+                ids.append(matches[0])
+            elif len(matches) != 1:
+                unresolved.append((label, name, len(matches)))
+        if ids:
+            assignment[label] = ids
+    for label in sorted(damage_labels):
+        assignment[label] = [DAMAGE_ID]
+    return assignment, unresolved
+
+
+def _add_ontology_picker(viewer, atlas, paint_layer, assignment):
+    """The ontology tree + label-assignment panel, as its own DEDICATED dock
+    on the SAMPLE viewer's RIGHT side.
+
+    Selecting a node assigns it (and everything under it) to a brush label;
+    nothing here is displayed anywhere. To actually SEE the atlas -- a
+    region highlighted among its neighbours in three synced panes, hover
+    ancestry -- run the separate visualization/atlas_view.py against the same
+    atlas_annotation_path / ontology_path. The two tools no longer share any
+    state: this panel used to drive a second napari window live (see
+    highlight_mask / _open_atlas_window, both now in visualization/atlas_view.py /
+    shared/atlas_reference.py); it just assigns now.
+
+    A dedicated dock of its own, not squeezed in with Relabel/Export: the
+    ontology sits 2-12 levels deep, so a tree squeezed into a fraction of a
+    shared column leaves most of it scrolled out of view. It has the right
+    column to itself; the tool sections fold up on the left (see
+    _add_tools_panel).
+
+    TWO trees, split by a draggable QSplitter. The lower one is what has been
+    assigned so far, as brush label -> its regions, and it is a TREE rather
+    than the text block it used to be for one reason: a label routinely
+    carries a dozen regions (DevCCF has no single "cortex", only 36 `layer N
+    of <area>` structures), and taking one of them back out used to mean
+    hunting that structure down in the 12-deep ontology above and pressing
+    "Remove from label" -- with nothing on screen to click even though the
+    thing to remove was right there in the list. Now the region row itself is
+    the handle. The splitter is there because a fixed-height text box that
+    folds after two labels was the other half of the same complaint.
+
+    `assignment` ({label: [structure id]}) is mutated in place -- it is the
+    live state the export reads, so there is no separate "apply" step to
+    forget. A label whose last region is removed stays in it as an EMPTY
+    entry, on purpose: see empty_assignment_labels.
+    """
+    # objectNames so these are addressable from outside the closure -- napari
+    # contributes its own QSpinBox/QLineEdit widgets to the same window, so
+    # "the first spin box" is not this panel's brush-label box.
+    search = QLineEdit()
+    search.setObjectName("ontology_search")
+    search.setPlaceholderText("Filter by name / acronym / id, any order...")
+    hide_empty = QCheckBox("Only regions with voxels in this annotation")
+    hide_empty.setObjectName("ontology_hide_empty")
+    hide_empty.setChecked(True)
+
+    tree = QTreeWidget()
+    tree.setObjectName("ontology_tree")
+    tree.setHeaderLabels(["Region", "Voxels", "id"])
+    tree.setColumnWidth(0, 260)
+    # No minimum height, deliberately: the tree is the only widget in its
+    # half of the splitter carrying a stretch factor, so it already takes
+    # every pixel that half is given beyond what the search box, the status
+    # box and the buttons need -- see the module docstring's "large,
+    # dedicated region panel" note for why that space was the point of this
+    # dock. A floor would only fight the splitter handle.
+    items = ontology_tree_ui.populate_ontology_tree(tree, atlas.structures, atlas.node_voxels)
+
+    # Pseudo-entry, always at the top and exempt from the voxel/name filters
+    # (it is not in `items`, so refresh_filter never touches it): tissue that
+    # exists in the sample but has no counterpart in the atlas (e.g. past the
+    # midline on a hemisphere sample). Exports as mask.guide_regions.
+    # damage_labels -- a moving_mask hole -- never as a guide pair, so it
+    # deliberately carries no ontology id.
+    damage_item = QTreeWidgetItem([f"— {DAMAGE_NAME} —", "", str(DAMAGE_ID)])
+    damage_item.setData(0, Qt.UserRole, DAMAGE_ID)
+    damage_item.setToolTip(0, "Sample tissue the atlas cannot match (e.g. contralateral tissue "
+                              "past the midline). Excluded from the registration metric via "
+                              "mask.guide_regions.damage_labels instead of being guided.")
+    tree.insertTopLevelItem(0, damage_item)
+
+    label_spin = QSpinBox()
+    label_spin.setObjectName("ontology_brush_label")
+    label_spin.setRange(1, MAX_LABEL)
+    add_btn = QPushButton("Assign to label")
+    add_btn.setObjectName("ontology_assign")
+    remove_btn = QPushButton("Remove from label")
+    remove_btn.setObjectName("ontology_unassign")
+    picker_status = QLabel()
+
+    # The lower half: what is assigned, one expandable row per brush label.
+    assign_tree = QTreeWidget()
+    assign_tree.setObjectName("assignment_tree")
+    assign_tree.setHeaderLabels(["Brush label / region", "id"])
+    assign_tree.setColumnWidth(0, 200)
+    assign_tree.setMinimumHeight(90)
+    assign_tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+    drop_btn = QPushButton("Remove selected region(s)")
+    drop_btn.setObjectName("assignment_remove")
+    empty_note = QLabel()
+    empty_note.setObjectName("assignment_empty_note")
+    empty_note.setWordWrap(True)
+    empty_note.setStyleSheet("color: #ffb86b;")   # a warning, not a caption
+    empty_note.setVisible(False)
+
+    def selected_id():
+        item = tree.currentItem()
+        return None if item is None else item.data(0, Qt.UserRole)
+
+    def refresh_filter():
+        visible = atlas_reference.visible_tree_ids(
+            atlas.structures, atlas.node_voxels, search.text(), hide_empty.isChecked())
+        for sid, item in items.items():
+            item.setHidden(sid not in visible)
+        if search.text().strip():
+            tree.expandAll()
+
+    def on_select():
+        sid = selected_id()
+        if sid is None:
+            return
+        if sid == DAMAGE_ID:
+            picker_status.setText(
+                f"{DAMAGE_NAME}: for sample tissue the atlas cannot match. Exports as "
+                "damage_labels (excluded from the metric), not as a guide region.")
+            return
+        info = atlas.structures[sid]
+        voxels = atlas.node_voxels.get(sid, 0)
+        if voxels:
+            picker_status.setText(
+                f"{info['name']} [{sid}]: {voxels:,} voxels including descendants.")
+        else:
+            picker_status.setText(
+                f"{info['name']} [{sid}] has no voxels in this annotation and cannot be "
+                f"assigned -- the pipeline errors out on a region it cannot match.")
+
+    def on_add():
+        sid = selected_id()
+        if sid is None:
+            picker_status.setText("Select a region in the tree first.")
+            return
+        label = label_spin.value()
+        # A label is either damage or guided, never both -- the same refusal
+        # the pipeline config makes for damage_labels vs atlas_ids.
+        if sid == DAMAGE_ID and any(s != DAMAGE_ID for s in assignment.get(label, [])):
+            picker_status.setText(
+                f"label {label} already carries atlas region(s) -- remove them first; a label "
+                f"cannot be both a guide region and {DAMAGE_NAME}.")
+            return
+        if sid != DAMAGE_ID and DAMAGE_ID in assignment.get(label, []):
+            picker_status.setText(
+                f"label {label} is marked {DAMAGE_NAME} -- remove that first; a label "
+                f"cannot be both a guide region and damage.")
+            return
+        if sid != DAMAGE_ID and not atlas.node_voxels.get(sid):
+            picker_status.setText(
+                f"{atlas.structures[sid]['name']} has no voxels in this annotation -- "
+                f"refusing to assign it.")
+            return
+        entries = assignment.setdefault(label, [])
+        if sid not in entries:
+            entries.append(sid)
+        paint_layer.selected_label = label     # so the brush is already right for painting
+        viewer.layers.selection = {paint_layer}
+        refresh_assignment()
+
+    def on_remove():
+        sid = selected_id()
+        label = label_spin.value()
+        if sid is not None and sid in assignment.get(label, []):
+            # Left as an empty entry rather than deleted: the label is still
+            # what the brush is painting with, and losing it silently is the
+            # failure empty_assignment_labels exists to make visible.
+            assignment[label].remove(sid)
+        refresh_assignment()
+
+    def drop_selected():
+        """Remove whatever is selected in the LOWER tree.
+
+        A region row drops that one region. A label row drops every region
+        under it (leaving the empty-label reminder), and dropping a label row
+        that is ALREADY empty forgets the label -- so the reminder has an
+        obvious way out that is not "assign something you don't want".
+        """
+        picked = assign_tree.selectedItems()
+        if not picked:
+            picker_status.setText(
+                "Select a region (or a brush-label row) in the assignment tree below first.")
+            return
+        dropped, forgotten = 0, []
+        for item in picked:
+            label = item.data(0, Qt.UserRole)
+            sid = item.data(1, Qt.UserRole)
+            ids = assignment.get(label)
+            if label is None or ids is None:
+                continue
+            if sid is None:
+                if ids:
+                    dropped += len(ids)
+                    assignment[label] = []
+                else:
+                    del assignment[label]
+                    forgotten.append(label)
+            elif sid in ids:
+                ids.remove(sid)
+                dropped += 1
+        refresh_assignment()
+        parts = []
+        if dropped:
+            parts.append(f"removed {dropped} region(s) from the assignment")
+        if forgotten:
+            parts.append(f"forgot brush label(s) {', '.join(str(lab) for lab in forgotten)}")
+        picker_status.setText(("; ".join(parts) + ".") if parts else "Nothing to remove.")
+
+    def on_assignment_selected():
+        """Clicking a row picks that brush label, so removing a region and
+        carrying on painting with the same label needs no second control."""
+        picked = assign_tree.selectedItems()
+        label = picked[0].data(0, Qt.UserRole) if picked else None
+        if label is None:
+            return
+        label_spin.setValue(int(label))
+        paint_layer.selected_label = int(label)
+
+    def refresh_assignment():
+        assign_tree.clear()
+        rows = assignment_rows(assignment, atlas.structures)
+        for label, regions in rows:
+            head = QTreeWidgetItem([f"label {label}    ({len(regions)} region(s))"
+                                    if regions else
+                                    f"label {label}    -- NO REGION LEFT", ""])
+            head.setData(0, Qt.UserRole, label)
+            head.setData(1, Qt.UserRole, None)
+            assign_tree.addTopLevelItem(head)
+            for sid, name in regions:
+                child = QTreeWidgetItem([name, str(sid)])
+                child.setData(0, Qt.UserRole, label)
+                child.setData(1, Qt.UserRole, sid)
+                head.addChild(child)
+        if not rows:
+            hint = QTreeWidgetItem(["No region assigned yet -- pick one above, set a brush "
+                                    "label, then Assign to label.", ""])
+            hint.setDisabled(True)
+            assign_tree.addTopLevelItem(hint)
+        assign_tree.expandAll()
+
+        empties = empty_assignment_labels(assignment)
+        empty_note.setVisible(bool(empties))
+        if empties:
+            empty_note.setText(
+                "! brush label(s) " + ", ".join(str(lab) for lab in empties) + ": no region left. "
+                "Painting with them exports an outline nothing can be paired with. Assign "
+                "one, or Remove the label row again to forget it.")
+
+    search.textChanged.connect(lambda _t: refresh_filter())
+    hide_empty.toggled.connect(lambda _c: refresh_filter())
+    tree.currentItemChanged.connect(lambda _cur, _prev: on_select())
+    add_btn.clicked.connect(on_add)
+    remove_btn.clicked.connect(on_remove)
+    drop_btn.clicked.connect(drop_selected)
+    assign_tree.itemSelectionChanged.connect(on_assignment_selected)
+
+    upper = QWidget()
+    upper_layout = QVBoxLayout(upper)
+    upper_layout.setContentsMargins(0, 0, 0, 0)
+    upper_layout.addWidget(QLabel("Atlas ontology -- selecting a node assigns it to the brush "
+                                  "label below. The atlas itself is not shown here; run "
+                                  "visualization/atlas_view.py to look at it."))
+    upper_layout.addWidget(search)
+    upper_layout.addWidget(hide_empty)
+    upper_layout.addWidget(tree, 1)      # the stretch: spare height is the tree's
+    # Pinned to its own height (it scrolls inside), so the blurb about the
+    # selected region cannot quietly take a hundred pixels off the tree --
+    # the panel being too small for the regions in it is the complaint this
+    # whole splitter exists to answer. A height cap only; the WIDTH stays
+    # free, which is the one set_dock_width/shrinkable insist on.
+    status_box = ontology_tree_ui.scrollable(picker_status, 56)
+    status_box.setMaximumHeight(56)
+    upper_layout.addWidget(status_box)
+    row = QWidget()
+    row_layout = QHBoxLayout(row)
+    row_layout.addWidget(QLabel("brush label"))
+    row_layout.addWidget(label_spin)
+    row_layout.addWidget(add_btn)
+    row_layout.addWidget(remove_btn)
+    upper_layout.addWidget(row)
+
+    lower = QWidget()
+    lower_layout = QVBoxLayout(lower)
+    lower_layout.setContentsMargins(0, 0, 0, 0)
+    lower_layout.addWidget(QLabel("Assigned so far -- select any region and remove it here."))
+    lower_layout.addWidget(assign_tree, 1)
+    lower_layout.addWidget(drop_btn)
+    lower_layout.addWidget(empty_note)
+
+    # A splitter, not two stacked widgets: how much of the column the
+    # assignment is worth depends on how many labels there are (five or six
+    # is normal), and that is exactly what a fixed split cannot know.
+    splitter = QSplitter(Qt.Vertical)
+    splitter.addWidget(upper)
+    splitter.addWidget(lower)
+    splitter.setStretchFactor(0, 3)
+    splitter.setStretchFactor(1, 2)
+    splitter.setSizes([560, 320])
+
+    dock = QWidget()
+    layout = QVBoxLayout(dock)
+    layout.addWidget(splitter)
+    for widget in (dock, tree, assign_tree, upper, lower, splitter, empty_note):
+        ontology_tree_ui.shrinkable(widget)
+    dock_widget = viewer.window.add_dock_widget(dock, area="right", name="Atlas / Ontology")
+    ontology_tree_ui.set_dock_width(dock_widget, _ONTOLOGY_PANEL_START_PX)
+
+    refresh_filter()
+    refresh_assignment()
+    return SimpleNamespace(refresh_assignment=refresh_assignment, dock=dock_widget)
+
+
+def _run_guide(args):
+    _import_gui()
+    base_sitk, arr = _read_sitk_array(args.image_path)
+
+    prefill = np.zeros(arr.shape, dtype=np.uint8)
+    resume = load_guide_resume(args.existing_mask_path, arr.shape) if args.existing_mask_path else None
+    if resume is not None:
+        prefill = resume.prefill
+        planes = sum(len(p) for p in resume.slices_by_label.values())
+        print(f"[resume] restored {planes} hand-drawn planes from {resume.sidecar.name} "
+              f"({ {lab: p for lab, p in sorted(resume.slices_by_label.items())} }); "
+              f"the interpolated planes were dropped -- just keep painting.")
+    elif args.existing_mask_path:
+        # No sidecar: all this can do is binarize, which merges every region
+        # into label 1 and treats interpolated planes as hand-drawn. Usable as
+        # a rough tracing backdrop, not as a resume.
+        loaded = _load_mask_array(args.existing_mask_path, arr.shape)
+        if loaded is not None:
+            prefill = loaded
+            print(f"WARNING: no .regions.json next to {args.existing_mask_path}, so it cannot be "
+                  f"resumed as keyframes.\n"
+                  f"         Pre-filled binarized instead: every region is merged into label 1, "
+                  f"and interpolated planes count as hand-drawn.\n"
+                  f"         Good as a tracing backdrop only; to really resume, use an export "
+                  f"that still has its sidecar.")
+
+    viewer, paint_layer = _launch_viewer(
+        arr, prefill, scale=display_scale_from_voxel_size(args.voxel_size_um),
+        image_path=args.image_path)
+
+    # The atlas ontology is loaded here only to populate the region-assignment
+    # tree and check which structures this annotation actually has voxels
+    # for -- nothing about it is displayed. To look at the atlas itself, run
+    # visualization/atlas_view.py against the same atlas_annotation_path / ontology_path.
+    atlas = assignment = picker = None
+    if args.atlas:
+        atlas = atlas_reference.load_atlas_reference(args.atlas, include_template=False)
+
+        # A resumed file's own sidecar wins over the config: it records what
+        # those label numbers actually meant last session, and painting more
+        # planes under a label that silently changed region would be worse
+        # than any config convenience.
+        seed_labels = resume.region_labels if resume is not None else args.region_labels
+        seed_ids = resume.region_ids if resume is not None else args.region_ids
+        seed_damage = resume.damage_labels if resume is not None else args.damage_labels
+        assignment, unresolved = _seed_assignment(seed_labels, seed_ids, atlas.structures,
+                                                  damage_labels=seed_damage)
+        for label, name, n in unresolved:
+            print(f"WARNING: region_labels label {label}: {name!r} matches "
+                  f"{'several' if n else 'no'} structures in the ontology ({n}), so it was not "
+                  f"resolved to an id; pick it again in the tree.")
+        picker = _add_ontology_picker(viewer, atlas, paint_layer, assignment)
+
+    guess_note = "Pre-filled with the existing mask -- adjust/redraw as needed.\n" if args.existing_mask_path else ""
+    header = ("Pick a region in the ontology tree on the left, set a brush label, click\n"
+              "Assign to label, then paint the sample with that brush number.\n"
+              if atlas else _region_legend(args.region_labels))
+    # Printed, not shown in a panel: the export report lives in the terminal
+    # now (see _export_controls), and the instructions belong with it rather
+    # than in a text box that would be the tallest thing in the window.
+    print(header +
+          "Paint a rough outline on a few planes per region (start, end, and\n"
+          "any plane where the shape changes a lot; at least 2 planes each),\n"
+          "then click Export.\n" + guess_note)
+
+    def export():
+        keyframes = sparse_keyframes_by_label(paint_layer.data)
+        if not keyframes:
+            # Still export the reposition work: fragments and guide regions are
+            # independent artifacts of the same session, and a sample opened
+            # only to close a crack would otherwise lose its plan to a check
+            # about a layer it never touched.
+            written = _export_reposition(reposition_state, args.output_path)
+            for path in written:
+                print(f"Wrote {path}")
+            print("No planes painted yet -- nothing to export."
+                  if not written else
+                  "No guide regions painted -- exported the reposition plan only.")
+            return
+
+        n_planes = sum(len(planes) for planes in keyframes.values())
+        print(f"Exporting... ({len(keyframes)} labels, {n_planes} painted planes)")
+        result = interpolate_labels_separately(keyframes, arr.shape)
+
+        # The GUI assignment is authoritative when an atlas is loaded (it is
+        # what was actually looked at); the config's region_labels are the
+        # fallback for the no-atlas case.
+        if atlas is not None:
+            damage_labels = sorted(lab for lab, ids in assignment.items() if DAMAGE_ID in ids)
+            region_ids = {lab: list(ids) for lab, ids in assignment.items()
+                          if ids and DAMAGE_ID not in ids}
+            region_labels = {lab: [atlas.structures[sid]["name"] for sid in ids]
+                             for lab, ids in region_ids.items()}
+            atlas_info = {
+                "annotation_path": str(args.atlas.annotation_path),
+                "ontology_path": str(args.atlas.ontology_path),
+                "orientation": list(args.atlas.orientation) if args.atlas.orientation else None,
+                "resolution_um": args.atlas.resolution_um,
+            }
+        else:
+            region_ids, region_labels, atlas_info = dict(args.region_ids), args.region_labels, None
+            damage_labels = list(args.damage_labels)
+
+        out_sitk = sitk.GetImageFromArray(result.volume)
+        out_sitk.CopyInformation(base_sitk)      # keeps the source's (1,1,1) -- see module docstring
+        sitk.WriteImage(out_sitk, args.output_path)
+        regions_path, slices_path = write_guide_sidecars(
+            args.output_path, args.image_path, result, region_labels,
+            arr.shape[0], spacing_xyz=base_sitk.GetSpacing(),
+            region_ids=region_ids, atlas_info=atlas_info, damage_labels=damage_labels)
+
+        # Damage labels are folded into the naming only for the printout and
+        # the warnings -- never into region_labels itself, which feeds the
+        # sidecar's `regions` key and would round-trip DAMAGE_NAME into a
+        # (bogus) ontology-name lookup on resume.
+        display_labels = dict(region_labels, **{lab: [DAMAGE_NAME] for lab in damage_labels})
+        # The reposition plan rides along with the guide rather than being
+        # exported separately: apply_reposition.py moves the guide outline with
+        # the stack, so the two have to describe the same painting session.
+        reposition_paths = _export_reposition(reposition_state, args.output_path)
+        lines = [f"Wrote {args.output_path}", f"Wrote {regions_path}", f"Wrote {slices_path}"]
+        lines += [f"Wrote {path}" for path in reposition_paths]
+        for label in sorted(result.slices_by_label):
+            lines.append(
+                f"  label {label} ({_label_name(label, display_labels)}): "
+                f"{len(result.slices_by_label[label])} painted planes "
+                f"{result.slices_by_label[label]} -> {result.voxels_by_label[label]} voxels")
+        lines += [f"WARNING: {w}" for w in guide_export_warnings(result, display_labels)]
+        if region_ids or damage_labels:
+            lines += ["", "Paste this into the pipeline config:", "",
+                      guide_regions_yaml_snippet(
+                          region_ids, region_labels, args.output_path,
+                          voxel_size_um=args.voxel_size_um, damage_labels=damage_labels)]
+
+        print("\n".join(lines))
+
+    # A bulk relabel has to carry the region assignment with it, or the label
+    # keeps its voxels and loses its meaning -- the exact thing the ontology
+    # picker exists to prevent. Merging onto a label that already has a region
+    # keeps the destination's, since that is the one the user just pointed at.
+    # An EMPTY entry travels too (`is not None`, not truthiness): the reminder
+    # that a label lost its regions belongs to whichever number now carries
+    # those voxels.
+    def _assignment_follows_relabel(src, dst):
+        if assignment is None:
+            return
+        ids = assignment.pop(src, None)
+        if ids is not None and dst not in assignment:
+            assignment[dst] = ids
+        if picker is not None:
+            picker.refresh_assignment()
+
+    reposition_section, reposition_state = _reposition_controls(
+        viewer, arr, args.voxel_size_um,
+        scale=display_scale_from_voxel_size(args.voxel_size_um),
+        resume=load_reposition_resume(args.output_path, args.existing_mask_path),
+        paint_layer=paint_layer)
+
+    tools_dock = _add_tools_panel(viewer, [
+        ("Export", _export_controls(export, "Export Outline")),
+        ("Relabel", _relabel_controls(viewer, paint_layer,
+                                      on_change=_assignment_follows_relabel)),
+        ("Erase", _erase_controls(viewer, paint_layer)),
+        ("Reposition", reposition_section),
+        ("Display", _display_controls([paint_layer, reposition_state.fragments_layer])),
+    ], name="Export & tools",
+       header=_sample_banner(args.image_path, [
+           ("image", args.image_path),
+           ("resume", args.existing_mask_path),
+           ("export", args.output_path)]))
+    # The region brush selected, not the fragments layer added after it:
+    # painting regions is what this window is for, and a session that never
+    # touches Reposition should not have to find its way back.
+    viewer.layers.selection = {paint_layer}
+    _tab_the_panels(viewer, left=[tools_dock],
+                    right=[picker.dock] if picker is not None else [])
+
+
+# =====================================================================================
+# mode: labels -- painting on a registration RESULT rather than on blank planes
+# =====================================================================================
+# `mode: guide` above starts from an empty paint layer: you trace regions on the
+# raw sample and every plane you do not touch stays background. This mode starts
+# from <name>_labels_in_sample.nii.gz -- a finished registration -- collapsed into
+# the current partition's brush labels, and you correct where it came out wrong.
+#
+# Three things differ, and all three follow from "the layer arrives pre-filled":
+#
+#   1. A keyframe is a WHOLE PLANE, not the pixels you touched. In guide mode an
+#      untouched pixel means "no outline here"; here it means "the registration
+#      was already right here", which is a positive statement about that plane's
+#      anatomy and belongs in the guide. So a plane counts as hand-drawn as soon
+#      as it differs from the baseline collapse anywhere, and the whole plane --
+#      every region on it, corrected or not -- becomes the keyframe.
+#
+#   2. Interpolation is mask_utils.interpolate_sparse_label_correction, not
+#      interpolate_labels_separately. Every region shares the same keyframe
+#      planes here (they are whole planes), so the interleaving problem that
+#      forces per-label interpolation in guide mode cannot arise; what is needed
+#      instead is for neighbouring regions to COMPETE for the voxels between two
+#      keyframes, which is exactly that function's per-label signed-distance
+#      contest.
+#
+#   3. Two volumes come out, not one:
+#        <output_path>         sparse guide, empty outside the keyframe span, for
+#                              mask.guide_regions -- i.e. for re-registering.
+#        <dense_output_path>   dense, every plane filled, for re-opening and
+#                              drawing more. Same keyframes, baseline swapped from
+#                              zeros to the full collapse. Defaults to
+#                              <output_path>_atlas.nii.gz; `atlas_output_path` is
+#                              the key's old name and still read.
+#      The dense one must never be used as the baseline for its own next export,
+#      or each session interpolates on top of the last one's guess; the
+#      .keyframes.json sidecar records which planes were real and where the true
+#      baseline lives, and load_labels_resume enforces it.
+#
+#      CARRYING ON NEXT SESSION is `resume_from:` -- the dense file to reopen,
+#      defaulting to dense_output_path, i.e. "save over the same working file"
+#      unless told otherwise. The two are separate keys because they answer
+#      different questions: point resume_from at last session's dense file and
+#      dense_output_path at a new name to keep every round as its own snapshot,
+#      leave resume_from empty for one archive that keeps growing. What must
+#      NEVER move is labels_path: it stays the registration's own output, the
+#      true baseline every session re-derives from.
+#
+# FIVE LAYERS, bottom to top, and only one of them is editable:
+#
+#   sample                          the raw stack, grayscale
+#   atlas regions (all, read-only)  every region the registration produced, in
+#                                   compact present_ids indices -- i.e. the same
+#                                   colours visualization/atlas_view.py gives them.
+#                                   Hidden by default (the paint layer is what
+#                                   you work on), and what the bottom hover bar
+#                                   reads: a brush label says "Cerebral cortex"
+#                                   whether the voxel is layer 5 of the motor
+#                                   area or the subiculum, and that difference
+#                                   is exactly what decides where to split.
+#   regions (paint here)            the brush labels -- the one editable layer
+#   registration as-is (read-only)  the baseline collapse, to compare a keyframe
+#                                   against once interpolation has overwritten
+#                                   the planes between two of them
+#   selected region (atlas pick)    what the ontology tree currently points at
+#
+# The three reference layers live on the REGISTRATION's grid with their own
+# napari scale, not regridded onto the raw stack: both grids share physical
+# origin 0 and an identity direction (regrid_nearest's own precondition), so
+# napari lands them on top of each other, and each costs an array the size of
+# the registration output rather than of the raw stack.
+
+
+def plane_keyframes(paint, baseline):
+    """{z: (all-True mask, paint[z])} for every plane that differs from the
+    baseline collapse anywhere.
+
+    The mask is all-True on purpose -- see point 1 above. It is still passed
+    explicitly rather than assumed, because interpolate_sparse_label_correction
+    is shared with tools/edit_sample_labels.py, where the mask really is the
+    sparse set of touched pixels.
+    """
+    changed = np.any(paint != baseline, axis=(1, 2))
+    full = np.ones(paint.shape[1:], dtype=bool)
+    return {int(z): (full, paint[int(z)]) for z in np.flatnonzero(changed)}
+
+
+def recollapse_keeping_edits(paint, old_baseline, new_baseline):
+    """Re-derive the paint layer after the partition changed, keeping the
+    hand edits and refreshing everything else.
+
+    Splitting a region out (or merging it back) renumbers most of the
+    volume, so the layer has to be rebuilt -- but a voxel the user actually
+    repainted must survive verbatim, or refining would quietly discard the
+    correction that motivated it. A voxel counts as edited exactly when it
+    disagreed with the OLD baseline.
+
+    The useful consequence: the parts of a keyframe plane you never touched
+    are refined to the new partition automatically, so splitting out
+    Hippocampal formation gives you its boundary on planes you had already
+    corrected at the coarse level, without redrawing them.
+    """
+    edited = paint != old_baseline
+    return np.where(edited, paint, new_baseline).astype(np.uint8)
+
+
+def labels_export(paint, baseline, interpolate=None):
+    """Whole-plane keyframes -> (sparse guide volume, dense atlas volume).
+
+    Returns SimpleNamespace(guide, atlas, hand_drawn_slices, slices_by_label,
+    voxels_by_label, overlap_pairs, n_contested) -- the last four shaped like
+    interpolate_labels_separately's result so write_guide_sidecars and
+    guide_export_warnings can be reused unchanged. overlap_pairs is always
+    empty and n_contested always 0: a napari Labels layer is a single-valued
+    raster, so a partition cannot have two labels claim one voxel the way
+    separately-interpolated outlines can.
+    """
+    interpolate = interpolate or _interpolate_sparse_label_correction()
+    keyframes = plane_keyframes(paint, baseline)
+    if not keyframes:
+        return None
+
+    guide = interpolate(keyframes, np.zeros_like(baseline))
+    atlas = interpolate(keyframes, baseline)
+
+    slices_by_label = {}
+    for z, (_mask, plane) in sorted(keyframes.items()):
+        for label in np.unique(plane):
+            if label:
+                slices_by_label.setdefault(int(label), []).append(int(z))
+    return SimpleNamespace(
+        guide=guide.astype(np.uint8),
+        atlas=atlas.astype(np.uint8),
+        hand_drawn_slices=sorted(keyframes),
+        slices_by_label={lab: sorted(zs) for lab, zs in sorted(slices_by_label.items())},
+        voxels_by_label={lab: int(np.count_nonzero(guide == lab)) for lab in sorted(slices_by_label)},
+        overlap_pairs={},
+        n_contested=0,
+    )
+
+
+def labels_export_warnings(result, partition, structures, own_voxels, total_z,
+                           node_voxels=None, voxel_mm3=None,
+                           min_mm3=label_partition.DEFAULT_MIN_MM3):
+    """The mode-specific checks, on top of guide_export_warnings'."""
+    warnings = []
+
+    painted = set(result.slices_by_label)
+    empty = [lab for lab in partition.empty_atlas_side(structures, own_voxels) if lab in painted]
+    for label in empty:
+        group = partition.groups[label]
+        warnings.append(
+            f"label {label} ({group.name}) is still painted on planes "
+            f"{result.slices_by_label[label]}, but every one of its atlas regions has been "
+            f"split out into a child label, so its atlas outline is EMPTY. The pipeline "
+            f"aborts the whole run on that (_build_guide_regions_from_labels raises). "
+            f"Repaint those voxels with the child labels, or merge the children back.")
+
+    if node_voxels is not None and voxel_mm3:
+        for label in sorted(painted):
+            group = partition.groups.get(label)
+            if group is None:
+                continue
+            mm3 = sum(node_voxels.get(i, 0) for i in group.ids) * voxel_mm3
+            if mm3 < min_mm3:
+                warnings.append(
+                    f"label {label} ({group.name}) is only ~{mm3:.2f} mm3 in the atlas. A guide "
+                    f"region that small usually drags the deformation the wrong way -- the "
+                    f"hand-drawn boundary error is a large fraction of the structure.")
+
+    n = len(result.hand_drawn_slices)
+    if total_z and n > total_z / 2:
+        warnings.append(
+            f"{n} of {total_z} planes count as hand-drawn. That is most of the volume, which "
+            f"usually means a bulk edit (Relabel the whole label) touched planes you never "
+            f"looked at -- every one of them is now a keyframe. Check the plane list above.")
+    return warnings
+
+
+def _labels_sidecar_path(dense_path):
+    return _output_stem(dense_path).with_name(
+        _output_stem(dense_path).name + ".keyframes.json")
+
+
+def write_labels_sidecar(dense_output_path, guide_output_path, labels_path, result,
+                         partition, structures, total_z, grids=None):
+    """<atlas_output>.keyframes.json -- what makes the dense volume safely
+    re-openable.
+
+    It records the true baseline's path, NOT just the plane list, because the
+    dense volume is mostly interpolation: re-opening it as its own baseline
+    would promote this session's guesses to next session's ground truth and
+    compound every round. load_labels_resume reads the baseline back from
+    here and overlays only these planes.
+
+    The partition is stored with its parent links so a split-out region can
+    be merged back after a resume -- the nesting is what atlas_exclude_ids is derived
+    from, and losing it would silently drop those subtractions.
+    """
+    path = _labels_sidecar_path(dense_output_path)
+    path.write_text(json.dumps({
+        "hand_drawn_slices": result.hand_drawn_slices,
+        "baseline_labels_path": str(Path(labels_path).resolve()),
+        "guide_path": str(guide_output_path),
+        # "atlas_path" rather than "dense_path": the key is what already-written
+        # sidecars carry, and it is informational -- load_labels_resume takes
+        # the path it was asked to open, never one out of the file.
+        "atlas_path": str(dense_output_path),
+        "total_z": int(total_z),
+        "region_ids": {str(g.label): list(g.ids) for g in partition},
+        "region_names": {str(g.label): g.name for g in partition},
+        "parents": {str(g.label): g.parent.label for g in partition if g.parent is not None},
+        "atlas_exclude_ids": {str(k): v for k, v in partition.atlas_exclude_ids(structures).items()},
+        # Both grids, because the volumes here are on the raw stack's while
+        # baseline_labels_path points at one on the registration's -- a resume
+        # has to regrid again and the two voxel sizes are in neither header.
+        "grids": grids,
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def load_labels_resume(dense_path, structures, expected_shape):
+    """Restore a previous mode-labels export, or None if there is nothing to
+    resume. Returns SimpleNamespace(partition, hand_drawn_slices, planes,
+    baseline_labels_path, sidecar) where `planes` is {z: 2D uint8}.
+
+    Only the recorded planes come back, at their exported values -- same rule
+    as load_guide_resume and tools/edit_sample_labels.py's
+    _load_prior_hand_drawn, for the same reason: everything else in that file
+    is this tool's own interpolation.
+    """
+    dense_path = Path(dense_path)
+    sidecar = _labels_sidecar_path(dense_path)
+    if not (dense_path.exists() and sidecar.exists()):
+        return None
+
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(dense_path)))
+    if arr.shape != expected_shape:
+        print(f"WARNING: resume file shape {arr.shape} != labels shape {expected_shape}, "
+              f"not resuming.")
+        return None
+
+    partition = label_partition.Partition.from_region_ids(
+        {int(k): v for k, v in meta["region_ids"].items()}, structures)
+    for child, parent in (meta.get("parents") or {}).items():
+        child, parent = int(child), int(parent)
+        if child in partition.groups and parent in partition.groups:
+            partition.groups[child].parent = partition.groups[parent]
+
+    planes = [z for z in meta["hand_drawn_slices"] if 0 <= z < expected_shape[0]]
+    return SimpleNamespace(
+        partition=partition,
+        hand_drawn_slices=sorted(planes),
+        planes={int(z): arr[int(z)].astype(np.uint8) for z in planes},
+        baseline_labels_path=meta.get("baseline_labels_path"),
+        # The guide this dense file was exported alongside -- i.e. the stem
+        # last round's reposition plan was written next to, which a new
+        # output_path would otherwise leave behind (load_reposition_resume).
+        guide_path=meta.get("guide_path"),
+        sidecar=sidecar,
+    )
+
+
+def labels_voxel_size_um(spacing_xyz, override=None):
+    """The (x,y,z) micron voxel size of a labels_in_sample.nii.gz.
+
+    Every image this codebase writes carries spacing DIRECTLY IN MICRONS
+    (io_utils.load_tiff_stack_as_ants / resample_to_isotropic are handed
+    micron values and never divide), so a pipeline output reads back as
+    25.0, not 0.025. Files from elsewhere follow the NIfTI convention and
+    are in millimetres -- the DevCCF downloads read back as 0.02. Both have
+    to work here, and getting it wrong by 1000x silently regrids the labels
+    to a sliver of the stack rather than erroring, so the two cases are told
+    apart by magnitude and the choice is announced.
+
+    override wins outright, for the case where neither guess is right.
+    """
+    if override:
+        return [float(v) for v in override]
+    spacing = [float(s) for s in spacing_xyz]
+    if all(abs(s - 1.0) < 1e-6 for s in spacing):
+        raise ValueError(
+            "labels_path has no voxel size in its header (spacing is 1,1,1). Set "
+            "labels_voxel_size_um in the config -- it is needed to overlay the labels on "
+            "the raw stack, so it cannot be guessed.")
+    if max(spacing) < 1.0:
+        print(f"[labels] header spacing {spacing} is below 1, reading it as MILLIMETRES "
+              f"-> {[s * 1000 for s in spacing]} um. Set labels_voxel_size_um to override.")
+        return [s * 1000.0 for s in spacing]
+    return spacing
+
+
+def regrid_nearest(arr_zyx, src_spacing_zyx, dst_shape_zyx, dst_spacing_zyx):
+    """Nearest-neighbour regrid of a label volume between two axis-aligned
+    grids that share physical origin 0 and identity direction.
+
+    That precondition is not an assumption, it is this codebase's invariant:
+    io_utils.load_tiff_stack_as_ants and resample_to_isotropic never pass a
+    nonzero origin or a non-default direction, and io_utils.crop_to_bounds
+    shifts origin precisely so a crop stays in the same physical space. So
+    the mapping is one multiplication per axis and needs no transform.
+
+    Done as a gather rather than through ants.resample_image_to_target
+    because the destination here is the raw stack -- 2273x3974x157 for the
+    s12t sample. A float32 ANTs round trip of that is ~5.7 GB per copy;
+    indexing a uint8 array straight into place is one output-sized
+    allocation and no interpolation to get wrong on discrete ids.
+    """
+    idx = []
+    for axis in range(3):
+        scale = float(dst_spacing_zyx[axis]) / float(src_spacing_zyx[axis])
+        pos = np.rint(np.arange(dst_shape_zyx[axis]) * scale).astype(np.int64)
+        idx.append(np.clip(pos, 0, arr_zyx.shape[axis] - 1))
+    return arr_zyx[np.ix_(*idx)]
+
+
+def _seed_partition(args, structures, resume):
+    """Where the starting partition comes from, most specific first: a resumed
+    session, then partition_path (a .regions.json -- e.g. the one an earlier
+    `mode: guide` export already wrote), then the config's own region_ids."""
+    if resume is not None:
+        return resume.partition, f"resumed from {resume.sidecar.name}"
+    if args.partition_path:
+        return (label_partition.Partition.from_regions_json(args.partition_path, structures),
+                f"seeded from {Path(args.partition_path).name}")
+    if args.region_ids:
+        return (label_partition.Partition.from_region_ids(args.region_ids, structures),
+                "seeded from the config's region_ids")
+    raise ValueError(
+        "mode: labels needs a starting partition. Set partition_path to a .regions.json "
+        "(the sidecar any guide export writes), or list region_ids in the config.")
+
+
+def _add_partition_panel(viewer, paint_layer, partition, structures, node_voxels,
+                         own_voxels, voxel_mm3, min_mm3, on_partition_changed,
+                         on_highlight=None):
+    """The partition panel: the ontology tree on top, the brush labels below.
+
+    Guide mode's tree ASSIGNS a region to a free brush number. This one
+    REFINES a mapping that already exists (it came from the registration):
+    picking a node splits exactly that node out into its own brush label,
+    leaving the group it came out of as the residual. Depth is per-group on
+    purpose -- see label_partition's docstring for the measured reason a
+    uniform ontology depth is not usable on CCFv3.
+
+    Why a tree rather than the "Expand one level" button this replaces:
+    expanding is only the operation you want when the level you want is the
+    NEXT one. It never is. `Field CA1` sits five levels under Cerebral
+    cortex, so reaching it meant four rounds of expanding, ~40 groups nobody
+    asked for -- each of which recollapses the whole paint layer and has to
+    be merged back one at a time -- and no way at all to say "just this one
+    region". The tree says it in one click, at any depth, and can also pick
+    a region the seed partition never covered.
+
+    Selecting a node HIGHLIGHTS it in the viewer before anything is changed
+    (on_highlight is handed the ids and answers with how many voxels of them
+    the registration result actually holds), because "which region is that,
+    and did the registration even put it in this sample" is the question you
+    have before deciding to split it out -- and the atlas node names alone
+    do not answer it.
+
+    The two halves stay in sync both ways: picking a node selects the group
+    that currently owns it (and sets the brush to it), picking a group
+    scrolls the tree to its root and highlights it.
+    """
+    status = QLabel("")
+    status.setWordWrap(True)
+    status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+    search = QLineEdit()
+    search.setObjectName("partition_search")
+    search.setPlaceholderText("Filter by name / acronym / id, any order...")
+    hide_empty = QCheckBox("Only regions with voxels in this annotation")
+    hide_empty.setObjectName("partition_hide_empty")
+    hide_empty.setChecked(True)
+
+    tree = QTreeWidget()
+    tree.setObjectName("partition_tree")
+    # A fourth column the shared widget does not fill: which brush label a
+    # node is the root of. Without it the tree and the group list below are
+    # two unrelated lists of names, and "have I already split this out" is
+    # only answerable by reading the other one.
+    tree.setHeaderLabels(["Region", "Voxels", "id", "brush"])
+    tree.setColumnWidth(0, 260)
+    items = ontology_tree_ui.populate_ontology_tree(tree, structures, node_voxels)
+    split_btn = QPushButton("Give this region its own brush label")
+    split_btn.setObjectName("partition_split")
+
+    listing = QListWidget()
+    listing.setObjectName("partition_listing")
+    merge_btn = QPushButton("Merge children back")
+    drop_btn = QPushButton("Remove this label")
+    isolate = QCheckBox("Show only the selected group")
+    isolate.toggled.connect(lambda checked: setattr(paint_layer, "show_selected_label", checked))
+
+    # The two halves drive each other, so each guards against re-entering the
+    # other's signal handler -- otherwise selecting a group scrolls the tree,
+    # which selects the group, which scrolls the tree.
+    sync = {"busy": False}
+
+    def selected_id():
+        item = tree.currentItem()
+        return None if item is None else item.data(0, Qt.UserRole)
+
+    def selected_label():
+        row = listing.currentRow()
+        return listing._labels[row] if 0 <= row < len(getattr(listing, "_labels", [])) else None
+
+    def highlight_note(ids):
+        """Light the region up in the viewer, and say what that showed."""
+        if on_highlight is None:
+            return ""
+        voxels = on_highlight(list(ids))
+        if voxels is None:
+            return ""
+        if not voxels:
+            return ("\nNOTHING HIGHLIGHTED: the registration result has no voxels of this "
+                    "region at all -- it is outside the sample, or the registration lost it.")
+        return f"\nHighlighted in the viewer: {voxels:,} voxels of it in the registration result."
+
+    def mm3_of(ids):
+        return sum(node_voxels.get(int(i), 0) for i in ids) * voxel_mm3
+
+    def small_note(mm3):
+        return (f"\nOnly ~{mm3:.2f} mm3 in the atlas, under the {min_mm3} mm3 floor: a guide "
+                f"region that small usually drags the deformation the wrong way.")
+
+    def refresh(message=""):
+        keep = selected_label()
+        sync["busy"] = True
+        try:
+            listing.clear()
+            listing._labels = []
+            for group in partition:
+                mm3 = mm3_of(group.ids)
+                kids = partition.children_of(group.label)
+                note = f"  [residual, {len(kids)} split out]" if kids else ""
+                listing.addItem(f"{group.label:>3}  {group.name}   ~{mm3:.1f} mm3{note}")
+                listing._labels.append(group.label)
+            if keep in listing._labels:
+                listing.setCurrentRow(listing._labels.index(keep))
+        finally:
+            sync["busy"] = False
+        roots = partition.root_to_label()
+        for sid, item in items.items():
+            item.setText(3, f"label {roots[sid]}" if sid in roots else "")
+        empty = partition.empty_atlas_side(structures, own_voxels)
+        tail = (f"\nResidual labels with an EMPTY atlas side (fine unless still painted): "
+                f"{empty}" if empty else "")
+        status.setText((message or "Pick a region above to highlight it, or a group below to "
+                                   "paint with it.") + tail)
+
+    def refresh_filter():
+        visible = atlas_reference.visible_tree_ids(
+            structures, node_voxels, search.text(), hide_empty.isChecked())
+        for sid, item in items.items():
+            item.setHidden(sid not in visible)
+        if search.text().strip():
+            tree.expandAll()
+
+    def on_tree_select():
+        sid = selected_id()
+        if sid is None or sync["busy"]:
+            return
+        owner = partition.owner_of(sid, structures)
+        if owner is not None:
+            # The brush follows the selection: correcting a region you just
+            # looked up starts by painting with whatever number covers it.
+            paint_layer.selected_label = owner.label
+            sync["busy"] = True
+            try:
+                if owner.label in listing._labels:
+                    listing.setCurrentRow(listing._labels.index(owner.label))
+            finally:
+                sync["busy"] = False
+        mm3 = mm3_of([sid])
+        where = (f"painted as label {owner.label} ({owner.name})" if owner is not None else
+                 "NOT covered by any brush label -- splitting it out is what makes it paintable")
+        status.setText(f"{structures[sid]['name']} [{sid}], ~{mm3:.1f} mm3 in the atlas; "
+                       f"currently {where}." + highlight_note([sid])
+                       + (small_note(mm3) if mm3 < min_mm3 else ""))
+
+    def on_row_changed(_row):
+        label = selected_label()
+        if label is None or sync["busy"]:
+            return
+        paint_layer.selected_label = label
+        group = partition.groups.get(label)
+        if group is None:
+            return
+        sync["busy"] = True
+        try:
+            first = next((int(i) for i in group.ids if int(i) in items), None)
+            if first is not None:
+                tree.setCurrentItem(items[first])
+                tree.scrollToItem(items[first])
+        finally:
+            sync["busy"] = False
+        status.setText(f"Brush is now label {group.label} = {group.name} "
+                       f"(~{mm3_of(group.ids):.1f} mm3)." + highlight_note(group.ids))
+
+    def split_out():
+        sid = selected_id()
+        if sid is None:
+            refresh("Pick a region in the tree above first.")
+            return
+        if not node_voxels.get(sid):
+            refresh(f"{structures[sid]['name']} has no voxels in this atlas annotation -- "
+                    f"refusing to split it out, the pipeline aborts on a guide region it "
+                    f"cannot match on the atlas side.")
+            return
+        try:
+            group = partition.split_out(sid, structures)
+        except ValueError as exc:
+            refresh(f"Cannot split that out: {exc}")
+            return
+        on_partition_changed()
+        paint_layer.selected_label = group.label
+        refresh()                      # rebuilds listing._labels for the row below
+        if group.label in listing._labels:
+            listing.setCurrentRow(listing._labels.index(group.label))
+        came_from = (f"out of label {group.parent.label} ({group.parent.name}), which keeps "
+                     f"everything it does not cover" if group.parent is not None else
+                     "out of the background -- no group covered it before")
+        mm3 = mm3_of(group.ids)
+        refresh(f"label {group.label} = {group.name}, split {came_from}. Paint with it to "
+                f"correct it on its own." + (small_note(mm3) if mm3 < min_mm3 else ""))
+
+    def merge():
+        label = selected_label()
+        if label is None:
+            return
+        removed = partition.merge_back(label)
+        if not removed:
+            refresh(f"label {label} has nothing split out of it. To remove the label itself, "
+                    f"use Remove this label.")
+            return
+        on_partition_changed()
+        refresh(f"Merged {len(removed)} group(s) back into label {label}: "
+                + ", ".join(g.name for g in removed))
+
+    def drop_group():
+        label = selected_label()
+        if label is None:
+            return
+        group = partition.groups[label]
+        falls_to = (f"back to label {group.parent.label} ({group.parent.name})"
+                    if group.parent is not None else "to background")
+        removed = partition.drop(label)
+        on_partition_changed()
+        under = f" and the {len(removed) - 1} group(s) split out of it" if len(removed) > 1 else ""
+        refresh(f"Removed label {label} ({group.name}){under}; its voxels go {falls_to}. "
+                f"Anything you already PAINTED with {label} keeps that number and now names "
+                f"no region -- relabel it before exporting.")
+
+    search.textChanged.connect(lambda _t: refresh_filter())
+    hide_empty.toggled.connect(lambda _c: refresh_filter())
+    tree.currentItemChanged.connect(lambda _cur, _prev: on_tree_select())
+    split_btn.clicked.connect(split_out)
+    listing.currentRowChanged.connect(on_row_changed)
+    merge_btn.clicked.connect(merge)
+    drop_btn.clicked.connect(drop_group)
+
+    upper = QWidget()
+    upper_layout = QVBoxLayout(upper)
+    upper_layout.setContentsMargins(0, 0, 0, 0)
+    # Short lines on purpose: a QLabel does not wrap (wrapping one would drive
+    # the whole window's minimum height -- see ontology_tree_ui.scrollable),
+    # so a line longer than the dock is CLIPPED, and a clipped sentence reads
+    # as a typo rather than as a narrow panel.
+    upper_layout.addWidget(QLabel(
+        "Atlas ontology. Selecting a region\n"
+        "highlights it on the sample, where\n"
+        "the registration put it. Split one\n"
+        "out to correct it under its own\n"
+        "brush label; the group it came out\n"
+        "of keeps everything else."))
+    upper_layout.addWidget(search)
+    upper_layout.addWidget(hide_empty)
+    upper_layout.addWidget(tree, 1)      # the stretch: spare height is the tree's
+    upper_layout.addWidget(split_btn)
+
+    lower = QWidget()
+    lower_layout = QVBoxLayout(lower)
+    lower_layout.setContentsMargins(0, 0, 0, 0)
+    lower_layout.addWidget(QLabel("Brush label -> atlas region.\nSelecting one sets the brush."))
+    # The stretch, plus a status box pinned to its own height: the group list
+    # is what this half is FOR and a partition routinely runs to a dozen
+    # groups, so spare height belongs to it rather than to the blank half of
+    # a message box. (Height only -- the width stays draggable, see
+    # ontology_tree_ui.shrinkable.)
+    lower_layout.addWidget(listing, 1)
+    row = QWidget()
+    row_layout = QHBoxLayout(row)
+    row_layout.addWidget(merge_btn)
+    row_layout.addWidget(drop_btn)
+    lower_layout.addWidget(row)
+    lower_layout.addWidget(isolate)
+    status_box = ontology_tree_ui.scrollable(status, 100)
+    status_box.setMaximumHeight(100)
+    lower_layout.addWidget(status_box)
+
+    # A splitter, not two stacked widgets, for the same reason guide mode's
+    # picker has one: how much of the column the group list is worth depends
+    # on how many groups there are, which a fixed split cannot know.
+    splitter = QSplitter(Qt.Vertical)
+    splitter.addWidget(upper)
+    splitter.addWidget(lower)
+    splitter.setStretchFactor(0, 3)
+    splitter.setStretchFactor(1, 2)
+    splitter.setSizes([560, 320])
+
+    dock = QWidget()
+    QVBoxLayout(dock).addWidget(splitter)
+    for widget in (dock, tree, listing, upper, lower, splitter):
+        ontology_tree_ui.shrinkable(widget)
+    dock_widget = viewer.window.add_dock_widget(dock, area="right", name="Partition")
+    ontology_tree_ui.set_dock_width(dock_widget, _ONTOLOGY_PANEL_START_PX)
+    refresh_filter()
+    refresh()
+    return SimpleNamespace(refresh=refresh, dock=dock_widget)
+
+
+def _run_labels(args):
+    """`mode: labels` -- correct a finished registration, export a guide to
+    re-register with plus a dense volume to carry on from.
+
+    Everything happens on the RAW stack's grid, not on the isotropic grid the
+    registration ran on. That is not a preference: the resample to
+    fine_target_um throws away ~8x of the in-plane detail (2.6 um pixels
+    become 20 um ones at the fine_target_um used here) and replaces the real
+    imaging planes with interpolated ones, so the
+    boundaries being corrected are no longer resolvable by eye and the plane
+    being drawn on is not a plane that was ever imaged.
+    pipeline.py's _build_guide_regions_from_labels already states this as the
+    convention for the painted volume; the registration output is brought TO
+    that grid here, rather than the painting being dragged down to it.
+    """
+    _import_gui()
+    if not args.labels_path:
+        raise ValueError("mode: labels needs labels_path (the <name>_labels_in_sample.nii.gz "
+                         "a completed registration wrote)")
+    if not args.atlas:
+        raise ValueError("mode: labels needs atlas_annotation_path + ontology_path: the "
+                         "partition is expressed in that ontology's ids")
+    raw_voxel_um = args.voxel_size_um
+    if not raw_voxel_um:
+        raise ValueError(
+            "mode: labels needs voxel_size_um: [x, y, z] for image_path -- the raw stack's "
+            "header does not carry one, and it is what puts the registration output onto the "
+            "same grid.")
+
+    # The default keeps the _atlas suffix it has always had, even though the
+    # key is called dense_output_path now: changing it would send every
+    # existing session's resume looking for a file that is not there.
+    dense_output_path = args.dense_output_path or str(
+        _output_stem(args.output_path).with_name(_output_stem(args.output_path).name + "_atlas.nii.gz"))
+    resume_path = args.resume_from or dense_output_path
+
+    raw_sitk, sample_arr = _read_sitk_array(args.image_path)
+    labels_sitk, fine_labels = _read_sitk_array(args.labels_path)
+    fine_labels = fine_labels.astype(np.uint32)
+    fine_voxel_um = labels_voxel_size_um(labels_sitk.GetSpacing(), args.labels_voxel_size_um)
+
+    raw_spacing_zyx = list(reversed(raw_voxel_um))
+    fine_spacing_zyx = list(reversed(fine_voxel_um))
+    print(f"[grids] raw stack   {sample_arr.shape} (z,y,x) @ {raw_spacing_zyx} um\n"
+          f"[grids] registration {fine_labels.shape} (z,y,x) @ {fine_spacing_zyx} um")
+    covered = [f * n for f, n in zip(fine_spacing_zyx, fine_labels.shape)]
+    extent = [s * n for s, n in zip(raw_spacing_zyx, sample_arr.shape)]
+    if any(c < 0.9 * e for c, e in zip(covered, extent)):
+        print(f"WARNING: the registration grid spans {[round(c) for c in covered]} um but the raw "
+              f"stack spans {[round(e) for e in extent]} um. Either the two are not the same "
+              f"sample, or a voxel size is wrong -- check voxel_size_um and labels_voxel_size_um "
+              f"before painting, because the overlay will be silently offset.")
+
+    atlas = atlas_reference.load_atlas_reference(args.atlas, include_template=False)
+    structures = atlas.structures
+    counts = np.bincount(atlas.compact.ravel(), minlength=len(atlas.present_ids))
+    own_voxels = {int(sid): int(n) for sid, n in zip(atlas.present_ids, counts)}
+    res_um = args.atlas.resolution_um
+    if not res_um:
+        res_um = 25.0
+        print("WARNING: atlas_resolution_um is not set, assuming 25 um. Every mm3 shown in the "
+              "partition panel -- and therefore which children are big enough to split out -- "
+              "scales with its cube, so set it if the atlas is not 25 um. Both presets here are "
+              "20 um (off by (25/20)^3 ~ 1.95x), and a TIFF annotation like DeMBA's carries no "
+              "spacing to read it from, so it has to come from the config.")
+    voxel_mm3 = (res_um / 1000.0) ** 3 * (atlas.downsample ** 3)
+
+    resume = load_labels_resume(resume_path, structures, sample_arr.shape)
+    if resume is not None and Path(resume_path).resolve() != Path(dense_output_path).resolve():
+        print(f"[resume] reading {resume_path}\n"
+              f"[resume] this session's dense file will be written to {dense_output_path}, "
+              f"leaving that one untouched.")
+    partition, seed_note = _seed_partition(args, structures, resume)
+    if resume is not None and resume.baseline_labels_path and \
+            Path(resume.baseline_labels_path).resolve() != Path(args.labels_path).resolve():
+        print(f"WARNING: {resume.sidecar.name} was made against\n"
+              f"           {resume.baseline_labels_path}\n"
+              f"         but labels_path is\n           {args.labels_path}\n"
+              f"         Resuming anyway, but the restored planes describe the other volume.")
+
+    def baseline_for(partition):
+        """The registration output in brush space, on the RAW grid.
+
+        Collapsed first and regridded second, deliberately: collapsing works
+        on the small isotropic volume (~20M voxels) and turns uint32 ids into
+        uint8 brush labels, so the one array that reaches the raw grid's ~1.4e9
+        voxels is a byte per voxel instead of four.
+        """
+        return regrid_nearest(partition.collapse(fine_labels, structures), fine_spacing_zyx,
+                              sample_arr.shape, raw_spacing_zyx)
+
+    state = {"baseline": baseline_for(partition)}
+    prefill = state["baseline"].copy()
+    if resume is not None:
+        for z, plane in resume.planes.items():
+            prefill[z] = plane
+        print(f"[resume] restored {len(resume.planes)} hand-drawn plane(s) "
+              f"{resume.hand_drawn_slices} from {resume.sidecar.name}; the interpolated "
+              f"planes were re-derived from {Path(args.labels_path).name}.")
+
+    viewer, paint_layer = _launch_viewer(
+        sample_arr, prefill, scale=display_scale_from_voxel_size(raw_voxel_um),
+        title="Correct a registration result", layer_name="regions (paint here)",
+        image_path=args.image_path)
+    paint_layer.opacity = 0.5
+    scale_kwargs = {"scale": display_scale_from_voxel_size(raw_voxel_um)}
+    # The untouched registration, to compare a keyframe against once
+    # interpolation has overwritten the planes between two of them in the
+    # dense volume. In brush space rather than raw ontology ids: that is the
+    # comparison that matters here, and a uint32 copy of the raw grid would
+    # cost 4x this one for no extra information. Hidden by default.
+    reference = viewer.add_labels(state["baseline"], name="registration as-is (read-only)",
+                                  visible=False, opacity=0.4, **scale_kwargs)
+    reference.editable = False
+
+    # What a region PICKED IN THE TREE looks like on this sample, before
+    # anything is split out or painted. Drawn from the registration output on
+    # the registration's OWN grid, with its own scale, rather than regridded
+    # onto the raw stack like the baseline: napari places layers in world
+    # coordinates and both grids share physical origin 0 and an identity
+    # direction (the invariant regrid_nearest relies on), so a 20 um volume
+    # lands exactly on top of the 2.6 um one -- and each click then costs one
+    # array the size of the registration output (~20M voxels) instead of one
+    # the size of the raw stack (~1.4e9). An Image layer in additive red, not
+    # a Labels one, so the highlight reads as a highlight over whatever the
+    # paint layer is showing rather than as another region to confuse it with.
+    fine_ids = np.unique(fine_labels)
+
+    # EVERY atlas region the registration produced, not just the handful the
+    # partition collapses them into: the paint layer answers "which brush
+    # label is this", and this one answers "which structure did the atlas
+    # actually put here", which is the question the hover bar reads off and
+    # the one the partition is being built against.
+    #
+    # Held as COMPACT INDICES into atlas.present_ids rather than raw ontology
+    # ids, for the same two reasons atlas_reference._compact_annotation
+    # exists: napari's Labels colormap on ids reaching 6.1e8 is a colour per
+    # id nobody can tell apart, and -- because visualization/atlas_view.py draws the
+    # very same indices -- the colours here are IDENTICAL to that tool's, so
+    # a region looked up there is the same colour here.
+    index_dtype = np.uint8 if len(atlas.present_ids) <= 255 else np.uint16
+    # An id the atlas annotation does not contain (the DeMBA P5 output has a
+    # handful) goes wherever background went, rather than to index 0 on the
+    # assumption that the two are the same: index 0 is whatever sorted
+    # FIRST, which is id 0 in every real annotation but need not be.
+    background_index = atlas.index_of_id.get(0, 0)
+    index_of_id = np.array([atlas.index_of_id.get(int(i), background_index) for i in fine_ids],
+                           dtype=index_dtype)
+    region_index = index_of_id[np.searchsorted(fine_ids, fine_labels)]
+    atlas_regions = viewer.add_labels(
+        region_index, name="atlas regions (all, read-only)", visible=False, opacity=0.6,
+        scale=fine_spacing_zyx)
+    atlas_regions.editable = False
+    # UNDER the paint layer, not on top of it: it is a reference to look at
+    # beneath what you are drawing, and napari draws in list order, so a
+    # layer added last would hide the painting. Everything else added here
+    # (the read-only baseline, the highlight) is meant to sit above it.
+    viewer.layers.move(viewer.layers.index(atlas_regions), 1)
+
+    highlight = viewer.add_image(
+        np.zeros(fine_labels.shape, dtype=np.uint8), name="selected region (atlas pick)",
+        colormap="red", blending="additive", opacity=0.8, visible=False,
+        contrast_limits=(0, 1), scale=fine_spacing_zyx)
+
+    def highlight_region(ids):
+        """Light up the picked node(s) INCLUDING every descendant, and answer
+        with how many voxels of them the registration result holds.
+
+        Subtree, not the id itself, for the same reason atlas_ids expands:
+        the annotation's own labels sit at ontology depths 2-12, so a node
+        anywhere above them owns no voxels under its own id and would light
+        up nothing. The count is the part the atlas panel cannot say by
+        itself -- a region can be perfectly real in the atlas and simply
+        absent from this sample (a half brain, a cut-off cerebellum), and
+        that is what decides whether splitting it out is worth a brush label.
+        """
+        wanted = set()
+        for root in ids:
+            wanted |= label_partition.subtree_ids(int(root), structures)
+        # Mapped through the ids actually PRESENT (np.unique of the volume)
+        # rather than np.isin over the volume itself: the same reason
+        # Partition.collapse does it, one gather instead of a membership test
+        # per voxel against a few hundred ids.
+        mapped = np.isin(fine_ids, sorted(wanted)).astype(np.uint8)
+        mask = mapped[np.searchsorted(fine_ids, fine_labels)]
+        voxels = int(np.count_nonzero(mask))
+        highlight.data = mask
+        highlight.visible = bool(voxels)
+        return voxels
+
+    def region_colour(structure_id):
+        """The RGBA the atlas-regions layer draws this structure in, read off
+        the layer's own colormap so the bar cannot drift out of step with the
+        picture -- and, because those are atlas.present_ids indices, the same
+        colour visualization/atlas_view.py gives it."""
+        try:
+            index = atlas.index_of_id.get(int(structure_id), 0)
+            return list(atlas_regions.colormap.map(np.array([index]))[0])
+        except Exception:               # any colormap napari might grow later
+            return [0.5, 0.5, 0.5, 1.0]
+
+    # The bottom strip, not a side panel: see shared/hover_bar.py for why.
+    # It reads the ATLAS region under the cursor (the layer above), with its
+    # ancestors, which is what a brush label alone cannot tell you -- a group
+    # is "Cerebral cortex" whether the voxel under the cursor is layer 5 of
+    # the motor area or the subiculum.
+    hover = hover_bar.add_hover_bar(
+        viewer, structures, region_colour,
+        resting="Hover over the sample to read the atlas region the registration put there.")
+
+
+    def on_partition_changed():
+        new_baseline = baseline_for(partition)
+        paint_layer.data = recollapse_keeping_edits(
+            paint_layer.data, state["baseline"], new_baseline)
+        state["baseline"] = new_baseline
+        reference.data = new_baseline
+
+    panel = _add_partition_panel(viewer, paint_layer, partition, structures, atlas.node_voxels,
+                                 own_voxels, voxel_mm3, args.min_region_mm3, on_partition_changed,
+                                 on_highlight=highlight_region)
+
+    def _at(layer, position):
+        """The value of `layer` under a world position, or None off the grid.
+
+        Read out by hand rather than through layer.get_value(): the two
+        volumes here are on DIFFERENT grids (raw stack vs registration), and
+        world_to_data is the transform that maps between them -- the same one
+        napari uses to draw them on top of each other.
+        """
+        index = tuple(int(round(c)) for c in layer.world_to_data(position))
+        if len(index) != layer.data.ndim or not all(
+                0 <= c < n for c, n in zip(index, layer.data.shape)):
+            return None
+        return int(layer.data[index])
+
+    def described(value):
+        group = partition.groups.get(value)
+        if group is not None:
+            return group.name
+        return "background" if not value else f"unassigned label {value}"
+
+    def on_mouse_move(_viewer, event):
+        index = _at(atlas_regions, event.position)
+        # Back to an ontology id, because index 0 is not a synonym for
+        # background: present_ids is just what the annotation contains,
+        # sorted, and it only starts with 0 because real annotations have
+        # background voxels in them. The id is what says "no region".
+        sid = 0 if index is None or index >= len(atlas.present_ids) else \
+            int(atlas.present_ids[index])
+        label = _at(paint_layer, event.position)
+        was = _at(reference, event.position)
+        # What the registration SAID, not just what is there now, is what
+        # tells a correction apart from a region you have not touched -- the
+        # whole plane looks hand-drawn once it becomes a keyframe. Only when
+        # they differ: on every other voxel it is noise, and it rides at the
+        # deep end of the chain, where fit_ancestry_line never folds it away.
+        extra = ()
+        if label is not None and was is not None and label != was:
+            extra = (f"REPAINTED as {described(label)} [{label}], was {described(was)}",)
+        hover.show(None if index is None else sid, extra)
+
+    # On the VIEWER, not on the paint layer: napari delivers layer mouse
+    # callbacks to the active layer only, so a layer-level callback goes
+    # quiet the moment the selection moves to any of the other four layers
+    # here (and it starts out on whichever was added last). That is why the
+    # old "Under cursor" panel showed nothing.
+    viewer.mouse_move_callbacks.append(on_mouse_move)
+
+    def describe():
+        planes = sorted(plane_keyframes(paint_layer.data, state["baseline"]))
+        return (f"{seed_note}; {len(partition)} groups. Painting on the raw stack "
+                f"{sample_arr.shape} (z,y,x).\n"
+                f"Planes that differ from the registration so far ({len(planes)}): {planes}\n"
+                "Correct a plane anywhere and the WHOLE plane becomes a keyframe -- every\n"
+                "region on it, not just what you repainted. Planes between two keyframes\n"
+                "are interpolated; planes outside them stay empty in the guide.\n"
+                "The bar along the bottom names the atlas region under the cursor and its\n"
+                "ancestors; tick 'atlas regions (all, read-only)' in the layer list to see\n"
+                "every region the registration produced, not just the brush labels.")
+
+    print(describe())
+
+    def export():
+        planes = sorted(plane_keyframes(paint_layer.data, state["baseline"]))
+        if not planes:
+            print("Nothing differs from the registration yet -- nothing to export.\n"
+                  + describe())
+            return
+        # Said out loud because on the raw grid this is minutes, not seconds:
+        # the interpolation runs a signed-distance transform per region per
+        # pair of neighbouring keyframes, on planes of several megapixels.
+        print(f"Exporting {len(planes)} keyframe planes at {sample_arr.shape[1]}x"
+              f"{sample_arr.shape[2]}. On the raw grid this takes a while (one distance "
+              f"transform per region per keyframe gap).")
+
+        result = labels_export(paint_layer.data, state["baseline"])
+        region_ids = partition.region_ids()
+        region_names = partition.region_names(structures)
+        painted = set(result.slices_by_label)
+        for volume, path in ((result.guide, args.output_path), (result.atlas, dense_output_path)):
+            out = sitk.GetImageFromArray(volume)
+            out.CopyInformation(raw_sitk)   # the raw stack's own (1,1,1) -- see the module docstring
+            sitk.WriteImage(out, str(path))
+
+        atlas_info = {
+            "annotation_path": str(args.atlas.annotation_path),
+            "ontology_path": str(args.atlas.ontology_path),
+            "orientation": list(args.atlas.orientation) if args.atlas.orientation else None,
+            "resolution_um": args.atlas.resolution_um,
+        }
+        regions_path, slices_path = write_guide_sidecars(
+            args.output_path, args.image_path, result,
+            {lab: names for lab, names in region_names.items() if lab in painted},
+            sample_arr.shape[0], spacing_xyz=raw_sitk.GetSpacing(),
+            region_ids={lab: ids for lab, ids in region_ids.items() if lab in painted},
+            atlas_info=atlas_info)
+        keyframes_path = write_labels_sidecar(
+            dense_output_path, args.output_path, args.labels_path, result, partition,
+            structures, sample_arr.shape[0],
+            grids={"raw_shape_zyx": list(sample_arr.shape),
+                   "raw_voxel_size_um_xyz": list(raw_voxel_um),
+                   "labels_shape_zyx": list(fine_labels.shape),
+                   "labels_voxel_size_um_xyz": list(fine_voxel_um)})
+
+        reposition_paths = _export_reposition(reposition_state, args.output_path)
+        lines = [f"Wrote {args.output_path}          (sparse guide -- re-register with this)",
+                 f"Wrote {dense_output_path}   (dense -- re-open this to keep drawing)",
+                 f"Wrote {regions_path}", f"Wrote {slices_path}", f"Wrote {keyframes_path}", "",
+                 f"Keyframe planes ({len(result.hand_drawn_slices)}): {result.hand_drawn_slices}"]
+        lines[5:5] = [f"Wrote {path}" for path in reposition_paths]
+        for label in sorted(result.slices_by_label):
+            lines.append(f"  label {label} ({_label_name(label, region_names)}):  "
+                         f"{len(result.slices_by_label[label])} planes -> "
+                         f"{result.voxels_by_label[label]} voxels")
+        # Only the painted groups: guide mode warns about a configured label
+        # with no outline because there it means "you forgot to draw it", but
+        # a partition legitimately covers the whole brain while any one sample
+        # only spans part of it.
+        painted_names = {lab: names for lab, names in region_names.items() if lab in painted}
+        lines += [f"WARNING: {w}" for w in guide_export_warnings(result, painted_names)]
+        lines += [f"WARNING: {w}" for w in labels_export_warnings(
+            result, partition, structures, own_voxels, sample_arr.shape[0],
+            node_voxels=atlas.node_voxels, voxel_mm3=voxel_mm3, min_mm3=args.min_region_mm3)]
+
+        exclude = {lab: ids for lab, ids in partition.atlas_exclude_ids(structures).items()
+                   if lab in painted}
+        lines += ["", "Paste this into the pipeline config:", "",
+                  guide_regions_yaml_snippet(
+                      {lab: ids for lab, ids in region_ids.items() if lab in painted},
+                      region_names, args.output_path, voxel_size_um=raw_voxel_um,
+                      atlas_exclude_ids=exclude,
+                      voxel_size_note="# the raw stack's own (x,y,z) um, same grid as mode: guide")]
+
+        print("\n".join(lines))
+        panel.refresh()
+
+    reposition_section, reposition_state = _reposition_controls(
+        viewer, sample_arr, raw_voxel_um,
+        scale=display_scale_from_voxel_size(raw_voxel_um),
+        resume=load_reposition_resume(args.output_path,
+                                      resume.guide_path if resume is not None else None),
+        paint_layer=paint_layer)
+
+    tools_dock = _add_tools_panel(viewer, [
+        ("Export", _export_controls(export, "Export Guide + Atlas")),
+        ("Relabel", _relabel_controls(
+            viewer, paint_layer, on_change=lambda src, dst: print(
+                f"Bulk relabel {src} -> {dst} touched every plane it appears on -- each of "
+                f"those is now a keyframe.\n" + describe()))),
+        ("Erase", _erase_controls(viewer, paint_layer)),
+        ("Reposition", reposition_section),
+        ("Display", _display_controls([paint_layer, reference, atlas_regions,
+                                       reposition_state.fragments_layer])),
+    ], name="Export & tools",
+       header=_sample_banner(args.image_path, [
+           ("image", args.image_path),
+           ("registration", args.labels_path),
+           ("resume", resume_path if resume is not None else None),
+           ("guide out", args.output_path),
+           ("dense out", dense_output_path)]))
+    # The brush layer selected, not whichever was added last: napari hands the
+    # keyboard and the paint tools to the ACTIVE layer, and this window opens
+    # with five of them.
+    viewer.layers.selection = {paint_layer}
+    _tab_the_panels(viewer, left=[tools_dock], right=[panel.dock])
+
+
+# =====================================================================================
+# selftests -- synthetic arrays only, no GUI, no config, no image on disk
+# =====================================================================================
+def _reference_interpolate_sparse_mask(keyframe_planes, full_shape):
+    """Deliberate standalone minimal copy of
+    registration_ants.mask_utils.interpolate_sparse_mask, used by the
+    selftests ONLY when registration_ants isn't importable -- it lives in
+    ../Registration_ants and is pip-installed-editable in the antsreg env, so
+    a checkout without that install (or an env that never had it) can still
+    run --selftest.
+    selftest_interpolator_matches_registration_ants() asserts the two agree
+    voxel-for-voxel whenever the real one IS available, so drift can't hide.
+    """
+    from scipy import ndimage
+
+    def sdf(plane):
+        return (ndimage.distance_transform_edt(~plane)
+                - ndimage.distance_transform_edt(plane))
+
+    dense = np.zeros(full_shape, dtype=bool)
+    indices = sorted(keyframe_planes)
+    for idx in indices:
+        dense[idx] = keyframe_planes[idx]
+    for i0, i1 in zip(indices[:-1], indices[1:]):
+        if i1 - i0 <= 1:
+            continue
+        sdf0, sdf1 = sdf(keyframe_planes[i0]), sdf(keyframe_planes[i1])
+        for idx in range(i0 + 1, i1):
+            t = (idx - i0) / (i1 - i0)
+            dense[idx] = (1 - t) * sdf0 + t * sdf1 <= 0
+    return dense
+
+
+def _selftest_interpolator():
+    """The real interpolator when the antsreg install is there, the local
+    copy otherwise (see _reference_interpolate_sparse_mask)."""
+    try:
+        return _interpolate_sparse_mask()
+    except ImportError:
+        print("   (registration_ants not importable here -- using the local reference "
+              "interpolator; run this in antsreg to test against the real one)")
+        return _reference_interpolate_sparse_mask
+
+
+SHAPE = (16, 40, 40)
+
+
+def _canvas(shape=SHAPE):
+    return np.zeros(shape, dtype=np.uint8)
+
+
+def _box(canvas, planes, label, y0, y1, x0, x1):
+    for z in planes:
+        canvas[z, y0:y1, x0:x1] = label
+    return canvas
+
+
+def _extent(volume, label):
+    """(z, y, x) min/max bounds of one label, for asserting a region stayed
+    where it was painted."""
+    idx = np.argwhere(volume == label)
+    assert idx.size, f"label {label} is missing from the export entirely"
+    return idx.min(axis=0), idx.max(axis=0)
+
+
+def selftest_three_labels_stay_separate(interp):
+    print("1. three regions, 3 keyframe planes each -> three intact, non-bleeding labels")
+    canvas = _canvas()
+    _box(canvas, [0, 4, 8], 1, 2, 10, 2, 10)        # 8x8 = 64 px/plane, spans z 0..8
+    _box(canvas, [2, 6, 10], 2, 20, 30, 4, 12)      # 10x8 = 80 px/plane, spans z 2..10
+    _box(canvas, [5, 9, 13], 3, 30, 38, 25, 35)     # 8x10 = 80 px/plane, spans z 5..13
+
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+    vol = result.volume
+
+    assert vol.dtype == np.uint8, vol.dtype
+    # No label may invent a value the config never mentioned (a merged
+    # interpolation, or an off-by-one in the write-back, shows up here).
+    assert set(np.unique(vol).tolist()) == {0, 1, 2, 3}, np.unique(vol)
+
+    # Constant cross-sections interpolate to themselves, so the counts are
+    # exact rather than "in a plausible range": area * (last - first + 1).
+    assert result.voxels_by_label == {1: 64 * 9, 2: 80 * 9, 3: 80 * 9}, result.voxels_by_label
+    assert result.slices_by_label == {1: [0, 4, 8], 2: [2, 6, 10], 3: [5, 9, 13]}, \
+        result.slices_by_label
+
+    # Each label filled exactly its own z span and its own footprint --
+    # nothing leaked into a neighbour's box or past its own keyframes.
+    for label, (zlo, zhi), (ylo, yhi), (xlo, xhi) in [
+            (1, (0, 8), (2, 9), (2, 9)),
+            (2, (2, 10), (20, 29), (4, 11)),
+            (3, (5, 13), (30, 37), (25, 34))]:
+        lo, hi = _extent(vol, label)
+        assert tuple(lo) == (zlo, ylo, xlo) and tuple(hi) == (zhi, yhi, xhi), \
+            f"label {label} extent {lo}..{hi} != {(zlo, ylo, xlo)}..{(zhi, yhi, xhi)}"
+
+    assert result.n_contested == 0 and not result.overlap_pairs, result.overlap_pairs
+    assert guide_export_warnings(result, {1: ["a"], 2: ["b"], 3: ["c"]}) == []
+    print("   ok")
+
+
+def selftest_per_label_beats_merged_interpolation(interp):
+    print("2. per-label vs one merged interpolation, on two adjacent regions")
+    # Region 1 on the left (planes 0, 8), region 2 on the right (planes 2, 6):
+    # the two labels' keyframes interleave along z, which is the normal case
+    # when you pick each region's own representative planes.
+    canvas = _canvas()
+    _box(canvas, [0, 8], 1, 5, 15, 2, 12)
+    _box(canvas, [2, 6], 2, 5, 15, 28, 38)
+
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+    vol = result.volume
+
+    # Per-label: each region fills its own z span with its own footprint,
+    # and neither one appears in the strip between them.
+    lo1, hi1 = _extent(vol, 1)
+    lo2, hi2 = _extent(vol, 2)
+    assert (lo1[0], hi1[0]) == (0, 8) and (lo1[2], hi1[2]) == (2, 11), (lo1, hi1)
+    assert (lo2[0], hi2[0]) == (2, 6) and (lo2[2], hi2[2]) == (28, 37), (lo2, hi2)
+    assert not np.any(vol[:, :, 12:28]), "per-label interpolation leaked into the gap"
+    assert result.voxels_by_label == {1: 100 * 9, 2: 100 * 5}, result.voxels_by_label
+
+    # The merged version: exactly what `keyframes = {z: data[z] > 0}` did
+    # before -- one binary blob, so consecutive keyframes belonging to
+    # DIFFERENT regions get blended into each other. Their cross-sections
+    # don't overlap, so the blend comes out empty and BOTH regions disappear
+    # from every plane bracketed by a mismatched keyframe pair.
+    merged_keyframes = {z: (canvas[z] > 0) for z in range(SHAPE[0]) if np.any(canvas[z])}
+    merged = interp(merged_keyframes, SHAPE)
+
+    for z in (1, 7):                # bracketed by region 1 and region 2 keyframes
+        assert not np.any(merged[z]), f"merged: plane {z} was expected to be annihilated"
+        assert np.count_nonzero(vol[z]) == 100, f"per-label: region 1 missing on plane {z}"
+    # Plane 4 sits between region 2's keyframes (2 and 6), so the merged run
+    # keeps region 2 there and drops region 1 -- the whole plane ends up
+    # attributed to the region that happened to bracket it.
+    assert np.count_nonzero(merged[4, :, 2:12]) == 0, "merged: region 1 survived on plane 4"
+    assert np.count_nonzero(merged[4, :, 28:38]) == 100
+    assert np.count_nonzero(vol[4, :, 2:12]) == 100 and np.count_nonzero(vol[4, :, 28:38]) == 100
+
+    lost = np.logical_and(vol > 0, ~merged)
+    assert int(lost.sum()) == 700, int(lost.sum())          # all of region 1's planes 1..7
+    assert not np.any(np.logical_and(merged, vol == 0)), "merged produced outline nobody painted"
+    print(f"   ok (merging the labels loses {int(lost.sum())} voxels of region 1; per-label: 0)")
+
+
+def selftest_single_plane_label_warns(interp):
+    print("3. a label painted on only one plane -> warning, but still exported")
+    canvas = _canvas()
+    _box(canvas, [0, 6], 1, 2, 10, 2, 10)
+    _box(canvas, [4], 3, 20, 28, 20, 28)            # one plane only: nothing to interpolate
+
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+    assert result.slices_by_label[3] == [4]
+    assert result.voxels_by_label[3] == 64, result.voxels_by_label
+    assert result.voxels_by_label[1] == 64 * 7, result.voxels_by_label
+
+    warnings = guide_export_warnings(result, {1: ["cortex"], 3: ["corpus callosum"]})
+    flat = [w for w in warnings if "label 3" in w and "1 plane" in w]
+    assert flat, warnings
+    assert "corpus callosum" in flat[0], flat[0]
+    assert not any("label 1" in w for w in warnings), warnings
+    print("   ok")
+
+
+def selftest_overlap_is_counted_and_reported(interp):
+    print("4. two overlapping regions -> exact contested voxel count, named pair")
+    # The overlap can only ever come from the INTERPOLATION: a single paint
+    # layer can't hold two labels on one pixel, so no two keyframe planes
+    # can disagree. Here label 1's keyframes bracket label 2's, and their
+    # interpolated bodies pass through each other on planes 2..6.
+    canvas = _canvas()
+    _box(canvas, [0, 8], 1, 5, 15, 5, 15)           # 100 px/plane, spans z 0..8
+    _box(canvas, [2, 6], 2, 10, 20, 10, 20)         # 100 px/plane, spans z 2..6
+    #                                                 intersection y 10:15 * x 10:15 = 25 px
+
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+    expected = 25 * 5                                # 25 px on each of planes 2..6
+    assert result.overlap_pairs == {(1, 2): expected}, result.overlap_pairs
+    assert result.n_contested == expected, result.n_contested
+
+    # The later (higher) label wins the contested voxels, silently -- which is
+    # exactly why it gets reported.
+    assert np.all(result.volume[2:7, 10:15, 10:15] == 2)
+    assert result.voxels_by_label[1] == 100 * 9 - expected, result.voxels_by_label
+    assert result.voxels_by_label[2] == 100 * 5, result.voxels_by_label
+
+    warnings = guide_export_warnings(result, {1: ["cortex"], 2: ["cerebellar hemisphere"]})
+    overlap = [w for w in warnings if "claimed by more than one label" in w]
+    assert overlap, warnings
+    assert str(expected) in overlap[0] and "cerebellar hemisphere" in overlap[0], overlap[0]
+    print(f"   ok ({expected} contested voxels, reported as 1 vs 2)")
+
+
+def selftest_unnamed_and_unpainted_labels_warn(interp):
+    print("5. region_labels/canvas mismatches in both directions -> warnings")
+    canvas = _canvas()
+    _box(canvas, [0, 6], 1, 2, 10, 2, 10)
+    _box(canvas, [1, 7], 4, 20, 28, 20, 28)         # painted but not in region_labels
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+
+    warnings = guide_export_warnings(result, {1: ["cortex"], 2: ["cerebellar hemisphere"]})
+    assert any("label 2" in w and "nothing was" in w for w in warnings), warnings
+    assert any("label 4" in w and "region_labels entry" in w for w in warnings), warnings
+    print("   ok")
+
+
+def selftest_single_label_matches_old_behaviour(interp):
+    print("6. one label, no region_labels -> bit-identical to the pre-multi-label export")
+    rng = np.random.default_rng(0)
+    canvas = _canvas()
+    # Irregular blobs, not boxes: the signed-distance interpolation has real
+    # work to do between keyframes, so an accidental change in how keyframes
+    # are collected would show up as a diff.
+    for z, (cy, cx, r) in zip([1, 5, 6, 12], [(15, 15, 7), (22, 18, 10), (20, 20, 4), (12, 25, 8)]):
+        yy, xx = np.ogrid[:SHAPE[1], :SHAPE[2]]
+        blob = (yy - cy) ** 2 + (xx - cx) ** 2 <= r ** 2
+        blob |= rng.random(blob.shape) > 0.995      # a bit of speckle
+        canvas[z][blob] = 1
+
+    # Verbatim the old code path: one binary keyframe dict, one interpolation.
+    old_keyframes = {z: (canvas[z] > 0) for z in range(SHAPE[0]) if np.any(canvas[z])}
+    old = interp(old_keyframes, SHAPE).astype(np.uint8)
+
+    new = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                        interpolate=interp).volume
+    assert new.dtype == old.dtype, (new.dtype, old.dtype)
+    assert np.array_equal(new, old), f"{int(np.sum(new != old))} voxels differ from old behaviour"
+
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+    assert guide_export_warnings(result, {}) == [], guide_export_warnings(result, {})
+    print(f"   ok ({int(old.sum())} voxels, identical)")
+
+
+def selftest_relabel_volume(interp):
+    print("9. relabel: renumber one label, merge two, reject out-of-range")
+    canvas = _canvas()
+    _box(canvas, [1, 4], 1, 5, 12, 5, 12)
+    _box(canvas, [1, 4], 2, 20, 27, 20, 27)
+    before_1 = int((canvas == 1).sum())
+    before_2 = int((canvas == 2).sum())
+
+    moved = canvas.copy()
+    n = relabel_volume(moved, 1, 3)
+    assert n == before_1, (n, before_1)
+    assert (moved == 1).sum() == 0 and (moved == 3).sum() == before_1
+    assert (moved == 2).sum() == before_2, "an unrelated label was touched"
+
+    merged = canvas.copy()
+    relabel_volume(merged, 1, 2)
+    assert (merged == 2).sum() == before_1 + before_2, "merge onto an existing label lost voxels"
+
+    assert relabel_volume(canvas.copy(), 99, 5) == 0, "a label nobody painted should be a no-op"
+    try:
+        relabel_volume(canvas.copy(), 1, MAX_LABEL + 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("out-of-range to_label was accepted (the export is uint8)")
+    print(f"   ok ({before_1} voxels moved, merge and no-op behave)")
+
+
+def selftest_sidecars(interp, tmp_dir):
+    print("7. sidecars: .regions.json + the .annotated_slices.json convention")
+    canvas = _canvas()
+    _box(canvas, [0, 4, 8], 1, 2, 10, 2, 10)
+    _box(canvas, [2, 6], 2, 20, 30, 4, 12)
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+
+    # label 1 carries TWO ontology entries, the case a single-name-per-label
+    # sidecar could not express (DevCCF has no single "cortex" structure).
+    region_labels = {1: ["layer 1 of A", "layer 2 of A"], 2: ["cerebellar hemisphere"]}
+    region_ids = {1: [15751, 15756], 2: [15623]}
+    out_path = tmp_dir / "s12t_guide_sample.nii.gz"
+    regions_path, slices_path = write_guide_sidecars(
+        out_path, "/data/s12t/registration.tif", result, region_labels,
+        SHAPE[0], spacing_xyz=(1.0, 1.0, 1.0), region_ids=region_ids,
+        atlas_info={"annotation_path": "/atlas/P04_annotations.nii.gz",
+                    "ontology_path": "/atlas/DevCCFv1_ontology.json"},
+        damage_labels=[9])
+
+    assert regions_path.name == "s12t_guide_sample.regions.json", regions_path
+    assert slices_path.name == "s12t_guide_sample.annotated_slices.json", slices_path
+
+    regions = json.loads(regions_path.read_text())
+    assert regions["regions"] == {"1": ["layer 1 of A", "layer 2 of A"],
+                                  "2": ["cerebellar hemisphere"]}, regions["regions"]
+    assert regions["region_ids"] == {"1": [15751, 15756], "2": [15623]}, regions["region_ids"]
+    # Damage labels live under their own key, never inside regions/region_ids
+    # (they have no ontology id for the pipeline to pair with).
+    assert regions["damage_labels"] == [9], regions["damage_labels"]
+    assert regions["annotated_slices"] == {"1": [0, 4, 8], "2": [2, 6]}, regions["annotated_slices"]
+    assert regions["image_path"] == "/data/s12t/registration.tif"
+    assert regions["atlas"]["ontology_path"].endswith("DevCCFv1_ontology.json"), regions["atlas"]
+    assert "voxel size" in regions["voxel_size_um_note"].lower()
+
+    # The paste-ready pipeline snippet must carry the IDS (names are a comment
+    # only -- two authorities that can disagree is what ids exist to remove).
+    snippet = guide_regions_yaml_snippet(region_ids, region_labels, out_path,
+                                         voxel_size_um=[2.6, 2.6, 32.0], damage_labels=[9])
+    parsed = yaml.safe_load(snippet)["mask"]["guide_regions"]
+    assert parsed["atlas_ids"] == {1: [15751, 15756], 2: [15623]}, parsed
+    assert parsed["voxel_size_um"] == [2.6, 2.6, 32.0], parsed
+    assert parsed["damage_labels"] == [9], parsed
+    assert "atlas_names" not in parsed, parsed
+
+    # Same key registration_eval.load_region_annotation_hint() reads. Asserted
+    # by name rather than by importing it: registration_eval pulls in
+    # registration_ants.transforms -> antspyx, which --selftest does without.
+    hint = json.loads(slices_path.read_text())
+    assert hint["hand_drawn_slices"] == [0, 2, 4, 6, 8], hint
+
+    # .nii (not .gz) and .tif outputs must hang their sidecars off the same stem.
+    for name, stem in [("guide.nii", "guide"), ("guide.tif", "guide"), ("guide", "guide")]:
+        assert _output_stem(tmp_dir / name).name == stem, name
+    print("   ok")
+
+
+def selftest_resume_restores_only_hand_drawn_planes(interp, tmp_dir):
+    print("8. resume: export -> reload -> add planes, without inheriting the interpolation")
+    canvas = _canvas()
+    _box(canvas, [0, 4, 8], 1, 2, 10, 2, 10)        # label 1: 3 real keyframes
+    _box(canvas, [2, 6], 2, 20, 30, 4, 12)          # label 2: 2 real keyframes
+    result = interpolate_labels_separately(sparse_keyframes_by_label(canvas), SHAPE,
+                                           interpolate=interp)
+
+    out_path = tmp_dir / "resume_guide.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(result.volume), str(out_path))
+    write_guide_sidecars(out_path, "/data/registration.tif", result,
+                         {1: ["cortex"], 2: ["cerebellar hemisphere"]}, SHAPE[0],
+                         region_ids={1: [15751], 2: [15623]})
+
+    resumed = load_guide_resume(out_path, SHAPE)
+    assert resumed is not None
+
+    # The whole point: exactly the planes that were hand-drawn come back, NOT
+    # the dense interpolation between them. Reloading the volume directly
+    # would give label 1 planes 0..8 and label 2 planes 2..6.
+    assert resumed.slices_by_label == {1: [0, 4, 8], 2: [2, 6]}, resumed.slices_by_label
+    assert sparse_keyframes_by_label(resumed.prefill).keys() == {1, 2}
+    assert {lab: sorted(planes) for lab, planes in
+            sparse_keyframes_by_label(resumed.prefill).items()} == {1: [0, 4, 8], 2: [2, 6]}
+
+    # Labels stay distinct (the old `> 0` path merged them into one).
+    assert set(np.unique(resumed.prefill).tolist()) == {0, 1, 2}, np.unique(resumed.prefill)
+    # And the label -> region mapping survives, so label numbers keep meaning.
+    assert resumed.region_ids == {1: [15751], 2: [15623]}, resumed.region_ids
+    assert resumed.region_labels == {1: ["cortex"], 2: ["cerebellar hemisphere"]}
+
+    # Re-exporting the untouched resume must reproduce the original file
+    # byte-for-byte -- otherwise every save/reload cycle would drift.
+    again = interpolate_labels_separately(sparse_keyframes_by_label(resumed.prefill), SHAPE,
+                                          interpolate=interp)
+    assert np.array_equal(again.volume, result.volume), \
+        f"{int(np.sum(again.volume != result.volume))} voxels drifted across a resume cycle"
+
+    # Adding a keyframe extends that label's span and leaves the other alone.
+    grown = resumed.prefill.copy()
+    _box(grown, [12], 1, 2, 10, 2, 10)
+    third = interpolate_labels_separately(sparse_keyframes_by_label(grown), SHAPE,
+                                          interpolate=interp)
+    assert third.slices_by_label == {1: [0, 4, 8, 12], 2: [2, 6]}, third.slices_by_label
+    assert third.voxels_by_label[1] == 64 * 13, third.voxels_by_label
+    assert third.voxels_by_label[2] == result.voxels_by_label[2], third.voxels_by_label
+
+    # No sidecar next to the file -> refuse to pretend it's resumable.
+    plain = tmp_dir / "no_sidecar.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(result.volume), str(plain))
+    assert load_guide_resume(plain, SHAPE) is None
+    print("   ok")
+
+
+def selftest_config_normalizers():
+    print("10. config: region_labels int/str keys + multi-region values, voxel_size_um,\n"
+          "    mode sections")
+    # A bare string and a one-element list must normalize identically -- both
+    # spellings appear in real configs and reading them differently would be
+    # a silent half-mapping.
+    assert _normalize_region_labels({1: "cortex", "2": "cerebellar hemisphere"}) == \
+        {1: ["cortex"], 2: ["cerebellar hemisphere"]}
+    assert _normalize_region_labels({1: ["layer 1 of A", "layer 2 of A"]}) == \
+        {1: ["layer 1 of A", "layer 2 of A"]}
+    assert _normalize_region_labels(None) == {}
+    assert _normalize_region_labels({}) == {}
+
+
+    assert _normalize_region_ids({1: 15751, "2": [15623, 15666]}) == \
+        {1: [15751], 2: [15623, 15666]}
+    assert _normalize_region_ids(None) == {}
+
+    # (x,y,z) config voxel size -> (z,y,x) napari scale. Reversed, not
+    # copied: the array axes and the config run in opposite orders.
+    assert display_scale_from_voxel_size([2.6, 2.6, 32.0]) == [32.0, 2.6, 2.6]
+    assert display_scale_from_voxel_size(None) is None
+
+    def rejects(fn, value, needle):
+        try:
+            fn(value)
+        except ValueError as exc:
+            assert needle in str(exc), f"{value!r}: wrong reason {exc}"
+        else:
+            raise AssertionError(f"{value!r} should have been rejected")
+
+    rejects(_normalize_region_labels, {"cortex": 1}, "integers")
+    rejects(_normalize_region_labels, {0: "background"}, ">= 1")
+    rejects(_normalize_region_labels, {1: "cortex", "1": "cortex"}, "twice")
+    rejects(_normalize_region_labels, ["cortex"], "mapping")
+
+    assert _normalize_damage_labels([9, "3", 9], {}, {}) == [3, 9]
+    assert _normalize_damage_labels([], {1: ["cortex"]}, {}) == []
+    rejects(lambda v: _normalize_damage_labels(v, {}, {}), [0], ">= 1")
+    rejects(lambda v: _normalize_damage_labels(v, {}, {}), ["cortex"], "integers")
+    rejects(lambda v: _normalize_damage_labels(v, {9: ["cortex"]}, {}), [9], "cannot both")
+
+    assert _normalize_voxel_size_um([2.6, 2.6, 32.0]) == [2.6, 2.6, 32.0]
+    assert _normalize_voxel_size_um(None) is None
+    rejects(_normalize_voxel_size_um, [2.6, 2.6], "exactly 3 numbers")
+    rejects(_normalize_voxel_size_um, [2.6, 0.0, 32.0], "positive")
+    rejects(_normalize_voxel_size_um, "2.6,2.6,32", "three numbers")
+
+    # The retired spelling is still read, reversed -- but never alongside a
+    # voxel_size_um that contradicts it.
+    assert _config_voxel_size_um({"display_scale_zyx": [32.0, 2.6, 2.6]}) == [2.6, 2.6, 32.0]
+    assert _config_voxel_size_um({"voxel_size_um": [2.6, 2.6, 32.0],
+                                  "display_scale_zyx": [32.0, 2.6, 2.6]}) == [2.6, 2.6, 32.0]
+    assert _config_voxel_size_um({}) is None
+    rejects(lambda cfg: _config_voxel_size_um(cfg),
+            {"voxel_size_um": [2.6, 2.6, 32.0], "display_scale_zyx": [25.0, 25.0, 25.0]},
+            "retired")
+
+    # Sections: the mode you are NOT running is dropped, not merged -- that is
+    # what lets both sections stay filled in.
+    sectioned = {"mode": "guide",
+                 "common": {"image_path": "raw.tif", "voxel_size_um": [2.6, 2.6, 32.0]},
+                 "guide": {"existing_mask_path": "prev.nii.gz"},
+                 "labels": {"labels_path": "labels.nii.gz", "image_path": "WRONG.tif"}}
+    assert flatten_config_sections(sectioned, "guide") == {
+        "image_path": "raw.tif", "voxel_size_um": [2.6, 2.6, 32.0],
+        "existing_mask_path": "prev.nii.gz"}, flatten_config_sections(sectioned, "guide")
+    assert flatten_config_sections(sectioned, "labels") == {
+        "image_path": "WRONG.tif", "voxel_size_um": [2.6, 2.6, 32.0],
+        "labels_path": "labels.nii.gz"}
+    # A flat config (every config predates the sections) still reads, and the
+    # more specific place wins over the top level.
+    assert flatten_config_sections({"image_path": "raw.tif", "mode": "guide"}, "guide") == \
+        {"image_path": "raw.tif"}
+    assert flatten_config_sections(
+        {"output_path": "top.nii.gz", "common": {"output_path": "common.nii.gz"}},
+        "guide") == {"output_path": "common.nii.gz"}
+    rejects(lambda cfg: flatten_config_sections(cfg, "guide"),
+            {"common": ["image_path"]}, "mapping")
+
+    # Every args.<field> the two mode entry points read must exist on the
+    # namespace parse_config builds. Checked statically because the real call
+    # needs a GUI, an atlas and an image on disk -- so the failure mode is an
+    # AttributeError minutes into a launch, after the atlas has loaded. (That
+    # is exactly how damage_labels shipped broken: it was added to
+    # _load_local_config but not to the hand-listed namespace main() used to
+    # build for _run_guide -- that namespace is gone now, and this keeps the
+    # next field from finding a new way to drift.)
+    import ast
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    provided = {kw.arg for node in ast.walk(module)
+                if isinstance(node, ast.FunctionDef) and node.name == "_load_local_config"
+                for ret in ast.walk(node) if isinstance(ret, ast.Return)
+                for call in ast.walk(ret) if isinstance(call, ast.Call)
+                for kw in call.keywords if kw.arg}
+    assert "image_path" in provided, "_load_local_config's namespace fields were not found"
+    for entry in ("_run_guide", "_run_labels"):
+        read = {n.attr for node in ast.walk(module)
+                if isinstance(node, ast.FunctionDef) and node.name == entry
+                for n in ast.walk(node)
+                if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id == "args"}
+        missing = sorted(read - provided)
+        assert not missing, (f"{entry} reads args.{{{', '.join(missing)}}}, which "
+                             "_load_local_config never sets")
+
+    # uint8 export: a brush value the output can't hold must fail loudly.
+    try:
+        interpolate_labels_separately({300: {0: np.ones((4, 4), bool)}}, (2, 4, 4),
+                                      interpolate=_reference_interpolate_sparse_mask)
+    except ValueError as exc:
+        assert "uint8" in str(exc), exc
+    else:
+        raise AssertionError("label 300 should have been rejected")
+    print("   ok")
+
+
+def _fake_ontology():
+    """A 6-node ontology shaped exactly like load_ccf_ontology_json's output.
+    Branch B is the "in the ontology but not in this annotation" case that
+    the real DevCCF pairing has 2359 of."""
+    return {
+        1:   {"id": 1,   "name": "root",     "acronym": "R",  "structure_id_path": [1]},
+        10:  {"id": 10,  "name": "branch A", "acronym": "BA", "structure_id_path": [1, 10]},
+        100: {"id": 100, "name": "leaf A1",  "acronym": "A1", "structure_id_path": [1, 10, 100]},
+        101: {"id": 101, "name": "leaf A2",  "acronym": "A2", "structure_id_path": [1, 10, 101]},
+        20:  {"id": 20,  "name": "branch B", "acronym": "BB", "structure_id_path": [1, 20]},
+        200: {"id": 200, "name": "leaf B1",  "acronym": "B1", "structure_id_path": [1, 20, 200]},
+    }
+
+
+def selftest_seed_assignment():
+    print("12. config -> GUI assignment: ids kept, names resolved only when unambiguous")
+    structures = _fake_ontology()
+    structures[300] = {"id": 300, "name": "leaf A1",   # deliberate duplicate name
+                       "acronym": "DUP", "structure_id_path": [1, 20, 300]}
+
+    assignment, unresolved = _seed_assignment(
+        region_labels={1: ["branch A"], 2: ["nope"], 3: ["leaf A1"]},
+        region_ids={1: [101], 4: [200]},
+        structures=structures)
+
+    # Ids pass through; a unique name resolves and is appended alongside them.
+    assert assignment[1] == [101, 10], assignment
+    assert assignment[4] == [200], assignment
+    # A name matching nothing, and one matching two structures, both refuse to
+    # guess -- substring/ambiguous matching is exactly what ids exist to avoid.
+    assert 2 not in assignment and 3 not in assignment, assignment
+    assert sorted((lab, n) for lab, _name, n in unresolved) == [(2, 0), (3, 2)], unresolved
+
+    # damage_labels seed as the sentinel; a label that is both damage and a
+    # region is a contradiction and must refuse, same as the pipeline config.
+    assignment, _ = _seed_assignment(region_labels={}, region_ids={1: [101]},
+                                     structures=structures, damage_labels=[9])
+    assert assignment[9] == [DAMAGE_ID] and assignment[1] == [101], assignment
+    try:
+        _seed_assignment(region_labels={}, region_ids={9: [101]},
+                         structures=structures, damage_labels=[9])
+        raise AssertionError("damage + region on one label must raise")
+    except ValueError:
+        pass
+    print("   ok")
+
+
+def selftest_assignment_rows():
+    print("20. assignment panel rows: an emptied brush label is reported, not dropped")
+    structures = _fake_ontology()
+    assignment = {1: [101, 10], 3: []}
+
+    rows = assignment_rows(assignment, structures)
+    assert [label for label, _regions in rows] == [1, 3], rows
+    assert [sid for sid, _name in rows[0][1]] == [101, 10], rows
+    assert all(name for _sid, name in rows[0][1]), "a row must carry the region's name"
+    assert rows[1][1] == [], "an emptied label still gets a row of its own"
+
+    # THE point: a label whose regions were all removed is still visible, so
+    # "I painted with 3 and it exports as nothing" is caught in the panel
+    # rather than in guide_export_warnings after the export.
+    assert empty_assignment_labels(assignment) == [3]
+    assert empty_assignment_labels({1: [101]}) == []
+
+    # A damage-marked label has no ontology entry to look up -- the row names
+    # it via the sentinel instead of KeyErroring on structures[-1].
+    rows = assignment_rows({5: [DAMAGE_ID]}, structures)
+    assert rows == [(5, [(DAMAGE_ID, DAMAGE_NAME)])], rows
+    print("   ok")
+
+
+def selftest_interpolator_matches_registration_ants():
+    print("11. local reference interpolator == registration_ants.mask_utils (when available)")
+    try:
+        real = _interpolate_sparse_mask()
+    except ImportError:
+        print("   skipped (no registration_ants in this env)")
+        return
+    rng = np.random.default_rng(7)
+    keyframes = {z: (rng.random((20, 20)) > 0.7) for z in (0, 3, 9)}
+    a = real(keyframes, (12, 20, 20))
+    b = _reference_interpolate_sparse_mask(keyframes, (12, 20, 20))
+    assert np.array_equal(a, b), f"{int(np.sum(a != b))} voxels differ -- the copy has drifted"
+    print("   ok")
+
+
+def _labels_interpolator():
+    """The real multi-label interpolator, or None when registration_ants is
+    not importable here (the mode-labels tests are then skipped rather than
+    re-implemented: interpolate_sparse_label_correction is 30 lines of
+    per-label signed-distance contest and a second copy would drift)."""
+    try:
+        return _interpolate_sparse_label_correction()
+    except ImportError:
+        return None
+
+
+def selftest_plane_keyframes_are_whole_planes():
+    print("13. mode labels: a plane that differs anywhere becomes a WHOLE keyframe")
+    baseline = np.zeros((6, 8, 8), dtype=np.uint8)
+    baseline[:, :4, :] = 1
+    baseline[:, 4:, :] = 2
+    paint = baseline.copy()
+    paint[3, 3, 3] = 2                      # one pixel repainted on one plane
+
+    keyframes = plane_keyframes(paint, baseline)
+    assert list(keyframes) == [3], list(keyframes)
+    mask, plane = keyframes[3]
+    assert mask.all(), "the keyframe must cover the whole plane, not just the edit"
+    # ...and it carries the regions that were NOT edited, which is the point:
+    # the guide describes that plane's whole anatomy.
+    assert set(np.unique(plane)) == {1, 2}, np.unique(plane)
+    assert not plane_keyframes(baseline, baseline), "an untouched volume has no keyframes"
+    print("   ok")
+
+
+def selftest_labels_export_sparse_vs_dense():
+    print("14. mode labels: sparse guide is bounded by the keyframes, dense one is not")
+    interp = _labels_interpolator()
+    if interp is None:
+        print("   skipped (no registration_ants in this env)")
+        return
+    baseline = np.zeros((10, 12, 12), dtype=np.uint8)
+    baseline[:, :6, :] = 1
+    baseline[:, 6:, :] = 2
+    paint = baseline.copy()
+    for z in (2, 6):
+        paint[z, 5, :] = 2                  # move the 1/2 boundary on two planes
+
+    result = labels_export(paint, baseline, interpolate=interp)
+    assert result.hand_drawn_slices == [2, 6], result.hand_drawn_slices
+
+    # sparse: empty before the first and after the last keyframe, filled between
+    assert not result.guide[:2].any(), "planes before the first keyframe must stay empty"
+    assert not result.guide[7:].any(), "planes after the last keyframe must stay empty"
+    assert result.guide[4].any(), "planes between two keyframes must be interpolated"
+
+    # dense: every plane carries the registration, keyframes carry the edit
+    assert result.atlas[0].any() and result.atlas[9].any(), "the dense volume has no empty planes"
+    assert np.array_equal(result.atlas[0], baseline[0]), \
+        "a plane outside the keyframe span must be the untouched registration"
+    assert np.array_equal(result.atlas[2], paint[2]), "a keyframe must survive verbatim"
+    assert np.array_equal(result.guide[2], paint[2]), "...in both outputs"
+
+    assert set(result.slices_by_label) == {1, 2}, result.slices_by_label
+    assert result.slices_by_label[1] == [2, 6], result.slices_by_label
+    print("   ok")
+
+
+def selftest_recollapse_keeps_edits():
+    print("15. mode labels: expanding refines the untouched pixels, keeps the edited ones")
+    old = np.zeros((3, 4, 4), dtype=np.uint8)
+    old[:] = 1                              # everything was "cortex"
+    new = old.copy()
+    new[:, :2, :] = 8                       # expand: half of it is now "cortical plate"
+
+    paint = old.copy()
+    paint[1, 0, 0] = 3                      # a hand correction, inside the refined half
+    paint[1, 3, 3] = 3                      # ...and one outside it
+
+    out = recollapse_keeping_edits(paint, old, new)
+    assert out[1, 0, 0] == 3 and out[1, 3, 3] == 3, "hand edits must survive an expand"
+    assert out[0, 0, 0] == 8, "untouched pixels must pick up the finer label"
+    assert out[1, 0, 1] == 8, "...including on a plane that was edited elsewhere"
+    assert out[2, 3, 3] == 1, "and stay coarse where the expand does not reach"
+
+    # The plane stays a keyframe afterwards, i.e. the expand did not silently
+    # drop it from the export.
+    assert list(plane_keyframes(out, new)) == [1], list(plane_keyframes(out, new))
+    print("   ok")
+
+
+def selftest_labels_sidecar_roundtrip(tmp_dir):
+    print("16. mode labels: resume restores only the hand-drawn planes, and the true baseline")
+    interp = _labels_interpolator()
+    if interp is None:
+        print("   skipped (no registration_ants in this env)")
+        return
+    structures = {
+        10: {"name": "cortex", "structure_id_path": [1, 10]},
+        100: {"name": "plate", "structure_id_path": [1, 10, 100]},
+        20: {"name": "cerebellum", "structure_id_path": [1, 20]},
+    }
+    partition = label_partition.Partition.from_region_ids({1: [10], 2: [20]}, structures)
+    partition.groups[3] = label_partition.Group(3, [100], "plate", parent=partition.groups[1])
+
+    baseline = np.full((8, 6, 6), 1, dtype=np.uint8)
+    baseline[:, 3:, :] = 2
+    paint = baseline.copy()
+    paint[2, 2, :] = 3
+    paint[5, 2, :] = 3
+    result = labels_export(paint, baseline, interpolate=interp)
+
+    atlas_path = Path(tmp_dir) / "s_corrected_atlas.nii.gz"
+    out = sitk.GetImageFromArray(result.atlas)
+    sitk.WriteImage(out, str(atlas_path))
+    sidecar = write_labels_sidecar(atlas_path, Path(tmp_dir) / "s_guide.nii.gz",
+                                   Path(tmp_dir) / "s_labels_in_sample.nii.gz",
+                                   result, partition, structures, 8)
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert meta["hand_drawn_slices"] == [2, 5], meta["hand_drawn_slices"]
+    assert meta["baseline_labels_path"].endswith("s_labels_in_sample.nii.gz"), meta
+    assert meta["parents"] == {"3": 1}, meta["parents"]
+    assert meta["atlas_exclude_ids"] == {"1": [100]}, meta["atlas_exclude_ids"]
+
+    resumed = load_labels_resume(atlas_path, structures, (8, 6, 6))
+    assert resumed.hand_drawn_slices == [2, 5], resumed.hand_drawn_slices
+    assert set(resumed.planes) == {2, 5}, "an interpolated plane must NOT come back as hand-drawn"
+    assert np.array_equal(resumed.planes[2], paint[2]), "a restored keyframe must be exact"
+    assert resumed.partition.children_of(1)[0].ids == (100,), "the nesting must survive"
+    assert resumed.partition.atlas_exclude_ids(structures) == {1: [100]}
+    print("   ok")
+
+
+def selftest_yaml_snippet_carries_exclusions():
+    print("17. mode labels: the emitted config block includes atlas_exclude_ids")
+    snippet = guide_regions_yaml_snippet(
+        {1: [688], 8: [695]}, {1: ["Cerebral cortex"], 8: ["Cortical plate"]},
+        "/tmp/guide.nii.gz", voxel_size_um=[25.0, 25.0, 25.0],
+        atlas_exclude_ids={1: [695]})
+    assert "atlas_exclude_ids:" in snippet, snippet
+    assert "1: [695]" in snippet, snippet
+    assert "voxel_size_um: [25.0, 25.0, 25.0]" in snippet, snippet
+    # guide mode must be unaffected: no exclusions, no block.
+    plain = guide_regions_yaml_snippet({1: [688]}, {1: ["Cerebral cortex"]}, "/tmp/g.nii.gz")
+    assert "atlas_exclude_ids" not in plain, plain
+    print("   ok")
+
+
+def selftest_labels_voxel_size():
+    print("18. mode labels: the labels' voxel size, um vs mm vs neither")
+    # This codebase's own outputs carry microns directly...
+    assert labels_voxel_size_um((25.0, 25.0, 25.0)) == [25.0, 25.0, 25.0]
+    # ...files from elsewhere (the DevCCF downloads) are in millimetres.
+    assert labels_voxel_size_um((0.02, 0.02, 0.02)) == [20.0, 20.0, 20.0]
+    assert labels_voxel_size_um((0.02, 0.02, 0.02), override=[25, 25, 25]) == [25.0, 25.0, 25.0]
+    try:
+        labels_voxel_size_um((1.0, 1.0, 1.0))
+    except ValueError as exc:
+        assert "labels_voxel_size_um" in str(exc), exc
+    else:
+        raise AssertionError("a (1,1,1) header must refuse to be guessed, not be read as 1 um")
+    print("   ok")
+
+
+def selftest_regrid_nearest():
+    print("19. mode labels: regridding the registration onto the raw stack")
+    # A fine grid at 25 um iso vs the raw stack's 32 um along z / 2.6 um in
+    # plane -- i.e. z is COARSER on the raw grid and x/y much finer, which is
+    # the real s12t geometry and the direction that catches an axis mix-up.
+    fine_spacing = [25.0, 25.0, 25.0]          # (z, y, x)
+    raw_spacing = [32.0, 2.6, 2.6]             # (z, y, x)
+
+    # label == the fine voxel's own index along each axis, so a regridded
+    # voxel can be checked against the index its physical position implies.
+    fine = np.zeros((8, 6, 5), dtype=np.uint16)
+    for z in range(8):
+        for y in range(6):
+            for x in range(5):
+                fine[z, y, x] = z * 100 + y * 10 + x
+
+    raw_shape = (6, 50, 40)
+    out = regrid_nearest(fine, fine_spacing, raw_shape, raw_spacing)
+    assert out.shape == raw_shape, out.shape
+    assert out.dtype == fine.dtype, "a regrid must not change the label dtype"
+
+    for z, y, x in ((0, 0, 0), (3, 20, 17), (5, 49, 39)):
+        want = (min(7, int(round(z * 32.0 / 25.0))) * 100
+                + min(5, int(round(y * 2.6 / 25.0))) * 10
+                + min(4, int(round(x * 2.6 / 25.0))))
+        assert out[z, y, x] == want, f"at {(z, y, x)}: {out[z, y, x]} != {want}"
+
+    # Out-of-range destination voxels clamp to the edge rather than wrapping:
+    # the raw stack legitimately extends past what was registered (crop_for_
+    # registration), and a wrap would paste the far side of the brain there.
+    tall = regrid_nearest(fine, fine_spacing, (40, 6, 5), fine_spacing)
+    assert np.array_equal(tall[-1], fine[-1]), "past the end must clamp, not wrap"
+
+    # Identity when the grids match, whatever the spacing.
+    same = regrid_nearest(fine, fine_spacing, fine.shape, fine_spacing)
+    assert np.array_equal(same, fine)
+    print("   ok")
+
+
+def run_selftests():
+    import tempfile
+
+    print("=== paint_mask.py selftests (synthetic data only, no GUI) ===")
+    interp = _selftest_interpolator()
+    selftest_three_labels_stay_separate(interp)
+    selftest_per_label_beats_merged_interpolation(interp)
+    selftest_single_plane_label_warns(interp)
+    selftest_overlap_is_counted_and_reported(interp)
+    selftest_unnamed_and_unpainted_labels_warn(interp)
+    selftest_single_label_matches_old_behaviour(interp)
+    with tempfile.TemporaryDirectory() as tmp:
+        selftest_sidecars(interp, Path(tmp))
+        selftest_resume_restores_only_hand_drawn_planes(interp, Path(tmp))
+    selftest_relabel_volume(interp)
+    selftest_config_normalizers()
+    selftest_interpolator_matches_registration_ants()
+    selftest_seed_assignment()
+    selftest_assignment_rows()
+
+    # mode: labels -- painting on a registration result (see that section above)
+    selftest_plane_keyframes_are_whole_planes()
+    selftest_labels_export_sparse_vs_dense()
+    selftest_recollapse_keeps_edits()
+    selftest_yaml_snippet_carries_exclusions()
+    selftest_labels_voxel_size()
+    selftest_regrid_nearest()
+    with tempfile.TemporaryDirectory() as tmp:
+        selftest_labels_sidecar_roundtrip(tmp)
+    print("=== all selftests passed ===")
+    print("(shared/atlas_reference.py --selftest / visualization/atlas_view.py --selftest cover atlas loading, "
+          "ontology maths and the ortho-view geometry)")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Paint a guide outline on a sample volume")
+    local_config.add_config_arg(parser, "paint_mask")
+    parser.add_argument("--selftest", action="store_true",
+                        help="run the built-in synthetic tests (no GUI, no config) and exit")
+    args_cli = parser.parse_args()
+
+    if args_cli.selftest:
+        return run_selftests()
+
+    cfg = _load_local_config(args_cli.config)
+    # Both modes take the parsed config straight through. _run_guide used to
+    # get a hand-listed SimpleNamespace instead (only to rename
+    # existing_mask_path -> existing_mask), which meant every new config field
+    # had to be added in two places -- and a forgotten one is an AttributeError
+    # at GUI launch, after the atlas has already loaded. Not worth the rename.
+    if cfg.mode == "section2d":
+        from mask.paint_section2d import launch
+        launch(cfg.sections_config, cfg.section_name,
+               cfg.output_dir or Path(cfg.sections_config).resolve().parent / "masks2d")
+        return 0
+    if cfg.mode == "labels":
+        _run_labels(cfg)
+    else:
+        _run_guide(cfg)
+
+    napari.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

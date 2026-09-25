@@ -1,6 +1,6 @@
 """Shared Qt widgets for browsing an ontology tree.
 
-Used by both paint_mask.py's region-assignment panel and tools/atlas_view.py's
+Used by both paint_mask.py's region-assignment panel and visualization/atlas_view.py's
 region-selection panel -- the same searchable QTreeWidget, just wired to a
 different action once a node is picked (assign it to a brush label, vs.
 highlight it in the atlas). `scrollable` is a second, more general widget
@@ -48,7 +48,7 @@ def shrinkable(widget):
     setMaximumWidth -- that caps widening, which no minimum can undo. Use
     set_dock_width for a starting width instead of a maximum.
 
-    tools/atlas_view.py has its own private copy of this (_shrinkable) from
+    visualization/atlas_view.py has its own private copy of this (_shrinkable) from
     before it was shared; the two are the same one-liner.
     """
     _import_qt()
