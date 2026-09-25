@@ -406,6 +406,33 @@ luck — which is why the selftests use **anisotropic** spacing and shift along
 
 ---
 
+## 2D sagittal section masks
+
+The 2D editor is `paint_section2d.py`; its mask composition and session
+roundtrip code is in `section_masks.py`. It reads a section from the same
+sections2d YAML used by `Registration_ants/scripts/register_sections_2d.py`:
+
+```bash
+conda activate antsreg
+python paint_section2d.py /path/to/sections2d.yaml m1_sec03 --output-dir /path/to/masks
+```
+
+Alternatively, set `mode: section2d` in `configs/paint_mask.yaml` with
+`section2d.sections_config`, `section2d.section_name`, and
+`section2d.output_dir`, then run `python paint_mask.py`. The editor
+saves a full-resolution tissue TIFF, a damage TIFF, editable tissue state,
+numbered region labels, and a JSON assignment record. Tissue and damage TIFFs
+feed the existing 2D registration config. Region labels currently stay in the
+editor and do not affect registration.
+
+Run its session and pixel-alignment tests with:
+
+```bash
+python -m unittest discover -s tests -p test_section_masks.py -v
+```
+
+---
+
 ## Tests
 
 ```bash

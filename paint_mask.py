@@ -1,10 +1,15 @@
 """Interactive tool: paint a guide outline on a 3D sample volume.
 
-TWO MODES, chosen by `mode:` in configs/paint_mask.yaml. Both export a guide
-for mask.guide_regions; they differ in what you start from. The config is
-`mode:` plus a `common:` section and one section per mode -- only the running
-mode's section is read (flatten_config_sections), so both can stay filled in
-and switching modes is a one-line edit.
+Three modes, chosen by `mode:` in configs/paint_mask.yaml. The guide and
+labels modes export 3D guides for mask.guide_regions; section2d opens a single
+sagittal section and exports full-resolution TIFF masks for 2D registration.
+The config is `mode:` plus a `common:` section and one section per mode;
+only the running mode's section is read (flatten_config_sections).
+
+  mode: section2d -- open one section from a sections2d config, edit tissue,
+    damage, and numbered region layers, and export YX TIFFs. This mode runs
+    paint_section2d.py in this toolkit; registration image IO and auto-mask
+    routines still come from the installed Registration_ants package.
 
   mode: guide (default) -- paint on the raw sample, from blank planes.
     You trace each region by hand and say which atlas structure(s) each brush
@@ -277,7 +282,7 @@ def _interpolate_sparse_label_correction():
 _LEGACY_CONFIG_PATHS = (Path(__file__).resolve().parent / "paint_mask_local.yaml",)
 
 
-MODES = ("guide", "labels")
+MODES = ("guide", "labels", "section2d")
 
 
 def flatten_config_sections(cfg, mode):
@@ -316,11 +321,17 @@ def _load_local_config(cli_path=None):
         "paint_mask", cli_path=cli_path, legacy_paths=_LEGACY_CONFIG_PATHS)
     mode = (raw.get("mode") or "guide").strip().lower()
     if mode not in MODES:
-        raise ValueError(f"mode must be 'guide' or 'labels', got {mode!r}")
+        raise ValueError(f"mode must be guide, labels, or section2d, got {mode!r}")
     # After flattening, not before: image_path/output_path normally live under
     # `common:` now, and load_config's own required= check only sees the top
     # level. Same message it would have printed.
     cfg = flatten_config_sections(raw, mode)
+    if mode == "section2d":
+        missing_2d = [k for k in ("sections_config", "section_name") if not cfg.get(k)]
+        if missing_2d:
+            raise ValueError(f"section2d config is missing: {missing_2d}")
+        return SimpleNamespace(mode=mode, sections_config=cfg["sections_config"],
+                               section_name=cfg["section_name"], output_dir=cfg.get("output_dir"))
     missing = [k for k in ("image_path", "output_path") if not cfg.get(k)]
     if missing:
         raise ValueError(
@@ -4854,6 +4865,11 @@ def main():
     # existing_mask_path -> existing_mask), which meant every new config field
     # had to be added in two places -- and a forgotten one is an AttributeError
     # at GUI launch, after the atlas has already loaded. Not worth the rename.
+    if cfg.mode == "section2d":
+        from paint_section2d import launch
+        launch(cfg.sections_config, cfg.section_name,
+               cfg.output_dir or Path(cfg.sections_config).resolve().parent / "masks2d")
+        return 0
     if cfg.mode == "labels":
         _run_labels(cfg)
     else:

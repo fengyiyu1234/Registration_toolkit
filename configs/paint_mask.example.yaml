@@ -7,7 +7,7 @@
 #   python paint_mask.py configs/paint_mask.guide_s12t.yaml  # 或显式指定另一份
 
 # =====================================================================================
-# 模式开关：guide | labels
+# 模式开关：guide | labels | section2d
 # =====================================================================================
 # guide  —— 在原图上从零画 guide outline，自己指定每个画笔号对应哪些脑区。
 #            output_path 就是画出来的 outline。
@@ -90,3 +90,15 @@ labels:
   # 依据是实测：小于 1mm³ 的 guide 区手圈边界误差占比太大，会主动把形变往错误方向拽，
   # 比不加引导更糟（见 Registration_ants/configs/config.example.yaml）。
   min_region_mm3: 1.0
+
+
+# =====================================================================================
+# section2d —— 使用 Registration_ants 的 2D 配准配置打开一张矢状切片
+# =====================================================================================
+# mode: section2d 时，common.image_path/output_path 不参与读取。
+# 组织/排除 TIFF 可直接作为 sections[].tissue_mask/damage_mask；
+# 区域标签会保存和恢复，但当前 2D 配准还不使用区域引导。
+section2d:
+  sections_config: /home/fyu7/My_project/Registration_ants/configs/my_sections.yaml
+  section_name: m1_sec03
+  output_dir: /path/to/masks
