@@ -1,0 +1,16 @@
+# Normalize line endings: store and check out text files as LF on all platforms
+# (Windows and HPC/Linux), so copying the working tree between them doesn't
+# show every file as modified.
+* text=auto eol=lf
+
+# Binary files
+*.png  binary
+*.jpg  binary
+*.tif  binary
+*.tiff binary
+*.nii  binary
+*.gz   binary
+*.npy  binary
+*.npz  binary
+*.mat  binary
+*.h5   binary
