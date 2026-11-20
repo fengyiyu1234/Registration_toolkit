@@ -15,11 +15,18 @@ import yaml
 
 
 from PyQt5.QtWidgets import (QComboBox, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame,
-                             QCheckBox, QLineEdit, QPushButton, QDoubleSpinBox, QScrollArea,
-                             QFileDialog, QMessageBox, QSizePolicy)
+                             QCheckBox, QLineEdit, QPushButton, QDoubleSpinBox,
+                             QFileDialog, QMessageBox, QSpinBox, QApplication)
 from PyQt5.QtCore import Qt
 
+# Run as `python visualization/<name>.py`, so sys.path[0] is visualization/, not
+# the repo root; add the root so `shared` resolves.
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from shared import atlas_reference   # check_label_dtype (lossy label dtypes)
+from shared import hover_bar         # bottom 'region under cursor' strip (same as atlas_view)
 from shared import local_config      # configs/<tool>.yaml
 from shared import ontology_tree_ui  # shrinkable / set_dock_width
 
@@ -93,6 +100,9 @@ class OntologyManager:
         # 两张表分别给"读文件的值→真实 id"和"真实 id→文件里的值"兜一次。
         self.f32_to_ids = {}
         self.id_to_f32 = {}
+        # id -> {"name", "acronym", "structure_id_path"}：shared/hover_bar.py 底部
+        # 脑区条要的格式（和 atlas_reference.structures 同形），从根到自身的 id 链。
+        self.structures = {}
         self.parse_ontology(json_path)
 
     def parse_ontology(self, json_path):
@@ -104,9 +114,9 @@ class OntologyManager:
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        def extract_node(node, ancestors=()):
+        def extract_node(node, ancestors=(), id_ancestors=()):
             if isinstance(node, list):
-                for item in node: extract_node(item, ancestors)
+                for item in node: extract_node(item, ancestors, id_ancestors)
                 return
             if isinstance(node, dict):
                 node_id = node.get('id') or node.get('structure_id')
@@ -114,6 +124,9 @@ class OntologyManager:
                 node_name = node.get('name') or node.get('safe_name') or node.get('acronym')
 
                 path = ancestors
+                id_path = id_ancestors
+                if node_id is not None:
+                    id_path = id_ancestors + (int(node_id),)
                 if node_name is not None:
                     s_name = DataLoader.clean_part(node_name)
                     s_acr = DataLoader.clean_part(node.get('acronym'))
@@ -127,6 +140,9 @@ class OntologyManager:
                     if node_id is not None:
                         self.id_to_name[int(node_id)] = s_name
                         self.id_to_path[int(node_id)] = path
+                        self.structures[int(node_id)] = {
+                            "name": s_name, "acronym": s_acr or None,
+                            "structure_id_path": list(id_path)}
                         # 同名脑区（不同半球等）保留先遇到的那个 id，和以前一致
                         if s_name not in self.name_to_id:
                             self.name_to_id[s_name] = int(node_id)
@@ -136,7 +152,7 @@ class OntologyManager:
                             self.f32_to_ids.setdefault(alias, []).append(int(node_id))
 
                 children = node.get('children') or node.get('msg')
-                if children: extract_node(children, path)
+                if children: extract_node(children, path, id_path)
 
         if isinstance(data, dict):
             if 'msg' in data: extract_node(data['msg'])
@@ -813,7 +829,11 @@ class MainController:
         self.last_hover_val = -1
         
         self.mode = None
-        self.cell_checkboxes = {}
+        # 每个细胞类别图层开没开（class_name -> bool）。不再有 Cell Class Filter
+        # 那一列勾选框 —— 直接在 napari 图层列表里点眼睛；这里记住选择，切视图、
+        # 切背景细胞重建图层后照旧，搜索高亮也只取开着的类别。默认全关：细胞点铺满
+        # 整卷会盖住图谱轮廓，先看配准、再按需打开。
+        self.cell_visible = {}
         self.last_search_mode = "Exact"
 
         # 🔥 细胞密度热图：两个视图各自的显示网格（(z,y,x) 形状 + 体素微米数），
@@ -891,7 +911,7 @@ class MainController:
                 coords = sub_df[['z', 'y', 'x']].values
                 colors = np.array([id_color_map[uid] for uid in sub_df['label_id']])
                 
-                is_vis = self.cell_checkboxes[cls_name].isChecked() if cls_name in self.cell_checkboxes else True
+                is_vis = self.cell_visible.setdefault(cls_name, False)
                 
                 layer = self.viewer.add_points(
                     coords, name=f"Cell: {cls_name}", face_color=colors,
@@ -914,6 +934,8 @@ class MainController:
                 # _apply_cell_geometry）。
                 layer.metadata['cell_rows'] = sub_df.index.values
                 layer.events.highlight.connect(self.on_cell_layer_click)
+                layer.events.visible.connect(
+                    lambda e, n=cls_name: self.on_cell_layer_visible(n, e.source.visible))
 
     # ================= 🔥 细胞密度热图 =================
     #
@@ -1095,7 +1117,7 @@ class MainController:
 
         # 2. 过滤 Cells
         if not self.current_cells_df.empty:
-            active_classes = [name for name, cb in self.cell_checkboxes.items() if cb.isChecked()]
+            active_classes = [name for name, on in self.cell_visible.items() if on]
             if search_mode == 'Exact':
                 region_mask = self.current_cells_df['region'].str.lower() == keyword.lower()
             else:
@@ -1114,28 +1136,6 @@ class MainController:
             self.highlight_cells.data = subset_points if len(subset_points) > 0 else np.empty((0, 3))
             self.last_highlighted_df = subset_df.copy()
             self.viewer.status = f"✅ [{search_mode}] Found {len(matched_ids)} regions | Cells: {len(subset_points)}"
-
-    def update_class_filter_ui(self, df_cells):
-        """核心：根据读取到的 df 动态生成 CheckBox"""
-        for i in reversed(range(self.layout_classes.count())): 
-            widget = self.layout_classes.itemAt(i).widget()
-            if widget: 
-                widget.setParent(None)
-                widget.deleteLater()
-        self.cell_checkboxes.clear()
-        self._populate_density_classes(df_cells)
-
-        if df_cells.empty: return
-
-        unique_classes = sorted(df_cells['class_name'].unique())
-
-        for cls_name in unique_classes:
-            cb = QCheckBox(cls_name)
-            # 默认全部不勾选：细胞点铺满整卷会盖住图谱轮廓，先看配准、再按需打开类别。
-            cb.setChecked(False)
-            cb.stateChanged.connect(lambda state, n=cls_name: self.on_cell_check_toggle(n, state))
-            self.layout_classes.addWidget(cb)
-            self.cell_checkboxes[cls_name] = cb
 
     # --- 视图加载 ---
 
@@ -1526,7 +1526,7 @@ class MainController:
         self.density_voxel_um = self._grid_voxel_um([resampled_path, mhd_path], k)
 
         self.current_cells_df = df_cells
-        self.update_class_filter_ui(df_cells)
+        self._populate_density_classes(df_cells)
         self.render_cells_from_df(df_cells, labels_layer)
         self._apply_grid_layout("Atlas Regions")
         self._apply_region_contour()
@@ -1588,7 +1588,7 @@ class MainController:
             [atlas_path] + (in_atlas_matches[:1] if in_atlas_matches else []), k)
 
         self.current_cells_df = df_cells
-        self.update_class_filter_ui(df_cells)
+        self._populate_density_classes(df_cells)
         self.render_cells_from_df(df_cells, atlas_layer)
         self._apply_grid_layout("Atlas Anatomy")
         self._apply_region_contour()
@@ -1833,36 +1833,18 @@ class MainController:
     def setup_callbacks(self):
         @self.viewer.mouse_move_callbacks.append
         def on_mouse_move(viewer, event):
-            if self.current_atlas_labels is None: return
+            if self.current_atlas_labels is None:
+                self._hover_show(None)
+                return
             cursor = viewer.cursor.position
-            if len(cursor) == 3:
-                z, y, x = int(round(cursor[0])), int(round(cursor[1])), int(round(cursor[2]))
-                shape = self.current_atlas_labels.shape
-                if 0 <= z < shape[0] and 0 <= y < shape[1] and 0 <= x < shape[2]:
-                    val = self.current_atlas_labels[z, y, x]
-                    if val != self.last_hover_val:
-                        self.last_hover_val = val
-                        if val > 0:
-                            path = self.ontology.get_path(val)
-                            if path:
-                                name, acr = path[-1]
-                                head = html.escape(f"{name} ({acr})" if acr else name)
-                            else:
-                                head = f"Region {val}"
-                            # 文件里的值被 float32 舍入过时把真实 id 一并写出来，
-                            # 别让人以为 ontology 里真有这么个 id；多解时标明是近似。
-                            rid, ambiguous = self.ontology.resolve_label_value(val)
-                            id_txt = f"ID {val}"
-                            if rid is not None and rid != int(val):
-                                id_txt += f" -> {rid}{' (ambiguous, first match)' if ambiguous else ''}"
-                            # 面板里把整条链从根列到自身（自身加粗），不用鼠标旁边的浮窗，
-                            # 免得挡住画面。
-                            self.lbl_hover.setText(
-                                f"📍 <b>{head}</b> · {id_txt}<br>"
-                                + self.ontology.get_lineage_html(val)
-                            )
-                        else:
-                            self.lbl_hover.setText("📍 Hover: Background")
+            if len(cursor) != 3:
+                return
+            c = [int(round(v)) for v in cursor]
+            shape = self.current_atlas_labels.shape
+            if not all(0 <= c[i] < shape[i] for i in range(3)):
+                self._hover_show(None)
+                return
+            self._hover_show(self.current_atlas_labels[c[0], c[1], c[2]])
 
         @self.viewer.mouse_drag_callbacks.append
         def on_click(viewer, event):
@@ -1885,21 +1867,55 @@ class MainController:
                     self.input_search.setText(name)
                     self.perform_search("Exact")
 
+    def _add_panel(self, widget, name, stretch=True):
+        """右侧一个 dock：可缩窄、起始宽度统一。"""
+        try:
+            added = self.viewer.window.add_dock_widget(
+                widget, area='right', name=name, add_vertical_stretch=stretch)
+        except TypeError:   # 老版本 napari 没有 add_vertical_stretch
+            added = self.viewer.window.add_dock_widget(widget, area='right', name=name)
+        ontology_tree_ui.set_dock_width(added, PANEL_START_WIDTH_PX)
+        return added
+
+    @staticmethod
+    def _hline(layout):
+        layout.addSpacing(5)
+        line = QFrame(); line.setFrameShape(QFrame.HLine)
+        layout.addWidget(line)
+        layout.addSpacing(5)
+
     def setup_ui(self):
+        """三个右侧面板 + 底部脑区条：
+
+          1. Workspace & Search —— 视图切换、显示选项、脑区搜索/导出
+          2. Density & Flags    —— 细胞密度热图、可疑细胞标记
+          3. Video Export       —— 滑块扫一遍录成视频
+          底部 Region under cursor —— 鼠标下的脑区 + 上级链，涂成该脑区的颜色
+
+        细胞类别不再单列勾选框：每个类别本来就是一个 'Cell: ...' 图层，直接在
+        napari 图层列表里开关（见 on_cell_layer_visible）。
+        """
         # napari 自己的 layer controls 缩到一半就不肯再缩了（QStackedWidget 的
         # minimumSizeHint 就是最高的那一页控件表单），左侧其他面板等于被它吃掉
         # 一大截高度还要不回来。包进滚动区并给个显式下限，拖到多矮都行，装不下
         # 的行改成滚动而不是被裁掉。
         ontology_tree_ui.free_layer_controls_height(self.viewer)
+        self._setup_workspace_panel()
+        self._setup_density_flag_panel()
+        self._setup_video_panel()
+        self._setup_hover_bar()
+
+    # ---------- 1. Workspace & Search ----------
+
+    def _setup_workspace_panel(self):
         dock = QWidget()
         # 起始宽度用 set_dock_width 给，而不是 setMaximumWidth —— 上限会让面板
-        # 永远拖不宽（脑区名一长就只能看开头几个字），这正是要修的。
+        # 永远拖不宽（脑区名一长就只能看开头几个字）。
         ontology_tree_ui.shrinkable(dock)
         layout = QVBoxLayout(dock)
-        
-        layout.addWidget(QLabel("<b>1. Workspace Mode:</b>"))
+
+        layout.addWidget(QLabel("<b>🗂 Workspace Mode:</b>"))
         self.combo_sample = QComboBox()
-        # 直接使用解析好的当前文件夹名称进行展示
         self.combo_sample.addItem(f"🐭 [Native] {self.sample_name}")
         self.combo_sample.addItem(f"📍 [Atlas ] {self.sample_name}")
         self.combo_sample.currentTextChanged.connect(self.on_mode_change)
@@ -1914,16 +1930,13 @@ class MainController:
         layout.addWidget(self.cb_grid)
 
         # 填充 = 看清哪块是哪个脑区（默认）；轮廓 = 只画边界，压在高分辨率原图上
-        # 直接看边界偏了多少，判断配准精度时用。napari 自己的 Labels 控件里也有
-        # 一个 contour 数字框，这里只是把它提到常用位置、并且切视图后不丢。
+        # 直接看边界偏了多少，判断配准精度时用。
         self.cb_outline = QCheckBox("Region outline only (unchecked = filled)")
         self.cb_outline.setChecked(False)
         self.cb_outline.stateChanged.connect(lambda _state: self._apply_region_contour())
         layout.addWidget(self.cb_outline)
 
-        # 只有带 reposition plan 的样本才看得到这个开关（_sync_restored_layer 负责
-        # 显隐）：没有碎片的样本两卷标签图完全一样，多一个永远无效的勾选框只会让人
-        # 以为自己漏了什么。
+        # 只有带 reposition plan 的样本才看得到这个开关（_sync_restored_layer 负责显隐）。
         self.cb_restored = QCheckBox("Fragments moved back (matches the original stack)")
         self.cb_restored.setToolTip(
             "The registration ran on a stack whose split-off fragments had been swung "
@@ -1936,17 +1949,56 @@ class MainController:
         self.cb_restored.stateChanged.connect(lambda _state: self._sync_restored_layer())
         layout.addWidget(self.cb_restored)
 
+        # 背景细胞 = warp 后落在图谱外的细胞（mapped_id=0）。它们分散在各个类别
+        # 图层里，没法靠图层开关单独控制，所以保留这一个勾选框。
+        self.cb_show_bg = QCheckBox("Show background cells (outside the atlas)")
+        self.cb_show_bg.setChecked(False)
+        self.cb_show_bg.stateChanged.connect(self.on_bg_toggle)
+        layout.addWidget(self.cb_show_bg)
+
         h_size = QHBoxLayout()
-        h_size.addWidget(QLabel("<b>Cell Size:</b>"))
+        h_size.addWidget(QLabel("Cell size:"))
         self.spin_point_size = QDoubleSpinBox()
         self.spin_point_size.setRange(0.1, 50.0)
         self.spin_point_size.setValue(5.0)
         self.spin_point_size.setSingleStep(1.0)
         self.spin_point_size.valueChanged.connect(self.on_point_size_change)
-        h_size.addWidget(self.spin_point_size)
+        h_size.addWidget(self.spin_point_size, 1)
         layout.addLayout(h_size)
 
-        layout.addSpacing(5); line_dens = QFrame(); line_dens.setFrameShape(QFrame.HLine); layout.addWidget(line_dens); layout.addSpacing(5)
+        hint = QLabel("Cell classes: toggle the 'Cell: …' layers in the layer list.")
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._hline(layout)
+
+        layout.addWidget(QLabel("<b>🔍 Search Regions:</b>"))
+        self.input_search = QLineEdit(); self.input_search.setPlaceholderText("Region name...")
+        self.input_search.returnPressed.connect(lambda: self.perform_search())
+        layout.addWidget(self.input_search)
+
+        h_search_btns = QHBoxLayout()
+        btn_fuzzy = QPushButton("Fuzzy Search")
+        btn_exact = QPushButton("Exact Search")
+        btn_fuzzy.clicked.connect(lambda: self.perform_search("Fuzzy"))
+        btn_exact.clicked.connect(lambda: self.perform_search("Exact"))
+        h_search_btns.addWidget(btn_fuzzy)
+        h_search_btns.addWidget(btn_exact)
+        layout.addLayout(h_search_btns)
+
+        btn_export_highlight = QPushButton("📤 Export Highlighted Cells (tile/slice)")
+        btn_export_highlight.clicked.connect(self.export_highlighted_cells)
+        layout.addWidget(btn_export_highlight)
+
+        self._add_panel(dock, "Workspace & Search")
+
+    # ---------- 2. Density & Flags ----------
+
+    def _setup_density_flag_panel(self):
+        dock = QWidget()
+        ontology_tree_ui.shrinkable(dock)
+        layout = QVBoxLayout(dock)
 
         # 🔥 密度热图：细胞点回答"这颗细胞在哪"，热图回答"哪一片细胞多"。两个视图
         # 都能开，画的都是当前视图那套坐标，所以热团和点永远对得上。
@@ -1966,8 +2018,8 @@ class MainController:
         h_dens_cls.addWidget(QLabel("Cells:"))
         self.combo_density_class = QComboBox()
         self.combo_density_class.setToolTip(
-            "Which cells go into the heat map. Independent of the class checkboxes below, "
-            "which only control whether the point layers are drawn.")
+            "Which cells go into the heat map. Independent of which 'Cell:' point layers "
+            "are switched on in the layer list.")
         self.combo_density_class.addItem("All classes", ("all", None))
         self.combo_density_class.currentIndexChanged.connect(lambda _i: self._refresh_density())
         h_dens_cls.addWidget(self.combo_density_class, 1)
@@ -1995,7 +2047,7 @@ class MainController:
         self.lbl_density.setWordWrap(True)
         layout.addWidget(self.lbl_density)
 
-        layout.addSpacing(5); line_flag = QFrame(); line_flag.setFrameShape(QFrame.HLine); layout.addWidget(line_flag); layout.addSpacing(5)
+        self._hline(layout)
 
         layout.addWidget(QLabel("<b>🚩 Flag Suspicious Cell:</b> click a cell point, then Pin"))
         self.lbl_last_click = QLabel("No cell clicked yet")
@@ -2015,91 +2067,192 @@ class MainController:
         self.lbl_flag_count.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self.lbl_flag_count)
 
-        layout.addSpacing(5); line2 = QFrame(); line2.setFrameShape(QFrame.HLine); layout.addWidget(line2); layout.addSpacing(5)
+        self._add_panel(dock, "Density & Flags")
 
-        layout.addWidget(QLabel("<b>2. Cell Class Filter:</b>"))
+    # ---------- 3. Video Export ----------
 
-        # --- 新增：控制是否显示背景细胞的 CheckBox ---
-        self.cb_show_bg = QCheckBox("Show Background Cells (ID=0)")
-        self.cb_show_bg.setChecked(False) # 默认不显示背景细胞
-        self.cb_show_bg.stateChanged.connect(self.on_bg_toggle)
-        layout.addWidget(self.cb_show_bg)
-        # ----------------------------------------
-        
-        # 动态 CheckBox 的容器
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        self.class_checkbox_container = QWidget()
-        self.layout_classes = QVBoxLayout(self.class_checkbox_container)
-        self.layout_classes.setContentsMargins(0,0,0,0)
-        scroll.setWidget(self.class_checkbox_container)
-        
-        layout.addWidget(scroll)
-        ontology_tree_ui.set_dock_width(
-            self.viewer.window.add_dock_widget(dock, area='right', name="Control Panel"),
-            PANEL_START_WIDTH_PX)
+    def _setup_video_panel(self):
+        dock = QWidget()
+        ontology_tree_ui.shrinkable(dock)
+        layout = QVBoxLayout(dock)
 
-        self.setup_region_panel()
+        # 🎬 导出视频：把滑块（当前层级轴）从起点扫到终点，每一步截一帧画布。
+        layout.addWidget(QLabel("<b>🎬 Export Slider Video:</b>"))
+        h_vid_range = QHBoxLayout()
+        self.spin_video_start = QSpinBox()
+        self.spin_video_end = QSpinBox()
+        for label, spin in (("From:", self.spin_video_start), ("To:", self.spin_video_end)):
+            spin.setRange(0, 0)
+            btn_cur = QPushButton("●")
+            btn_cur.setFixedWidth(26)
+            btn_cur.setToolTip("Use the slider's current position")
+            btn_cur.clicked.connect(lambda _c=False, s=spin: s.setValue(self._slider_step()))
+            h_vid_range.addWidget(QLabel(label))
+            h_vid_range.addWidget(spin, 1)
+            h_vid_range.addWidget(btn_cur)
+        layout.addLayout(h_vid_range)
+        self.viewer.dims.events.range.connect(lambda _e: self._sync_video_range())
+        self._sync_video_range()
 
-    def setup_region_panel(self):
-        """搜索 + hover 单独一个 dock。
+        h_vid_fps = QHBoxLayout()
+        h_vid_fps.addWidget(QLabel("FPS:"))
+        self.spin_video_fps = QSpinBox()
+        self.spin_video_fps.setRange(1, 120)
+        self.spin_video_fps.setValue(int(CONFIG.get('video_fps', 15)))
+        h_vid_fps.addWidget(self.spin_video_fps, 1)
+        btn_video = QPushButton("🎬 Export")
+        btn_video.setToolTip("Sweep the slider from From to To (From > To plays backwards) "
+                             "and save what the canvas shows as .mp4 or .gif.")
+        btn_video.clicked.connect(self.export_slider_video)
+        h_vid_fps.addWidget(btn_video, 1)
+        layout.addLayout(h_vid_fps)
+        self.btn_video = btn_video
 
-        与 Control Panel 拆开是因为 DevCCF 最深有十几级祖先，挤在控制面板里
-        只能给个固定高度的小框，链一长就得滚动；单独成面板后谱系框拿
-        stretch=1 吃掉剩下的全部空间，只有长到连这些空间都装不下才出现
-        滚动条。面板本身高度固定，鼠标划过不同脉络时布局不会抖。
-        """
-        region_dock = QWidget()
-        ontology_tree_ui.shrinkable(region_dock)
-        rlayout = QVBoxLayout(region_dock)
+        self._add_panel(dock, "Video Export")
 
-        rlayout.addWidget(QLabel("<b>🔍 Search Regions:</b>"))
-        self.input_search = QLineEdit(); self.input_search.setPlaceholderText("Region name...")
-        self.input_search.returnPressed.connect(lambda: self.perform_search())
-        rlayout.addWidget(self.input_search)
+    # ---------- 底部脑区条 ----------
 
-        h_search_btns = QHBoxLayout()
-        btn_fuzzy = QPushButton("Fuzzy Search")
-        btn_exact = QPushButton("Exact Search")
-        btn_fuzzy.clicked.connect(lambda: self.perform_search("Fuzzy"))
-        btn_exact.clicked.connect(lambda: self.perform_search("Exact"))
-        h_search_btns.addWidget(btn_fuzzy)
-        h_search_btns.addWidget(btn_exact)
-        rlayout.addLayout(h_search_btns)
+    def _active_region_layer(self):
+        """hover 正在读的那一层标签图（它的 data 就是 current_atlas_labels）。"""
+        for name in self.REGION_LAYER_NAMES:
+            if name in self.viewer.layers and \
+                    self.viewer.layers[name].data is self.current_atlas_labels:
+                return self.viewer.layers[name]
+        return None
 
-        btn_export_highlight = QPushButton("📤 Export Highlighted Cells (tile/slice)")
-        btn_export_highlight.clicked.connect(self.export_highlighted_cells)
-        rlayout.addWidget(btn_export_highlight)
+    def _setup_hover_bar(self):
+        """底部整宽的一条：鼠标下的脑区 + 全部上级（太长就折叠最浅的几层，最深的
+        几层总保留），整条涂成该脑区在标签图层里的颜色。和 atlas_view 是同一个
+        控件（shared/hover_bar.py），拖高这条字就跟着变大。"""
+        def colour_of(_structure_id):
+            # 用标签图里实际读到的数值去问图层要颜色：float32 舍入过的 id 在
+            # colormap 里登记的是舍入后的那个数。
+            layer = self._active_region_layer()
+            raw = self._hover_raw
+            try:
+                rgba = layer.get_color(raw) if layer is not None and raw else None
+            except Exception:
+                rgba = None
+            if rgba is None:
+                return list(self._fallback_region_color(raw or 0))
+            return list(rgba)
 
-        rlayout.addSpacing(5); rline = QFrame(); rline.setFrameShape(QFrame.HLine); rlayout.addWidget(rline); rlayout.addSpacing(5)
+        self._hover_raw = 0
+        self.hover = hover_bar.add_hover_bar(
+            self.viewer, self.ontology.structures, colour_of,
+            resting="Hover over the image to read the region under the cursor.")
 
-        rlayout.addWidget(QLabel("<b>📍 Hovered Region:</b>"))
-        self.lbl_hover = QLabel("📍 Hover: None")
-        self.lbl_hover.setStyleSheet("color: #999; font-size: 11px;")
-        self.lbl_hover.setWordWrap(True)
-        self.lbl_hover.setTextFormat(Qt.RichText)
-        self.lbl_hover.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.lbl_hover.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    def _hover_show(self, raw_value):
+        """raw_value = 标签图里读到的数值；None = 鼠标不在卷内。"""
+        if raw_value is None:
+            self.hover.show(None)
+            return
+        raw = int(raw_value)
+        if raw == self.last_hover_val:
+            return
+        self.last_hover_val = raw
+        self._hover_raw = raw
+        if raw <= 0:
+            self.hover.show(0)
+            return
+        # float32 舍入过的值换回真实 id；多解时在链尾标明是近似。
+        rid, ambiguous = self.ontology.resolve_label_value(raw)
+        extra = ("≈ float32-rounded id, first match",) if ambiguous else ()
+        self.hover.show(rid if rid is not None else raw, extra)
 
-        hover_scroll = QScrollArea()
-        hover_scroll.setWidgetResizable(True)
-        hover_scroll.setFrameShape(QFrame.NoFrame)
-        hover_scroll.setMinimumHeight(120)
-        hover_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        hover_scroll.setWidget(self.lbl_hover)
-        rlayout.addWidget(hover_scroll, 1)
+    # ================= 🎬 滑块视频导出 =================
 
-        # add_vertical_stretch=False：napari 默认会在 dock 底部塞一个弹簧把控件
-        # 顶到顶部，那样 hover 框的 stretch 就失效了。旧版本没这个参数就回退。
+    def _slider_axis(self):
+        """被滑块控制的那根轴 = 当前显示顺序里第一根（2D 显示时就是 z）。"""
+        return list(self.viewer.dims.order)[0]
+
+    def _slider_step(self):
+        return int(self.viewer.dims.current_step[self._slider_axis()])
+
+    def _sync_video_range(self):
+        """图层换了（切视图）滑块长度会变，起止框的上限跟着走，并把越界的值夹回来。"""
+        n = int(self.viewer.dims.nsteps[self._slider_axis()])
+        last = max(n - 1, 0)
+        first_fill = self.spin_video_end.maximum() == 0 and self.spin_video_end.value() == 0
+        for spin in (self.spin_video_start, self.spin_video_end):
+            spin.setRange(0, last)
+        if first_fill:
+            self.spin_video_end.setValue(last)
+
+    def export_slider_video(self):
+        start, end = self.spin_video_start.value(), self.spin_video_end.value()
+        fps = self.spin_video_fps.value()
+        step = 1 if end >= start else -1
+        steps = list(range(start, end + step, step))
+
+        default = f"{self.sample_name}_{start}-{end}_{fps}fps.mp4"
+        path, chosen = QFileDialog.getSaveFileName(
+            None, "Save slider video", os.path.join(self.target_dir, default),
+            "MP4 video (*.mp4);;GIF (*.gif)")
+        if not path:
+            return
+        # 对话框不一定会补扩展名；没有 .mp4/.gif imageio 会按别的格式（如 tiff）
+        # 去写，然后 fps 参数报错。按选中的过滤器补上。
+        if not path.lower().endswith(('.mp4', '.gif')):
+            path += '.gif' if 'GIF' in chosen else '.mp4'
+
+        axis = self._slider_axis()
+        original = self._slider_step()
+        self.btn_video.setEnabled(False)
+        is_gif = path.lower().endswith('.gif')
+        writer = None
+        via_imageio = is_gif
         try:
-            added = self.viewer.window.add_dock_widget(
-                region_dock, area='right', name="Region Explorer",
-                add_vertical_stretch=False)
-        except TypeError:
-            added = self.viewer.window.add_dock_widget(
-                region_dock, area='right', name="Region Explorer")
-        ontology_tree_ui.set_dock_width(added, PANEL_START_WIDTH_PX)
+            for i, s in enumerate(steps, 1):
+                self.viewer.dims.set_current_step(axis, s)
+                frame = self.viewer.screenshot(canvas_only=True, flash=False)
+                # H.264 要求宽高为偶数；只裁掉多出来的一行/列。
+                frame = np.ascontiguousarray(
+                    frame[:frame.shape[0] // 2 * 2, :frame.shape[1] // 2 * 2, :3])
+                if writer is None:
+                    writer, via_imageio = self._open_video_writer(path, fps, frame.shape, is_gif)
+                if via_imageio:
+                    writer.append_data(frame)
+                else:
+                    writer.write(frame[:, :, ::-1])  # cv2 要 BGR
+                self.btn_video.setText(f"{i}/{len(steps)}")
+                QApplication.processEvents()
+        except Exception as e:
+            QMessageBox.warning(None, "Export video", f"Export failed:\n{e}")
+        else:
+            print(f"🎬 Saved {len(steps)} frames @ {fps} fps (slider {start} → {end}): {path}")
+        finally:
+            if writer is not None:
+                writer.close() if via_imageio else writer.release()
+            self.viewer.dims.set_current_step(axis, original)
+            self.btn_video.setText("🎬 Export")
+            self.btn_video.setEnabled(True)
+
+    @staticmethod
+    def _open_video_writer(path, fps, shape, is_gif):
+        """返回 (writer, 是不是 imageio 写入器)。
+
+        gif 走 imageio（显式指定 GIF 格式，不让它按插件优先级乱选成 tiff）；
+        mp4 优先 cv2，没装 cv2 就走 imageio 的 FFMPEG 插件（需要 imageio-ffmpeg）。
+        """
+        import imageio
+        if is_gif:
+            return imageio.get_writer(path, format='GIF', fps=fps), True
+        try:
+            import cv2
+        except ImportError:
+            try:
+                return imageio.get_writer(path, format='FFMPEG', fps=fps), True
+            except Exception as e:
+                raise RuntimeError(
+                    "Writing .mp4 needs either opencv or imageio-ffmpeg in the viewer's "
+                    "environment:\n    pip install imageio-ffmpeg\n(or save as .gif)\n\n"
+                    f"{e}") from e
+        h, w = shape[:2]
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+        if not writer.isOpened():
+            raise RuntimeError(f"cv2 could not open {path} for writing")
+        return writer, False
 
     def on_point_size_change(self, val):
         for layer in self.viewer.layers:
@@ -2117,13 +2270,12 @@ class MainController:
             self.mode = "Atlas_Sample"
             self.load_sample_atlas_view()
     
-    def on_cell_check_toggle(self, name, state):
-        layer_name = f"Cell: {name}"
-        for layer in self.viewer.layers:
-            if layer.name == layer_name:
-                layer.visible = (state == Qt.Checked)
-                break
-        self.perform_search() 
+    def on_cell_layer_visible(self, name, visible):
+        """napari 图层列表里点了某个 Cell: 图层的眼睛：记下来，并让搜索高亮跟上。"""
+        if self.cell_visible.get(name) == bool(visible):
+            return
+        self.cell_visible[name] = bool(visible)
+        self.perform_search()
 
     def on_bg_toggle(self, state):
         """当勾选/取消背景细胞显示时触发，重新渲染细胞图层"""
